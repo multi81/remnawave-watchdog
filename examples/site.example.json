@@ -1,0 +1,11 @@
+{
+ "sites": [
+  {"name": "панель", "url": "https://panel.example.com/api/auth/status"},
+  {"name": "кабинет", "url": "https://cab.example.com/"},
+  {"name": "админка", "url": "https://admin.example.com/health", "key": "admin",
+   "impact": "служебная админка, на VPN у пользователей не влияет."}
+ ],
+ "site_hosts": ["panel.example.com", "sub.example.com", "cab.example.com", "admin.example.com"],
+ "domains": ["example.com", "example.net"],
+ "no_vantage": []
+}
