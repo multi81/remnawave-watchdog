@@ -1,0 +1,10 @@
+{
+ "hosts": [
+  {"name": "nl1", "host": "203.0.113.10", "port": 22},
+  {"name": "de1", "host": "203.0.113.20", "port": 22},
+  {"name": "панель", "host": "203.0.113.30", "port": 22}
+ ],
+ "work_from": 9, "work_to": 21, "summary_hour": 9,
+ "thresholds": {},
+ "ignore_containers": []
+}
