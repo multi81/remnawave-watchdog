@@ -29,7 +29,7 @@ import sys
 import time
 import urllib.parse
 
-VERSION = "1.5.0"   # 1.5.0 (27.10): переполнение буфера карты и сбросы ядра; 1.4.0 (25.10): протоколы и порты из щита
+VERSION = "1.6.0"   # 1.6.0: метка compose и --rm у контейнеров; 1.5.0 (27.10): переполнение буфера карты и сбросы ядра; 1.4.0 (25.10): протоколы и порты из щита
 SHIELD_CTL = "/usr/local/sbin/shield-ctl"
 SHIELD_TOP = 10
 XRAY_LOG = "/var/log/remnanode/access.log"
@@ -164,7 +164,8 @@ def _docker_get(path, sock, timeout):
 def containers(sock=DOCKER_SOCK, get=None, timeout=10):
     """-> (docker_ok, [контейнеры]) или (None, None), если Docker на сервере нет.
     Контейнер: n имя, s состояние (running/exited/restarting/dead/…), h healthcheck (""/healthy/unhealthy/starting),
-    rp политика перезапуска, rc счётчик перезапусков, ex код выхода."""
+    rp политика перезапуска, rc счётчик перезапусков, ex код выхода; cp — проект docker compose (если поднят им),
+    ar — True, если запущен с --rm (сам удалится после выхода)."""
     if get is None:
         if not os.path.exists(sock):
             return (False, []) if os.path.exists("/usr/bin/docker") else (None, None)
@@ -180,10 +181,16 @@ def containers(sock=DOCKER_SOCK, get=None, timeout=10):
         except (OSError, ValueError, http.client.HTTPException):
             continue   # удалили между запросами
         st, hc = i.get("State") or {}, i.get("HostConfig") or {}
-        out.append({"n": str(i.get("Name") or "").lstrip("/"), "s": st.get("Status") or "",
-                    "h": (st.get("Health") or {}).get("Status") or "",
-                    "rp": (hc.get("RestartPolicy") or {}).get("Name") or "no",
-                    "rc": int(i.get("RestartCount") or 0), "ex": int(st.get("ExitCode") or 0)})
+        c = {"n": str(i.get("Name") or "").lstrip("/"), "s": st.get("Status") or "",
+             "h": (st.get("Health") or {}).get("Status") or "",
+             "rp": (hc.get("RestartPolicy") or {}).get("Name") or "no",
+             "rc": int(i.get("RestartCount") or 0), "ex": int(st.get("ExitCode") or 0)}
+        cp = ((i.get("Config") or {}).get("Labels") or {}).get("com.docker.compose.project")
+        if cp:
+            c["cp"] = str(cp)[:64]
+        if hc.get("AutoRemove"):
+            c["ar"] = True
+        out.append(c)
     return True, out
 
 
@@ -353,6 +360,7 @@ def static_part(iface, failed, docker=(None, None), sh=None):
     m["failed_units"] = failed
     if docker[0] is not None:
         m["docker_ok"], m["containers"] = docker
+        m["docker_v"] = 2   # есть cp/ar: сторож отличает временные контейнеры от постоянных
     if sh is not None:
         m["shield"] = sh
     m["iface"] = iface

@@ -84,6 +84,8 @@ DEFAULTS = {"key": ETC + "/ddos_ed25519", "known_hosts": ETC + "/ddos_known_host
                              "apt-daily-upgrade.service", "update-notifier-download.service"],
             # контейнеры, остановленные нарочно (не тревожить)
             "ignore_containers": [],
+            # важные контейнеры без политики перезапуска и не из docker compose — следить, как за постоянными
+            "permanent_containers": [],
             # без них не работает VPN, панель, бот или подписка — о них и ночью
             "critical_containers": ["remnanode", "remnawave", "remnawave-db", "remnawave-redis", "caddy",
                                     "remnawave_bot", "remnawave_bot_db", "remnawave_bot_redis",
@@ -498,15 +500,42 @@ def times_ru(k):
     return "%d %s" % (k, "раз" if k % 10 in (0, 1, 5, 6, 7, 8, 9) or 11 <= k % 100 <= 14 else "раза")
 
 
-def docker_problems(dk, s, now, ign):
-    """Один срез сборщика -> ({ключ: что не так}, [разовые события]). dk — память по серверу (меняется)."""
+PERMANENT_RP = ("always", "unless-stopped", "on-failure")
+TEMP_LOG_KEEP = 2 * 86400
+
+
+def is_temp(ct, perm):
+    """Временный контейнер: без политики перезапуска, не из docker compose, не назван важным (critical/permanent)."""
+    return (ct.get("rp") or "no") not in PERMANENT_RP and not ct.get("cp") and str(ct.get("n") or "") not in perm
+
+
+def temp_track(dk, n, ct, now, seen_temp):
+    """Временный контейнер: без тревог, в отдельный журнал — когда завершился (если видели его работающим)."""
+    temp, log = dk.setdefault("temp", {}), dk.setdefault("temp_log", [])
+    seen_temp.add(n)
+    st, ex = ct.get("s") or "", int(num(ct.get("ex")))
+    if st == "running":
+        temp[n] = {"ts": now, "run": True}
+    elif temp.get(n, {}).get("run"):
+        log.append({"n": n, "ts": now, "how": "завершился, код %d" % ex if ex else "завершился без ошибок"})
+        temp[n] = {"ts": now, "run": False}
+    else:
+        temp.setdefault(n, {"ts": now, "run": False})
+
+
+def docker_problems(dk, s, now, ign, perm=None):
+    """Один срез сборщика -> ({ключ: что не так}, [разовые события]). dk — память по серверу (меняется).
+    perm — имена важных контейнеров; задан только для нового сборщика (docker_v=2): тогда временные идут отдельно."""
     if s.get("docker_ok") is False:
         return {"docker": "Docker не отвечает"}, []
-    probs, events, seen = {}, [], set()
+    probs, events, seen, seen_temp = {}, [], set(), set()
     known, rcs = dk.setdefault("known", {}), dk.setdefault("rc", {})
     for ct in s.get("containers") or []:
         n = str(ct.get("n") or "")
         if not n or n in ign:
+            continue
+        if perm is not None and is_temp(ct, perm):
+            temp_track(dk, n, ct, now, seen_temp)
             continue
         seen.add(n)
         st, rp, ex, rc = ct.get("s") or "", ct.get("rp") or "no", int(num(ct.get("ex"))), int(num(ct.get("rc")))
@@ -533,6 +562,13 @@ def docker_problems(dk, s, now, ign):
     for n in list(rcs):
         if n not in seen:
             del rcs[n]
+    if perm is not None:
+        for n, v in list(dk.get("temp", {}).items()):
+            if n not in seen_temp:
+                if v.get("run"):
+                    dk.setdefault("temp_log", []).append({"n": n, "ts": now, "how": "удалён"})
+                del dk["temp"][n]
+        dk["temp_log"] = [x for x in dk.get("temp_log", []) if now - x["ts"] <= TEMP_LOG_KEEP]
     for n, t in list(known.items()):
         if n in seen or n in ign:
             continue
@@ -559,8 +595,9 @@ def docker_pass(e, name, s, c):
         return []
     ts = s["ts"]
     dk = e.setdefault("docker", {})
-    probs, events = docker_problems(dk, s, ts, set(c.get("ignore_containers") or []))
     crit = set(c.get("critical_containers") or []) | {"docker"}
+    perm = (crit | set(c.get("permanent_containers") or [])) if num(s.get("docker_v")) >= 2 else None
+    probs, events = docker_problems(dk, s, ts, set(c.get("ignore_containers") or []), perm)
     cand, active = dk.setdefault("cand", {}), dk.setdefault("active", {})
     newly = []
     for k, t in probs.items():
@@ -968,6 +1005,10 @@ def report_sections(since, now, state=None, c=None, db=None):
             info.append("<b>Контейнеры Docker:</b> работают %d на %d серверах · %s" % (
                 sum(int(x.get("running") or 0) for x in dks), len(dks),
                 "проблем нет" if not bad_n else "проблемы на %d" % bad_n))
+            tl = [(h, x) for h, e in hosts.items() for x in (e.get("docker") or {}).get("temp_log", []) if x["ts"] >= since]
+            if tl:
+                info.append("<b>Временные контейнеры</b> (без тревог): %d за период · %s" % (len(tl), ", ".join(
+                    "%s на %s — %s" % (html.escape(x["n"]), html.escape(h), html.escape(x["how"])) for h, x in tl[-5:])))
         si = shield_info(hosts)
         if si:
             info.append(si)

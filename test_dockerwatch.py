@@ -196,6 +196,62 @@ st = {}
 d.process(st, {"DE7": {"samples": [dict(NORM, ts=DAY)]}}, C, DAY + 5)
 check("старый сборщик — без контейнеров", "docker" not in st["hosts"]["DE7"])
 
+# --- временные контейнеры (новый сборщик, docker_v=2): отдельно, без тревог; постоянные — как раньше
+API2 = {
+    "/containers/json?all=1": [{"Id": "c3"}, {"Id": "d4"}],
+    "/containers/c3/json": {"Name": "/blog", "RestartCount": 0, "State": {"Status": "running", "ExitCode": 0},
+                            "HostConfig": {"RestartPolicy": {"Name": "no"}},
+                            "Config": {"Labels": {"com.docker.compose.project": "site"}}},
+    "/containers/d4/json": {"Name": "/bold_yalow", "RestartCount": 0, "State": {"Status": "exited", "ExitCode": 0},
+                            "HostConfig": {"RestartPolicy": {"Name": "no"}, "AutoRemove": True}, "Config": {"Labels": {}}},
+}
+okd2, cts2 = col.containers(get=lambda p: API2[p])
+check("сборщик: метка compose и --rm", cts2[0].get("cp") == "site" and "ar" not in cts2[0]
+      and cts2[1].get("ar") is True and "cp" not in cts2[1])
+check("сборщик: в срезе версия формата контейнеров", col.static_part("eth0", [], (True, cts2)).get("docker_v") == 2)
+
+
+def run2(st, t, cts, c=C):
+    return run(st, t, cts, c=c, docker_v=2)
+
+
+TMP = GOOD + [ct("bold_yalow", rp="no")]
+st = {}
+run2(st, DAY, TMP)
+out = run2(st, DAY + 60, GOOD) + run2(st, DAY + 120, GOOD) + run2(st, DAY + 180, GOOD)
+dk = st["hosts"]["DE7"]["docker"]
+check("временный (restart=no, не compose) удалён — без тревоги", out == [] and not dk["active"])
+check("временный — не в памяти постоянных", "bold_yalow" not in dk["known"])
+check("временный — записан отдельно: удалён",
+      [(x["n"], x["how"]) for x in dk["temp_log"]] == [("bold_yalow", "удалён")])
+st = {}
+run2(st, DAY, TMP)
+fail = repl(TMP, "bold_yalow", s="exited", ex=1)
+out = run2(st, DAY + 60, fail) + run2(st, DAY + 120, fail) + run2(st, DAY + 180, fail)
+check("временный завершился с ошибкой — без тревоги, в записи код", out == []
+      and [(x["n"], x["how"]) for x in st["hosts"]["DE7"]["docker"]["temp_log"]] == [("bold_yalow", "завершился, код 1")])
+check("временный: повторные проходы не дублируют запись", len(st["hosts"]["DE7"]["docker"]["temp_log"]) == 1)
+st = {}
+comp = GOOD + [dict(ct("blog", rp="no"), cp="site")]
+run2(st, DAY, comp)
+run2(st, DAY + 60, GOOD)
+check("compose-сервис с restart=no пропал — тревога (постоянный)", "blog" in "".join(run2(st, DAY + 120, GOOD)))
+st = {}
+Cp = dict(C, permanent_containers=["worker"])
+w = GOOD + [ct("worker", rp="no")]
+run2(st, DAY, w, c=Cp)
+run2(st, DAY + 60, repl(w, "worker", s="exited"), c=Cp)
+check("в permanent_containers — тревога, как у постоянного", "worker" in "".join(run2(st, DAY + 120, repl(w, "worker", s="exited"), c=Cp)))
+st = {}
+cr = GOOD + [ct("caddy", rp="no")]
+run2(st, DAY, cr)
+run2(st, DAY + 60, GOOD)
+check("критичный по имени с restart=no — постоянный", "caddy" in "".join(run2(st, DAY + 120, GOOD)))
+st = {}
+run2(st, DAY, GOOD + [ct("job_1", rp="no", h="unhealthy")])
+out = run2(st, DAY + 60, GOOD + [ct("job_1", rp="no", h="unhealthy")]) + run2(st, DAY + 120, GOOD + [ct("job_1", rp="no", h="unhealthy")])
+check("временный unhealthy — без тревоги", out == [])
+
 # --- отчёт 3 раза в день и сводка
 with tempfile.TemporaryDirectory() as tmp:
     db = d.db_open(os.path.join(tmp, "r.sqlite"))
@@ -212,6 +268,13 @@ with tempfile.TemporaryDirectory() as tmp:
     check("разделы: ночное, которое ещё лежит, не повторяется; поднявшееся — с пометкой",
           sum("вне рабочих часов" in x for x in iss) == 1 and any("caddy-selfsteal" in x and "вне рабочих" in x for x in iss))
     check("разделы: сведения о контейнерах", "<b>Контейнеры Docker:</b> работают 5 на 2 серверах · проблемы на 1" in inf)
+    check("разделы: без временных — строки о них нет", not any("Временные" in x for x in inf))
+    st["hosts"]["DE1"]["docker"]["temp_log"] = [{"n": "bold_yalow", "ts": DAY - 600, "how": "удалён"},
+                                                {"n": "old_job", "ts": DAY - 7200, "how": "завершился, код 1"}]
+    inf2 = d.report_sections(DAY - 3600, DAY, st, C3, db)[1]
+    check("разделы: временные — отдельной строкой, только за период",
+          "<b>Временные контейнеры</b> (без тревог): 1 за период · bold_yalow на DE1 — удалён" in inf2)
+    del st["hosts"]["DE1"]["docker"]["temp_log"]
     L = d.report_lines(DAY - 3600, DAY, st, C3, db)
     check("старый блок отчёта тоже видит", any("🐳" in x for x in L))
     check("сводка видит", "🐳" in d.summary(st, C3, DAY))
