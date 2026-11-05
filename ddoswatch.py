@@ -576,7 +576,7 @@ def docker_pass(e, name, s, c):
     gone = [(k, active.pop(k)) for k in list(active) if k not in probs]
     dk["running"] = sum(1 for ct in s.get("containers") or [] if ct.get("s") == "running")
     work, msgs = in_work(c, ts), []
-    hint = "\n\nЕсли его остановили нарочно — скажите Вере, внесу в исключения, и тревоги о нём не будет."
+    hint = "\n\nЕсли его остановили нарочно — добавьте его имя в ignore_containers в /etc/channel-watch/ddos.json, и тревоги о нём не будет."
     for items, title, extra in ((newly, "🐳 <b>Контейнеры: требуют внимания</b>", hint),
                                 (events, "🐳 <b>Контейнер упал и поднялся сам</b>", "")):
         if not items:
