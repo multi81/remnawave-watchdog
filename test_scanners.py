@@ -99,7 +99,8 @@ check("исключение владельца убирает сеть цели�
 with tempfile.TemporaryDirectory() as tmp:
     sl.ETC = tmp
     open(os.path.join(tmp, "scanners-extra.txt"), "w", encoding="utf-8").write("203.0.113.0/24  # свои добавки\n")
-    LST = {"antiscanner": "1.2.3.0/24\n", "government_networks": "4.4.0.0/20\n2a00:1::/32\n", "skipa": "5.5.5.0/24\n"}
+    LST = {"antiscanner": "1.2.3.0/24\n", "government_networks": "4.4.0.0/20\n2a00:1::/32\n", "skipa": "5.5.5.0/24\n",
+           "c24be_gov": "7.7.7.0/24\n4.4.1.0/24\n"}
     loads, sent = {}, []
     HOSTS = {"DE7": {"host": "93.185.179.107"}, "NL1": {"host": "93.185.34.47"}}
 
@@ -111,15 +112,15 @@ with tempfile.TemporaryDirectory() as tmp:
             return {"ok": True, "clients": {"4.4.1.9": {"user": "user_gov", "last": 50, "n": 2}}} if h == "DE7" else {"ok": False}
         return {"ok": False}
     sm = sl.run([], fetcher=lambda n: LST[n], run_ctl=ctl, hosts=HOSTS, send=sent.append, now=1000, base=tmp)
-    check("собрано из трёх списков и своих добавок", sm["nets"] == 5 and sm["per_list"] == {"antiscanner": 1, "government_networks": 2, "skipa": 1}
-          and sm["extra"] == 1)
+    check("собрано из четырёх списков и своих добавок (пересечения слиты)", sm["nets"] == 6
+          and sm["per_list"] == {"antiscanner": 1, "government_networks": 2, "skipa": 1, "c24be_gov": 2} and sm["extra"] == 1)
     check("разослано на все серверы одинаково", set(loads) == {"DE7", "NL1"} and loads["DE7"] == loads["NL1"] and "203.0.113.0/24" in loads["DE7"])
     check("кто не принял — видно", sm["hosts"] == {"DE7": "ok", "NL1": "ошибка: timeout"})
-    check("наш клиент в списке — с указанием, в каком", sm["clients"]["4.4.1.9"]["list"] == "государственные сети"
+    check("наш клиент в списке — с указанием, в каких", sm["clients"]["4.4.1.9"]["list"] == "государственные сети, госорганы РФ (C24Be)"
           and sm["clients"]["4.4.1.9"]["node"] == "DE7")
     check("сообщение владельцу: не принял сервер и клиент в списке", len(sent) == 1 and "NL1" in sent[0] and "user_gov" in sent[0]
           and "исключения" in sent[0])
-    check("итог сохранён для отчёта", json.load(open(os.path.join(tmp, "summary.json")))["nets"] == 5)
+    check("итог сохранён для отчёта", json.load(open(os.path.join(tmp, "summary.json")))["nets"] == 6)
     sent.clear()
 
     def ctl_ok(h, args, inp=None):
@@ -127,7 +128,11 @@ with tempfile.TemporaryDirectory() as tmp:
     sl.run([], fetcher=lambda n: LST[n], run_ctl=ctl_ok, hosts=HOSTS, send=sent.append, now=2000, base=tmp)
     check("всё приняли, клиент уже известен — молчим", sent == [])
     sm = sl.run(["--dry"], fetcher=lambda n: None, run_ctl=None, hosts=HOSTS, send=sent.append, now=3000, base=tmp)
-    check("--dry: ничего не шлёт; не скачалось — прошлые копии", sent == [] and sm["nets"] == 5 and len(sm["notes"]) == 3)
+    check("--dry: ничего не шлёт; не скачалось — прошлые копии", sent == [] and sm["nets"] == 6 and len(sm["notes"]) == 4)
+check("адреса списков: shadow-netlab и C24Be (госорганы, обновляется ежедневно)",
+      sl.list_url("skipa").endswith("/traffic-guard-lists/refs/heads/main/public/skipa.list")
+      and sl.list_url("c24be_gov") == "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt"
+      and sl.LISTS["c24be_gov"] == "госорганы РФ (C24Be)")
 
 # --- отчёт
 DAY = dt.datetime(2026, 10, 22, 14, 0, tzinfo=d.MSK).timestamp()

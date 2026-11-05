@@ -24,7 +24,14 @@ import time
 ETC = "/etc/channel-watch"
 DIR = "/var/lib/channel-watch/scanners"
 BASE = "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/"
-LISTS = {"antiscanner": "сканеры", "government_networks": "государственные сети", "skipa": "СКИПА (РКН)"}
+LISTS = {"antiscanner": "сканеры", "government_networks": "государственные сети", "skipa": "СКИПА (РКН)",
+         "c24be_gov": "госорганы РФ (C24Be)"}
+# списки не из shadow-netlab — свой адрес (C24Be/AS_Network_List, BSD-2, обновляется ежедневно; IPv4 и IPv6)
+URLS = {"c24be_gov": "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt"}
+
+
+def list_url(name):
+    return URLS.get(name) or BASE + name + ".list"
 SHRINK_MAX = 0.3
 MIN_PREFIX = {4: 16, 6: 28}
 
@@ -59,7 +66,7 @@ def parse(text):
 
 
 def fetch(name, routes=(None,)):
-    url = BASE + name + ".list"
+    url = list_url(name)
     for proxy in routes:
         cmd = ["curl", "-s", "-f", "-m", "40", url]
         if proxy:
