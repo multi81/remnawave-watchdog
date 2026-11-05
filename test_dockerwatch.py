@@ -89,7 +89,7 @@ check("остановился — первый проход тихо", run(st, D
 msgs = run(st, DAY + 180, down)
 check("второй проход — тревога с именем и кодом", len(msgs) == 1 and "🐳" in msgs[0] and "remnanode" in msgs[0]
       and "<b>VPN на ноде (remnanode)</b> — остановлен (убит из-за нехватки памяти или вручную, код 137)" in msgs[0]
-      and "⚠️ клиенты этой ноды без VPN" in msgs[0] and "DE7" in msgs[0] and "внесу в исключения" in msgs[0])
+      and "⚠️ клиенты этой ноды без VPN" in msgs[0] and "DE7" in msgs[0] and "ignore_containers" in msgs[0])
 SAMPLE_DOWN = msgs[0]
 check("пока лежит — не повторяется", run(st, DAY + 240, down) == [])
 check("вердикт сервера не тронут", st["hosts"]["DE7"]["verdict"] == "stable")
