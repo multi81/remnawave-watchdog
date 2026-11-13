@@ -56,6 +56,7 @@ import urllib.request
 
 import blockwatch
 import nodewatch
+import rucheck
 
 ETC = "/etc/channel-watch"
 SPEED_FILE = "/var/lib/channel-watch/speed.json"  # замеры probe.py --speed (закачка побольше перед отчётом)
@@ -1143,6 +1144,12 @@ def main():
         log("списки блокировок: " + (", ".join(f"{who} — {name}" for who, name in blockwatch.hard_hits(st)) or "наших адресов нет")
             + f"; источников скачано {sum(1 for v in fresh['sources'].values() if v['ok'])} из {len(fresh['sources'])}")
 
+    # шаблон и блокировки в России: свежую сверку (probe.py --lists) забираем один раз
+    fresh = load_json(rucheck.STATE_FILE)
+    if fresh.get("ts", 0) > (st.get("rucheck") or {}).get("ts", 0):
+        alerts += rucheck.step(st, fresh)
+        log("шаблон и блокировки: " + "; ".join(rucheck.items(st)))
+
     # потери соединений с точек: свежий замер (probe.py --loss, раз в час) забираем один раз
     fresh = load_json(blockwatch.LOSS_FILE)
     if fresh.get("ts", 0) > st["loss"].get("ts", 0):
@@ -1790,6 +1797,24 @@ if __name__ == "__main__":
                   + (", ".join(f"{who} в {rec}" for who, rec in hits.items()) or "нет") if src["ok"] else "НЕ СКАЧАЛСЯ"))
         print("  чужие адреса реестра в той же подсети /24, что наши: "
               + (", ".join(f"{who} — {n}" for who, n in sorted(result["neighbours"].items())) or "нет"))
+        # сверка шаблона подписки с блокировками в России: сервисы проверяются отсюда, правила — из подписки сторожа
+        try:
+            req = urllib.request.Request(sub_url(), headers={"User-Agent": SUB_UA, "Accept": "application/json"})
+            with urllib.request.urlopen(req, timeout=30) as r:
+                tiles = [c for c in json.loads(r.read().decode("utf-8")) if isinstance(c, dict) and c.get("routing")]
+            rc = rucheck.run_live(tiles)
+            with open(rucheck.STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(rc, f, ensure_ascii=False)
+            os.replace(rucheck.STATE_FILE + ".tmp", rucheck.STATE_FILE)
+            closed = {h: v["verdict"] for h, v in rc["services"].items() if rucheck.blocked(v["verdict"])}
+            print(f"с сервера сторожа закрыто {len(closed)} из {len(rc['services'])} (российские в счёте, тревог по ним нет): "
+                  + (", ".join(f"{h} ({v})" for h, v in sorted(closed.items())) or "—"))
+            print("шаблоны: " + "; ".join(" / ".join(t["tiles"]) + (" (всё напрямую)" if t["default_direct"] else "")
+                                          for t in rc["templates"]))
+            print("расхождения: " + (", ".join(f"«{m['template']}» — {m['host']}" for m in rc["mismatch"]) or "нет"))
+        except Exception as e:  # сверка шаблона не должна ронять сверку списков
+            print(f"сверка шаблона не удалась: {e!r}")
+            log(f"сверка шаблона с блокировками не удалась: {e!r}")
     elif "--loss" in sys.argv:
         # фоновый замер потерь: серия соединений на вход каждой ноды с rf1 и с каждой точки; результат забирает
         # очередной обычный запуск

@@ -23,6 +23,7 @@ import urllib.request
 
 import netprobe
 import nodewatch
+import rucheck
 
 ETC = "/etc/channel-watch"
 LISTS_FILE = "/var/lib/channel-watch/lists.json"
@@ -1439,6 +1440,7 @@ def block_items(st, now):
             parts.append(f"⚠️ списки не обновлялись {int((now - lists['ts']) // 3600)} ч")
         elif failed:
             parts.append(f"не скачалось списков: {len(failed)} из {len(lists['sources'])}")
+    parts += rucheck.items(st)
     dns = st.get("dns") or {}
     if dns.get("names"):
         bad = [n for n, v in (st.get("dns_lvl") or {}).items() if v.get("lvl") == "bad"]
