@@ -30,6 +30,8 @@ probe.HISTORY = os.path.join(tmp, "history.json")
 blockwatch.ETC = tmp
 blockwatch.HOP_CACHE = os.path.join(tmp, "hops.json")   # сведения об узлах трассировки — без сети
 blockwatch.HOP_LOOKUP = lambda ip: {"org": "AS64500 Тестовая сеть", "country": "XX", "city": "Город"}
+real_neighbours = blockwatch.netprobe.neighbours   # соседи по подсети — в общих сценариях без сети, сама функция — в ZL80
+blockwatch.netprobe.neighbours = lambda addr, **kw: None
 blockwatch.LISTS_FILE = os.path.join(tmp, "lists.json")
 real_dns_check, real_deep_many, real_health = blockwatch.dns_check, blockwatch.deep_many, blockwatch.agents_health
 blockwatch.dns_check = lambda names, port, agents=(): {}
@@ -2464,6 +2466,30 @@ check(d79["trace"]["last_info"] == "AS1299 Arelion Sweden AB · SE Stockholm"
       and d79["paths"]["Москва"]["last_info"] == "AS1299 Arelion Sweden AB · SE Stockholm"
       and "пропадает после шага 6 (62.115.196.193 — AS1299 Arelion Sweden AB · SE Stockholm)" in blockwatch.path_text(d79["paths"]["Москва"]),
       "ZL79 в разборе сбоя рядом с последним узлом — чей он (с rf1 и с точек проверки)")
+
+# ZL80–ZL84. Блокировка адреса вне реестра: соседи по подсети и открытый реестр РКН в выводе разбора
+tried80 = []
+nb80 = real_neighbours("93.195.169.105", conn=lambda ip, port, t: tried80.append((ip, port)) or ip.endswith((".50", ".100")) and port == 443)
+check(nb80["checked"] == len({ip for ip, _ in tried80}) >= 6 and "93.195.169.105" not in {ip for ip, _ in tried80}
+      and all(ip.startswith("93.195.169.") for ip, _ in tried80) and sorted(nb80["open"]) == ["93.195.169.100", "93.195.169.50"],
+      "ZL80 соседи: адреса той же /24, сама нода не трогается, открытые — списком")
+check(real_neighbours("10.0.0.5", conn=lambda *a: True) is None and real_neighbours("мусор", conn=lambda *a: True) is None,
+      "ZL81 частный адрес или мусор — соседей не проверяем")
+lists82 = {"hits": {"rkn_ip": {"fi2 (93.195.169.105)": "93.195.169.105/32"}, "rkn_net": {}, "cdn": {"pl1 (1.2.3.4)": "1.2.3.0/24"}}}
+check(blockwatch.registry_hit("93.195.169.105", lists82) is True and blockwatch.registry_hit("1.2.3.4", lists82) is False
+      and blockwatch.registry_hit("9.9.9.9", lists82) is False and blockwatch.registry_hit("9.9.9.9", None) is None,
+      "ZL82 в реестре — только по спискам РКН (подсети CDN не реестр); списков нет — неизвестно")
+d83 = dd(DEAD, two(DEAD), True, {"reached": False, "hops": 9, "last": (7, "62.1.1.1")})
+d83.update(neighbours={"checked": 8, "open": ["93.195.169.50", "93.195.169.100"]}, registry=False)
+v83 = v(d83, "DOWN")
+check("блокировку адреса ноды из России" in v83 and "соседние адреса той же подсети из России открываются (2 из 8) — закрыт именно адрес ноды" in v83
+      and "в открытом реестре РКН адреса нет — похоже на блокировку на ТСПУ вне реестра" in v83,
+      "ZL83 вывод: соседи открыты, в реестре нет — блокировка адреса вне реестра")
+d84 = dd(DEAD, two(DEAD), True, None)
+d84.update(neighbours={"checked": 8, "open": []}, registry=True)
+v84 = v(d84, "DOWN")
+check("соседние адреса той же подсети из России тоже не отвечают" in v84 and "адрес есть в реестре РКН" in v84,
+      "ZL84 вывод: соседи тоже молчат, адрес в реестре — так и сказано")
 
 print("\n--- пример сводки за неделю ---\n" + weekly_sample)
 print("\n--- пример отчёта ---\n" + summ[0])
