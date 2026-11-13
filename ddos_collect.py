@@ -23,13 +23,14 @@ import calendar
 import http.client
 import json
 import os
+import re
 import socket
 import subprocess
 import sys
 import time
 import urllib.parse
 
-VERSION = "1.6.0"   # 1.6.0: метка compose и --rm у контейнеров; 1.5.0 (27.10): переполнение буфера карты и сбросы ядра; 1.4.0 (25.10): протоколы и порты из щита
+VERSION = "1.7.0"   # 1.7.0: бэкапы по журналам (backups.json); 1.6.0: метка compose и --rm у контейнеров; 1.5.0 (27.10): переполнение буфера карты и сбросы ядра; 1.4.0 (25.10): протоколы и порты из щита
 SHIELD_CTL = "/usr/local/sbin/shield-ctl"
 SHIELD_TOP = 10
 XRAY_LOG = "/var/log/remnanode/access.log"
@@ -43,6 +44,11 @@ DOCKER_MAX = 40    # контейнеров в срезе, не больше
 STEP = 10          # секунд между срезами
 KEEP = 30          # срезов в файле (5 минут): сторож забирает раз в минуту и не пропускает короткие всплески
 FAILED_EVERY = 60  # секунд между опросами systemctl --failed
+# бэкапы этого сервера: [{"name": "панель", "log": "/var/log/x-backup.log", "ok": "DONE", "err": "\\[ERR\\]|FAILURE"}]
+# (ok/err — регулярные выражения строк журнала; по умолчанию как ниже). Нет файла — бэкапы не смотрим.
+BACKUP_CONF = "/etc/ddos-collect/backups.json"
+BACKUP_OK, BACKUP_ERR = r"\bDONE\b", r"\[ERR\]|\bFAILURE\b|\bERROR\b"
+BACKUP_TAIL = 262144
 OUT = sys.argv[1] if len(sys.argv) > 1 else "/run/ddos-collect/state.json"
 
 
@@ -331,7 +337,53 @@ class Clients:
             pass
 
 
-def static_part(iface, failed, docker=(None, None), sh=None):
+def _log_ts(line):
+    """Время строки журнала: «[2026-11-13 18:20:09]» или «[2026-11-13T18:20:09]» (время сервера) -> секунды."""
+    m = re.match(r"\[(\d{4}-\d\d-\d\d)[ T](\d\d:\d\d:\d\d)", line)
+    if not m:
+        return None
+    try:
+        return int(time.mktime(time.strptime(m.group(1) + " " + m.group(2), "%Y-%m-%d %H:%M:%S")))
+    except (ValueError, OverflowError):
+        return None
+
+
+def backups(conf=BACKUP_CONF):
+    """Последняя удачная копия и последняя ошибка по журналу каждого бэкапа. None — бэкапы здесь не настроены."""
+    try:
+        items = json.load(open(conf, encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    out = []
+    for it in items if isinstance(items, list) else []:
+        if not isinstance(it, dict) or not it.get("log"):
+            continue
+        r = {"name": str(it.get("name") or os.path.basename(it["log"])), "ok_ts": None, "ok": "", "err_ts": None, "err": ""}
+        try:
+            with open(it["log"], "rb") as f:
+                f.seek(0, 2)
+                size = f.tell()
+                f.seek(max(size - BACKUP_TAIL, 0))
+                text = f.read().decode("utf-8", "replace")
+            r["log_ts"] = int(os.path.getmtime(it["log"]))
+        except OSError:
+            r["missing"] = True
+            out.append(r)
+            continue
+        ok_re, err_re = re.compile(it.get("ok") or BACKUP_OK), re.compile(it.get("err") or BACKUP_ERR)
+        for ln in text.splitlines():
+            ts = _log_ts(ln)
+            if ts is None:
+                continue
+            if ok_re.search(ln):
+                r["ok_ts"], r["ok"] = ts, ln[ln.find("]", ln.find("]") + 1) + 1:].strip()[:100]
+            elif err_re.search(ln):
+                r["err_ts"], r["err"] = ts, ln[ln.find("]") + 1:].strip()[:140]
+        out.append(r)
+    return out
+
+
+def static_part(iface, failed, docker=(None, None), sh=None, bk=None):
     m = {}
     la = read("/proc/loadavg").split()
     if la:
@@ -363,13 +415,15 @@ def static_part(iface, failed, docker=(None, None), sh=None):
         m["docker_v"] = 2   # есть cp/ar: сторож отличает временные контейнеры от постоянных
     if sh is not None:
         m["shield"] = sh
+    if bk is not None:
+        m["backups"] = bk
     m["iface"] = iface
     return m
 
 
 def main():
     os.makedirs(os.path.dirname(OUT), exist_ok=True)
-    samples, prev, failed, failed_at, docker, sh = [], None, [], 0.0, (None, None), None
+    samples, prev, failed, failed_at, docker, sh, bk = [], None, [], 0.0, (None, None), None, None
     prev_proto = {}
     cl = Clients() if os.path.exists(XRAY_LOG) else None
     while True:
@@ -382,7 +436,7 @@ def main():
                         cl.push()
                 except OSError:
                     pass
-            failed, docker, sh, failed_at = failed_units(), containers(), shield(), t0
+            failed, docker, sh, bk, failed_at = failed_units(), containers(), shield(), backups(), t0
             if sh is not None and cl:
                 sh["clients"] = len(cl.map)
             if sh is not None and sh.get("loaded"):
@@ -390,7 +444,7 @@ def main():
         iface = default_iface()
         nd, ns, (ct, ci) = (netdev(iface) if iface else None), netstat(), cpu_times()
         cur = {"t": time.monotonic(), "nd": nd, "ns": ns, "ct": ct, "ci": ci, "ov": overload(iface) if iface else None}
-        m = static_part(iface, failed, docker, sh)
+        m = static_part(iface, failed, docker, sh, bk)
         if prev and prev["nd"] and nd and cur["t"] > prev["t"]:
             dt = cur["t"] - prev["t"]
             m["rx_bps"] = int(max(nd["rx_b"] - prev["nd"]["rx_b"], 0) * 8 / dt)

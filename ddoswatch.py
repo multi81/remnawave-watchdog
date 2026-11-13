@@ -92,6 +92,7 @@ DEFAULTS = {"key": ETC + "/ddos_ed25519", "known_hosts": ETC + "/ddos_known_host
                                     "remnawave-subscription-page"]}
 # Контейнеры Docker: отдельно от вердикта сервера, чтобы упавший контейнер не терялся за «Swap 95%»
 DOCKER_CONFIRM = 2          # проходов подряд (проход — раз в минуту), прежде чем тревожить
+BACKUP_MAX_HOURS = 26       # удачной копии нет дольше — тревога (свой срок: "backup_max_hours" в ddos.json)
 RESTARTS_HOUR = 3           # перезапусков за час — «по кругу» (плановый перезапуск раз в несколько часов — это не он)
 DOCKER_FORGET = 3 * 86400   # пропавший контейнер забываем через 3 суток
 # Щит — только с подтверждением в Telegram, никакой автоматики: сторож только предлагает, блокирует — кнопка (shieldbot)
@@ -629,6 +630,75 @@ def docker_pass(e, name, s, c):
     return msgs
 
 
+# ---------- бэкапы ----------
+def backup_problems(bks, now, max_h):
+    """{имя бэкапа: что не так} по срезу сборщика."""
+    out = {}
+    for b in bks or []:
+        n = str(b.get("name") or "?")
+        if b.get("missing"):
+            out[n] = "нет журнала бэкапа"
+        elif not b.get("ok_ts"):
+            out[n] = "в журнале нет ни одной удачной копии" + (": " + b["err"] if b.get("err") else "")
+        elif b.get("err_ts") and b["err_ts"] > b["ok_ts"]:
+            out[n] = "последняя попытка с ошибкой (%s): %s" % (msk(b["err_ts"]).strftime("%d.%m %H:%M"), b.get("err") or "?")
+        elif now - b["ok_ts"] > max_h * 3600:
+            out[n] = "последняя удачная копия %s — %s назад" % (msk(b["ok_ts"]).strftime("%d.%m %H:%M"), dur(now - b["ok_ts"]))
+    return out
+
+
+def backup_pass(e, name, s, c):
+    """Бэкапы сервера по последнему срезу -> сообщения. Сборщик без бэкапов — молчим."""
+    if "backups" not in s:
+        return []
+    bk = e.setdefault("backup", {})
+    probs = backup_problems(s["backups"], s["ts"], num(c.get("backup_max_hours"), BACKUP_MAX_HOURS))
+    cand, active = bk.setdefault("cand", {}), bk.setdefault("active", {})
+    newly = []
+    for k, t in probs.items():
+        cand[k] = cand.get(k, 0) + 1
+        if k in active:
+            active[k] = t
+        elif cand[k] >= DOCKER_CONFIRM:
+            active[k] = t
+            newly.append((k, t))
+    for k in list(cand):
+        if k not in probs:
+            del cand[k]
+    gone = [k for k in list(active) if k not in probs]
+    for k in gone:
+        active.pop(k)
+    bk["last"] = [{k: b.get(k) for k in ("name", "ok_ts", "ok")} for b in s["backups"]]
+    head = "\n\n🖥 <b>Сервер:</b> %s · 🕒 %s МСК\n\n" % (html.escape(name), msk(s["ts"]).strftime("%d.%m %H:%M"))
+    msgs = []
+    if newly:
+        msgs.append("💾 <b>Бэкап не в порядке</b>" + head + "\n".join(
+            "• <b>%s</b> — %s" % (html.escape(k), html.escape(t)) for k, t in newly)
+            + "\n\nПока бэкап не идёт, при поломке сервера данные с последней копии потеряются.")
+    if gone:
+        last = {b["name"]: b for b in bk["last"]}
+        msgs.append("🟢 <b>Бэкап снова в порядке</b>" + head + "\n".join(
+            "• <b>%s</b> — копия %s" % (html.escape(k), msk(last[k]["ok_ts"]).strftime("%d.%m %H:%M") if last.get(k, {}).get("ok_ts") else "есть")
+            for k in gone))
+    return msgs
+
+
+def backup_lines(hosts, now):
+    """(проблемы, сведения) для отчёта."""
+    iss, rows = [], []
+    for n, e in hosts.items():
+        bk = e.get("backup") or {}
+        for k, t in (bk.get("active") or {}).items():
+            iss.append("💾 <b>Бэкап %s (%s)</b> — %s" % (html.escape(k), html.escape(n), html.escape(t)))
+        for b in bk.get("last") or []:
+            if b.get("ok_ts"):
+                size = re.search(r"size=(\S+)", b.get("ok") or "")
+                rows.append("%s — %s%s" % (html.escape(b["name"]), msk(b["ok_ts"]).strftime("%d.%m %H:%M"),
+                                           " (%s)" % html.escape(size.group(1)) if size else ""))
+    info = ["<b>Бэкапы, последняя удачная копия:</b> " + ", ".join(rows)] if rows else []
+    return iss, info
+
+
 # ---------- щит ----------
 def ago_ru(ts, now):
     m = int(max(now - ts, 0) // 60)
@@ -833,6 +903,7 @@ def process(state, data, c, now, db=None):
         if fresh:
             last = max(fresh, key=lambda s: s["ts"])
             msgs += docker_pass(e, name, last, c)
+            msgs += backup_pass(e, name, last, c)
             msgs += shield_pass(e, name, last, c, state)
             inc = e.pop("incident", None)
             if inc:   # атака: одно сообщение с источниками и кнопками щита
@@ -1015,6 +1086,9 @@ def report_sections(since, now, state=None, c=None, db=None):
         si = shield_info(hosts)
         if si:
             info.append(si)
+        b_iss, b_inf = backup_lines(hosts, now)
+        issues += b_iss
+        info += b_inf
         s_iss, s_inf = scan_lines(hosts)
         issues += s_iss
         info += s_inf
