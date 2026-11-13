@@ -32,7 +32,7 @@ check("блокировать можно чужих; свои, частные и
 many = ["8.8.%d.%d" % (i // 250, i % 250 + 1) for i in range(60)]
 g2, b2 = s.check_block(many, C)
 check("не больше 50 за раз", len(g2) == 50 and len(b2) == 10)
-check("полигон: allow_private=false — частные можно", s.check_block(["172.16.0.128"], dict(C, allow_private=False))[0] == ["172.16.0.128"])
+check("полигон: allow_private=false — частные можно", s.check_block(["192.168.77.128"], dict(C, allow_private=False))[0] == ["192.168.77.128"])
 
 # --- shield-ctl: таблица
 t = s.render(C, "eth0")
@@ -88,9 +88,9 @@ with tempfile.TemporaryDirectory() as tmp:
 
 # --- разбор вывода nft -j (как на полигоне)
 js = {"nftables": [{"metainfo": {}}, {"set": {"name": "suspects4", "elem": [
-    {"elem": {"val": "172.16.0.128", "timeout": 600, "expires": 590, "counter": {"packets": 207, "bytes": 1}}},
+    {"elem": {"val": "192.168.77.128", "timeout": 600, "expires": 590, "counter": {"packets": 207, "bytes": 1}}},
     {"elem": {"val": "1.2.3.4", "counter": {"packets": 5, "bytes": 1}}}]}}]}
-check("разбор подозрительных со счётчиком", s.parse_set(js, "suspects4") == [("172.16.0.128", 207), ("1.2.3.4", 5)])
+check("разбор подозрительных со счётчиком", s.parse_set(js, "suspects4") == [("192.168.77.128", 207), ("1.2.3.4", 5)])
 check("разбор счётчиков", s.parse_counters({"nftables": [{"counter": {"name": "over_rate", "packets": 9}}]}) == {"over_rate": 9})
 
 # --- сборщик
