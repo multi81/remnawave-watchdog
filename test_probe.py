@@ -1601,7 +1601,7 @@ agent_cfg2 = {"token": TOKEN, "allow": ["127.0.0.1"], "suffixes": ["localhost"],
               "name": "тест", "hosts": ["127.0.0.1"], "snis": ["dl.google.com"]}
 agent2 = vantage_agent.Agent(("127.0.0.1", 0), agent_cfg2)
 threading.Thread(target=agent2.serve_forever, daemon=True).start()
-A2 = {"name": "Офис", "url": f"http://127.0.0.1:{agent2.server_address[1]}", "token": TOKEN}
+A2 = {"name": "Точка Б", "url": f"http://127.0.0.1:{agent2.server_address[1]}", "token": TOKEN}
 h = blockwatch.agent_get(A2, "/health")
 r = blockwatch.agent_get(A2, f"/series?host=localhost&port={p_page}&n=4&mss=1213")
 check(h["v"] == 6 and h["ports"] == [p_page, p_silent] and (r["n"], r["ok"], r["mss"]) == (4, 4, 1213 if MARK else None)
@@ -1650,7 +1650,7 @@ check(m2["seen"] == 27 and "теряются по дороге к ноде" in w
 
 L_NODES = [{"name": "de7", "host": "de7.example.net", "beacon": "https://de7.example.net/st-a.json"},
            {"name": "nl2", "host": "nl2.example.net", "beacon": "https://nl2.example.net/st-b.json"}]
-L_AGENTS = [{"name": "Москва", "url": "u", "token": "t"}, {"name": "Офис", "url": "u2", "token": "t"}]
+L_AGENTS = [{"name": "Москва", "url": "u", "token": "t"}, {"name": "Точка Б", "url": "u2", "token": "t"}]
 asked_loss, fetched = [], []
 real_fw = blockwatch.fetch_witness
 blockwatch.fetch_witness = lambda url, socks_port=None: fetched.append((url, socks_port)) or {"ts": 2000.0, "flows": [[f[0], 1205] + f[2:] for f in flows]}
@@ -1658,24 +1658,24 @@ res = blockwatch.loss_run(
     L_NODES, L_AGENTS, n=30, socks_port=21003, wait=0,
     local=lambda host, port, n, mss: asked_loss.append(("rf1", host, mss)) or ser(0, mss=mss),
     remote=lambda agent, host, mss: asked_loss.append((agent["name"], host, mss))
-    or (ser(3, mss=mss) if (agent["name"], host) == ("Офис", "de7.example.net") else None if agent["name"] == "Москва" and "nl2" in host else ser(0, mss=mss)))
+    or (ser(3, mss=mss) if (agent["name"], host) == ("Точка Б", "de7.example.net") else None if agent["name"] == "Москва" and "nl2" in host else ser(0, mss=mss)))
 blockwatch.fetch_witness = real_fw
-check(res["points"] == ["rf1", "Москва", "Офис"] and set(res["nodes"]) == {"de7", "nl2"}
-      and sorted(asked_loss) == sorted([(p, h, m_) for p, m_ in (("rf1", 1201), ("Москва", 1203), ("Офис", 1205))
+check(res["points"] == ["rf1", "Москва", "Точка Б"] and set(res["nodes"]) == {"de7", "nl2"}
+      and sorted(asked_loss) == sorted([(p, h, m_) for p, m_ in (("rf1", 1201), ("Москва", 1203), ("Точка Б", 1205))
                                         for h in ("de7.example.net", "nl2.example.net")])
-      and res["nodes"]["de7"]["Офис"]["fail"] == 3 and res["nodes"]["de7"]["Офис"]["wit"]["seen"] == 30
+      and res["nodes"]["de7"]["Точка Б"]["fail"] == 3 and res["nodes"]["de7"]["Точка Б"]["wit"]["seen"] == 30
       and "wit" not in res["nodes"]["de7"]["rf1"] and res["nodes"]["nl2"]["Москва"] is None
       and fetched == [("https://de7.example.net/fw-a.json", 21003)],
       "ZL12 замер: каждая точка — каждую ноду, у каждой точки своя метка; у ноды спрашиваем счётчики только там, где что-то потерялось")
 
 st_l = {}
-data = lambda ts, office: {"ts": ts, "n": 30, "points": ["rf1", "Офис"],
-                           "nodes": {"de7": {"rf1": ser(0), "Офис": office}, "nl2": {"rf1": ser(0), "Офис": ser(0)}}}
+data = lambda ts, office: {"ts": ts, "n": 30, "points": ["rf1", "Точка Б"],
+                           "nodes": {"de7": {"rf1": ser(0), "Точка Б": office}, "nl2": {"rf1": ser(0), "Точка Б": ser(0)}}}
 a1 = blockwatch.loss_step(st_l, data(100, ser(4, wit={"seen": 30, "rep": 4, "rst_out": 0, "rst_in": 0})))
 a2 = blockwatch.loss_step(st_l, data(200, ser(4, wit={"seen": 30, "rep": 4, "rst_out": 0, "rst_in": 0})))
 a3 = blockwatch.loss_step(st_l, data(300, ser(5)))
 L2 = a2[0].split("\n") if a2 else []
-check(a1 == [] and len(a2) == 1 and L2[0] == "📉 <b>Потери соединений до нод</b>" and "📍 Откуда: <b>Офис</b>" in L2
+check(a1 == [] and len(a2) == 1 and L2[0] == "📉 <b>Потери соединений до нод</b>" and "📍 Откуда: <b>Точка Б</b>" in L2
       and "• <b>DE7</b> — не проходит 4 из 30 (13 %)" in L2 and any(x.startswith("   ↳ нода получила все 30") for x in L2)
       and "С других точек к этим нодам: потерь нет (rf1)" in L2 and "NL4" not in a2[0] and a3 == []
       and L2.count("") >= 4 and max(len(x) for x in L2) < 190,
@@ -1684,35 +1684,35 @@ a4 = blockwatch.loss_step(st_l, data(400, ser(1)))
 a5 = blockwatch.loss_step(st_l, data(500, ser(0)))
 a6 = blockwatch.loss_step(st_l, data(600, ser(0)))
 check(a4 == [] and a5 == [] and len(a6) == 1 and "Потери соединений прошли" in a6[0]
-      and "📍 Откуда: <b>Офис</b>" in a6[0] and "• DE7 — проходят все 30 соединений" in a6[0]
-      and st_l["loss"]["lvl"]["de7|Офис"]["lvl"] == "ok",
+      and "📍 Откуда: <b>Точка Б</b>" in a6[0] and "• DE7 — проходят все 30 соединений" in a6[0]
+      and st_l["loss"]["lvl"]["de7|Точка Б"]["lvl"] == "ok",
       "ZL14 один-два потерянных — ещё не «прошло»; чисто два замера подряд — сообщение, что потери прошли")
 blockwatch.loss_step(st_l, data(700, ser(4)))
 blockwatch.loss_step(st_l, data(800, ser(4)))
 bl = blockwatch.block_line
-check("⚠️ потери соединений: de7 — Офис 13 %" in bl(st_l, 900)
+check("⚠️ потери соединений: de7 — Точка Б 13 %" in bl(st_l, 900)
       and "потери" not in (bl(st_l, 800 + blockwatch.LOSS_STALE + 1) or "")
       and "потерь соединений с точек нет" in bl({"loss": {"ts": 100, "lvl": {}, "last": {}}}, 200),
       "ZL15 в обычном отчёте: где сейчас потери; чисто — так и сказано; замер устарел — не упоминаем")
 
 okk = pt()
-d1 = dict(dd(okk, {"Офис": okk}, True), series={"rf1": ser(0, n=6), "Офис": ser(1, n=6)}, sni={})
+d1 = dict(dd(okk, {"Точка Б": okk}, True), series={"rf1": ser(0, n=6), "Точка Б": ser(1, n=6)}, sni={})
 lines = blockwatch.deep_lines(d1)
 check("соединений прошло 6 из 6" in lines[0] and "соединений прошло 5 из 6" in lines[1]
-      and "часть соединений теряется (Офис — 5 из 6)" in v(d1, "DOWN"),
+      and "часть соединений теряется (Точка Б — 5 из 6)" in v(d1, "DOWN"),
       "ZL16 в разборе у каждой точки — сколько соединений прошло; частичные потери названы в выводе")
 cut_cmp = {"addr": "9.9.9.9", "real": "silent", "neutral": "answer", "none": "answer"}
-d2 = dict(dd(NOTLS, {"Офис": NOTLS}, True), series={}, sni={"rf1": cut_cmp, "Офис": cut_cmp})
-d3 = dict(dd(NOTLS, {"Офис": NOTLS}, True), series={}, sni={"rf1": cut_cmp, "Офис": dict(cut_cmp, neutral="silent", none="silent")})
-check("режут по имени сайта" in v(d2, "DOWN") and any("имена TLS на том же адресе (с rf1, Офис)" in x for x in blockwatch.deep_lines(d2))
+d2 = dict(dd(NOTLS, {"Точка Б": NOTLS}, True), series={}, sni={"rf1": cut_cmp, "Точка Б": cut_cmp})
+d3 = dict(dd(NOTLS, {"Точка Б": NOTLS}, True), series={}, sni={"rf1": cut_cmp, "Точка Б": dict(cut_cmp, neutral="silent", none="silent")})
+check("режут по имени сайта" in v(d2, "DOWN") and any("имена TLS на том же адресе (с rf1, Точка Б)" in x for x in blockwatch.deep_lines(d2))
       and "режут по имени сайта" not in v(d3, "DOWN") and "блокировка по имени сайта (SNI) или по протоколу" in v(d3, "DOWN"),
       "ZL17 с настоящим именем ответа нет, с другим — есть, и так со всех точек — блокировка по имени; не со всех — прежний осторожный вывод")
-d4 = dict(dd(dict(DEAD, alt80="open"), {"Офис": dict(DEAD, alt80="refused")}, True), series={}, sni={})
+d4 = dict(dd(dict(DEAD, alt80="open"), {"Точка Б": dict(DEAD, alt80="refused")}, True), series={}, sni={})
 check("закрыт именно порт 443" in v(d4, "DOWN") and "а порт 80 на том же адресе отвечает" in blockwatch.deep_lines(d4)[0]
-      and "закрыт именно порт 443" not in v(dd(DEAD, {"Офис": DEAD}, True), "DOWN"),
+      and "закрыт именно порт 443" not in v(dd(DEAD, {"Точка Б": DEAD}, True), "DOWN"),
       "ZL18 порт 443 молчит, а порт 80 на том же адресе отвечает — закрыт порт, а не адрес")
 nl = blockwatch.node_line
-check(nl(POLAND, d1).startswith("⚠️") and "часть соединений теряется: Офис — прошло 5 из 6" in nl(POLAND, d1)
+check(nl(POLAND, d1).startswith("⚠️") and "часть соединений теряется: Точка Б — прошло 5 из 6" in nl(POLAND, d1)
       and nl(POLAND, dict(d1, series={})).startswith("✅"),
       "ZL19 в проверке по запросу нода с частичными потерями помечена, без потерь — как раньше")
 
@@ -1803,12 +1803,12 @@ fl2.feed(f"{T:.6f} IP 79.1.1.1.40001 > 93.187.140.234.443: Flags [S], seq 1, win
 check([f[1] for f in fl2.snapshot(T + 1)["flows"]] == [1207],
       "ZL27 свидетель на сервере сторожа: собственные исходящие проверки других нод за входящие не считает")
 
-two_pts = {"ts": 900, "n": 30, "points": ["rf1", "Москва", "Офис"],
-           "nodes": {"de7": {"rf1": ser(0), "Москва": ser(1), "Офис": ser(6)}, "fi1": {"rf1": ser(0), "Москва": ser(0), "Офис": ser(4)},
-                     "pl1": {"rf1": ser(0), "Москва": ser(5), "Офис": ser(0)}}}
-txt = blockwatch.loss_alert([("de7", "Офис"), ("fi1", "Офис"), ("pl1", "Москва")], two_pts)
+two_pts = {"ts": 900, "n": 30, "points": ["rf1", "Москва", "Точка Б"],
+           "nodes": {"de7": {"rf1": ser(0), "Москва": ser(1), "Точка Б": ser(6)}, "fi1": {"rf1": ser(0), "Москва": ser(0), "Точка Б": ser(4)},
+                     "pl1": {"rf1": ser(0), "Москва": ser(5), "Точка Б": ser(0)}}}
+txt = blockwatch.loss_alert([("de7", "Точка Б"), ("fi1", "Точка Б"), ("pl1", "Москва")], two_pts)
 check(txt.count("📍 Откуда:") == 2 and txt.index("<b>DE7</b>") < txt.index("<b>FI1</b>") < txt.index("📍 Откуда: <b>Москва</b>") < txt.index("<b>PL1</b>")
-      and "С других точек к этим нодам: DE7 — Москва: 1 из 30" in txt and "С других точек к этим нодам: потерь нет (rf1, Офис)" in txt
+      and "С других точек к этим нодам: DE7 — Москва: 1 из 30" in txt and "С других точек к этим нодам: потерь нет (rf1, Точка Б)" in txt
       and txt.endswith("Сами ноды работают."),
       "ZL28 несколько нод и точек в одном сообщении: сгруппировано по точке, у каждой свои ноды и своя строка про остальные точки")
 
@@ -1824,7 +1824,7 @@ s3 = step()
 put(4)
 s4 = step()
 check(s1 == [] and len(s2) == 1 and "Потери соединений до нод" in s2[0] and s3 == [] and s4 == []
-      and load()["loss"]["lvl"]["de7|Офис"]["lvl"] == "bad" and "потери соединений: de7 — Офис" in report(),
+      and load()["loss"]["lvl"]["de7|Точка Б"]["lvl"] == "bad" and "потери соединений: de7 — Точка Б" in report(),
       "ZL20 сторож: потери подтверждены вторым замером — одно сообщение; тот же файл дважды не читается; в отчёте — строка")
 os.remove(blockwatch.LOSS_FILE)
 
@@ -1834,13 +1834,13 @@ blockwatch.SIDE_FILE = os.path.join(tmp, "side.json")
 PF51 = blockwatch.profile_merge([{"sites": [{"kind": "blocked", "host": "rutracker.org", "addr": "1.2.3.4", "real": "silent",
                                              "neutral": "answer"}], "loads": []}] * 3)
 G51 = {"🇩🇪 DE": {"flag": "DE", "row": {"ipinfo": "DE"}, "org": "H", "cf": "DE", "yt": "RU"}}
-json.dump({"profiles": {"ts": clock["t"] + 1, "by": {"Офис": PF51}}, "geo": {"ts": clock["t"] + 1, "data": G51}},
+json.dump({"profiles": {"ts": clock["t"] + 1, "by": {"Точка Б": PF51}}, "geo": {"ts": clock["t"] + 1, "data": G51}},
           open(blockwatch.SIDE_FILE, "w", encoding="utf-8"))
 a51 = step()
 st51 = load()
 a51b = step()
-check(a51 == [] and a51b == [] and st51["profiles"]["by"]["Офис"]["tries"] == 3 and st51["geo"]["by"] == G51
-      and st51["geo"]["seen"]["🇩🇪 DE"]["youtube"] == ["RU"] and "за фильтром точки: Офис" in report()
+check(a51 == [] and a51b == [] and st51["profiles"]["by"]["Точка Б"]["tries"] == 3 and st51["geo"]["by"] == G51
+      and st51["geo"]["seen"]["🇩🇪 DE"]["youtube"] == ["RU"] and "за фильтром точки: Точка Б" in report()
       and load()["geo"]["ts"] == st51["geo"]["ts"],
       "ZL51 основной проход забирает профиль и гео из файла службы один раз; гео первой недели — исходное, без тревог")
 os.remove(blockwatch.SIDE_FILE)
@@ -1929,36 +1929,36 @@ check(r1 == ("203.0.113.7", "8.8.8.8") and r2 == (None, "fail") and s2["addr"] i
       "ZL34 свой DNS не нашёл имя — адрес берётся у публичного, и это помечено; не нашёл никто — так и сказано")
 
 NODES5 = ["de1", "de7", "nl1", "nl2", "pl1"]
-dz = lambda ts, office, moscow=None: {"ts": ts, "n": 30, "points": ["rf1", "Москва", "Офис"],
-                                       "nodes": {n: {"rf1": ser(0), "Москва": moscow(n) if moscow else ser(0), "Офис": office(n)}
+dz = lambda ts, office, moscow=None: {"ts": ts, "n": 30, "points": ["rf1", "Москва", "Точка Б"],
+                                       "nodes": {n: {"rf1": ser(0), "Москва": moscow(n) if moscow else ser(0), "Точка Б": office(n)}
                                                  for n in NODES5}}
 st_p = {}
 blind = lambda n: None
 b1 = blockwatch.loss_step(st_p, dz(100, lambda n: ser(4)))
 b2 = blockwatch.loss_step(st_p, dz(200, lambda n: ser(4)))
-check(len(b2) == 1 and "У точки «Офис» проблемы с сетью" in b2[0] and "5 нодам из 5" in b2[0] and "Потери соединений" not in b2[0]
-      and st_p["loss"]["skip"] == ["Офис"] and all(v["lvl"] == "ok" for k, v in st_p["loss"]["lvl"].items() if k.endswith("|Офис")),
+check(len(b2) == 1 and "У точки «Точка Б» проблемы с сетью" in b2[0] and "5 нодам из 5" in b2[0] and "Потери соединений" not in b2[0]
+      and st_p["loss"]["skip"] == ["Точка Б"] and all(v["lvl"] == "ok" for k, v in st_p["loss"]["lvl"].items() if k.endswith("|Точка Б")),
       "ZL35 точка теряет связь к большинству нод — одно сообщение о беде точки, по нодам не шлём, её пары не судим")
 nb = lambda n: ser(0) if n != "de7" else ser(5)
 b3 = blockwatch.loss_step(st_p, dz(300, nb))
 b4 = blockwatch.loss_step(st_p, dz(400, nb))
-check(b3 == [] and len(b4) == 1 and "Точка «Офис» снова в порядке" in b4[0] and st_p["loss"]["skip"] == []
-      and st_p["loss"]["lvl"]["de7|Офис"]["cand"] == "bad",
+check(b3 == [] and len(b4) == 1 and "Точка «Точка Б» снова в порядке" in b4[0] and st_p["loss"]["skip"] == []
+      and st_p["loss"]["lvl"]["de7|Точка Б"]["cand"] == "bad",
       "ZL35а точка снова в порядке — сообщение; дальше её пары судятся как обычно (de7 — уже кандидат в потери)")
 st_b = {}
 c1 = blockwatch.loss_step(st_b, dz(100, blind))
 c2 = blockwatch.loss_step(st_b, dz(200, lambda n: dict(ser(0), n=0, ok=0, addr=None, dns="fail")))
-check(len(c2) == 1 and "Точка «Офис» ничего не проверила" in c2[0] and "ни свой, ни публичный DNS" in c2[0]
-      and "Офис" in st_b["loss"]["skip"] and "точка «Офис» — ничего не проверяет" in blockwatch.block_line(st_b, 250),
+check(len(c2) == 1 and "Точка «Точка Б» ничего не проверила" in c2[0] and "ни свой, ни публичный DNS" in c2[0]
+      and "Точка Б" in st_b["loss"]["skip"] and "точка «Точка Б» — ничего не проверяет" in blockwatch.block_line(st_b, 250),
       "ZL36 точка ничего не проверила два замера подряд — сообщение с причиной, строка в отчёте, её данные не учитываются")
-check(blockwatch.loss_step(st_b, dz(300, blind)) == [] and st_b["loss"]["pt"]["Офис"]["lvl"] == "blind",
+check(blockwatch.loss_step(st_b, dz(300, blind)) == [] and st_b["loss"]["pt"]["Точка Б"]["lvl"] == "blind",
       "ZL36а пока точка слепа — повторных сообщений нет")
 
-dns_res = {"a.example.com": {"system": {"rf1": "ok", "Офис": "err"}}, "b.example.net": {"system": {"rf1": "ok", "Офис": "err"}},
-           "c.example.net": {"system": {"rf1": "ok", "Офис": "ok"}}}
-check(blockwatch.dns_points(dns_res, [{"name": "Офис"}]) == {"rf1": (0, 3), "Офис": (2, 3)}
-      and "свой DNS не находит наши имена" in blockwatch.dns_point_text("Офис", "bad", 2, 3)
-      and "снова находит" in blockwatch.dns_point_text("Офис", "ok", 0, 3),
+dns_res = {"a.example.com": {"system": {"rf1": "ok", "Точка Б": "err"}}, "b.example.net": {"system": {"rf1": "ok", "Точка Б": "err"}},
+           "c.example.net": {"system": {"rf1": "ok", "Точка Б": "ok"}}}
+check(blockwatch.dns_points(dns_res, [{"name": "Точка Б"}]) == {"rf1": (0, 3), "Точка Б": (2, 3)}
+      and "свой DNS не находит наши имена" in blockwatch.dns_point_text("Точка Б", "bad", 2, 3)
+      and "снова находит" in blockwatch.dns_point_text("Точка Б", "ok", 0, 3),
       "ZL37 по проверке DNS видно, у какой точки свой DNS не находит наши имена")
 fresh()
 real_dns_check_fake = blockwatch.dns_check
@@ -1980,7 +1980,7 @@ check(len(dns_msgs) == 1 and "«Москва»" in dns_msgs[0] and len([x for x 
       "ZL37а сторож: свой DNS точки не находит наши имена две проверки подряд — одно сообщение; снова находит — одно")
 
 okk2 = pt()
-d5 = dict(dd(okk2, {"Офис": DEAD, "Москва": okk2}, True), series={}, sni={}, skip=["Офис"])
+d5 = dict(dd(okk2, {"Точка Б": DEAD, "Москва": okk2}, True), series={}, sni={}, skip=["Точка Б"])
 check("со всех 2 российских точек" in v(d5, "DOWN") and "с части российских точек" not in v(d5, "DOWN")
       and any("в выводе не учитываю" in x for x in blockwatch.deep_lines(d5)),
       "ZL38 разбор сбоя: точку с собственной бедой сети показываем, но в выводе не учитываем")
@@ -1998,7 +1998,7 @@ PF_ONCE = blockwatch.profile_merge([prun("silent", "answer"), prun("answer", "an
 PF_ONE = blockwatch.profile_merge([prun("silent", "answer")])
 PF_DEAD = blockwatch.profile_merge([{"sites": [{"kind": "blocked", "host": "r.org", "addr": None, "real": "dns", "neutral": None}, {"kind": "control", "host": "ya.ru", "addr": "9.9.9.9", "real": "tcp", "neutral": None}], "loads": []}] * 2)
 pv = blockwatch.profile_verdict
-t_filt = blockwatch.profile_text("Офис", PF_FILT)
+t_filt = blockwatch.profile_text("Точка Б", PF_FILT)
 t_once = blockwatch.profile_text("Москва", PF_ONCE)
 check(pv(PF_FILT) == "filtered" and pv(PF_ONCE) == "clear" and pv(PF_ONE) == "clear"
       and pv({"sites": [{"kind": "blocked", "host": "x", "real": "silent", "neutral": "answer"}]}) == "unknown"
@@ -2011,13 +2011,13 @@ check(pv(PF_FILT) == "filtered" and pv(PF_ONCE) == "clear" and pv(PF_ONE) == "cl
 check(pv(PF_DEAD) == "unknown" and blockwatch.profile_merge([prun("silent", "answer", 10.0), prun("silent", "answer", 30.0),
                                                               prun("silent", "answer", 20.0)])["loads"][0]["mbit"] == 20.0,
       "ZL39а ничего не ответило — «не определить»; скорость — медиана попыток")
-st_pf = {"profiles": {"ts": 1000, "by": {"Офис": PF_FILT, "Москва": PF_ONCE}}}
-check("ℹ️ за фильтром точки: Офис" in blockwatch.block_line(st_pf, 1100)
-      and blockwatch.profiles_line({"profiles": {"ts": 1, "by": {"Москва": PF_ONCE, "Офис": PF_DEAD}}}) == "точки без фильтра по имени (1)"
-      and blockwatch.profiles_line({"profiles": {"ts": 1, "by": {"Офис": PF_DEAD}}}) is None,
+st_pf = {"profiles": {"ts": 1000, "by": {"Точка Б": PF_FILT, "Москва": PF_ONCE}}}
+check("ℹ️ за фильтром точки: Точка Б" in blockwatch.block_line(st_pf, 1100)
+      and blockwatch.profiles_line({"profiles": {"ts": 1, "by": {"Москва": PF_ONCE, "Точка Б": PF_DEAD}}}) == "точки без фильтра по имени (1)"
+      and blockwatch.profiles_line({"profiles": {"ts": 1, "by": {"Точка Б": PF_DEAD}}}) is None,
       "ZL40 в отчёте — какие точки за фильтром; если никто — так и сказано")
 okk3 = pt()
-dpf = dict(dd(okk3, {"Офис": okk3, "Москва": okk3}, True), series={}, sni={}, filtered=["Офис"])
+dpf = dict(dd(okk3, {"Точка Б": okk3, "Москва": okk3}, True), series={}, sni={}, filtered=["Точка Б"])
 check("из них за фильтром: 1" in v(dpf, "DOWN"),
       "ZL41 в разборе сбоя рядом с «отвечает со всех точек» — сколько из них за фильтром")
 # ZL47. Список профиля у rf1 и у агентов один и тот же
@@ -2044,11 +2044,11 @@ def bad_local():
     return prun("answer", "answer")
 
 
-by48 = blockwatch.profile_fetch([{"name": "Офис"}, {"name": "Молчит"}], tries=3, gap=0, local=bad_local)
+by48 = blockwatch.profile_fetch([{"name": "Точка Б"}, {"name": "Молчит"}], tries=3, gap=0, local=bad_local)
 blockwatch.agent_get = real_ag
-check(sorted(by48) == ["rf1", "Офис"] and by48["Офис"]["tries"] == 3 and by48["rf1"]["tries"] == 2
-      and pv(by48["Офис"]) == "filtered" and pv(by48["rf1"]) == "clear"
-      and calls.count(("Офис", "/profile")) == 3 and len(n_local) == 3,
+check(sorted(by48) == ["rf1", "Точка Б"] and by48["Точка Б"]["tries"] == 3 and by48["rf1"]["tries"] == 2
+      and pv(by48["Точка Б"]) == "filtered" and pv(by48["rf1"]) == "clear"
+      and calls.count(("Точка Б", "/profile")) == 3 and len(n_local) == 3,
       "ZL48 сбор профиля: три попытки на каждую точку и сам rf1; молчащая точка пропускается, сбой одной попытки — не помеха")
 
 # агент: /profile по своему списку (произвольную цель не принимает)
@@ -2161,8 +2161,8 @@ netprobe.tls_hello = real_th
 nn = blockwatch.name_note
 check(r_cut == {"ref": "127.0.0.1", "n": 2, "name_ok": 0, "neutral_ok": 2, "fails": {"silent": 2}}
       and blockwatch.name_cut(r_cut) and not blockwatch.name_cut(r_free) and r_free["name_ok"] == 2
-      and "новый адрес не поможет" in nn({"refs": {"rf1": r_cut, "Офис": r_cut}})
-      and "поможет новый адрес" in nn({"refs": {"rf1": r_free}}) and nn({"refs": {"rf1": r_cut, "Офис": r_free}}) is None
+      and "новый адрес не поможет" in nn({"refs": {"rf1": r_cut, "Точка Б": r_cut}})
+      and "поможет новый адрес" in nn({"refs": {"rf1": r_free}}) and nn({"refs": {"rf1": r_cut, "Точка Б": r_free}}) is None
       and nn({}) is None,
       "ZL54 «закрыто ли имя»: на чужом сервере с нашим именем молчит, с нейтральным отвечает — имя в фильтре; "
       "проходит — закрыт только адрес; точки расходятся — вывода нет")
@@ -2186,8 +2186,8 @@ netprobe.path_trace, netprobe.name_ref, netprobe.sni_compare = real_pt, real_nr,
 check(r56 == ({"asked": ["localhost", p_page]}, {"asked": "localhost"}, {"addr": "1", "mss": 1233}, {"addr": "1", "mss": 1260},
               None, None, vantage_agent.VERSION),
       "ZL56 агент 4: путь и «закрыто ли имя» — только до разрешённого имени и порта; метка сравнения имён — в пределах")
-d57 = dict(dd(pt("timeout"), {"Офис": pt("timeout")}, True), series={}, sni={}, paths={"Офис": p_lost},
-           refs={"rf1": r_cut, "Офис": r_cut}, witness={"Офис|tls": {"seen": 1, "rep": 0, "rst_out": 0, "rst_in": 0},
+d57 = dict(dd(pt("timeout"), {"Точка Б": pt("timeout")}, True), series={}, sni={}, paths={"Точка Б": p_lost},
+           refs={"rf1": r_cut, "Точка Б": r_cut}, witness={"Точка Б|tls": {"seen": 1, "rep": 0, "rst_out": 0, "rst_in": 0},
                                                        "rf1|tls": {"seen": 1, "rep": 0, "rst_out": 1, "rst_in": 0}})
 live57 = blockwatch.DEEP_EXTRA_LIVE
 blockwatch.DEEP_EXTRA_LIVE = False
@@ -2196,12 +2196,12 @@ txt_shadow = blockwatch.deep_text(d57, "DOWN")
 blockwatch.DEEP_EXTRA_LIVE = True
 txt_live = blockwatch.deep_text(d57, "DOWN")
 blockwatch.DEEP_EXTRA_LIVE = live57
-check(not any("путь от" in x for x in plain) and "• путь от Офис: пропадает после шага 3 (10.0.0.3)" in full
-      and any("имя ноды на чужом сервере (rf1, Офис): с нашим именем ответа нет" in x for x in full)
-      and "• сброс TLS (Офис): нода сброса не отправляла — соединение оборвали по дороге" in full
+check(not any("путь от" in x for x in plain) and "• путь от Точка Б: пропадает после шага 3 (10.0.0.3)" in full
+      and any("имя ноды на чужом сервере (rf1, Точка Б): с нашим именем ответа нет" in x for x in full)
+      and "• сброс TLS (Точка Б): нода сброса не отправляла — соединение оборвали по дороге" in full
       and "• сброс TLS (rf1): его отправила сама нода" in full
       and "новый адрес не поможет" not in txt_shadow and "путь от" not in txt_shadow
-      and "новый адрес не поможет" in txt_live and "путь от Офис" in txt_live
+      and "новый адрес не поможет" in txt_live and "путь от Точка Б" in txt_live
       and "блокировку адреса ноды из России" in v(d57, "DOWN"),
       "ZL57 пробный режим: путь, имя и сброс TLS — в журнале (extra), в сообщении нет; включили — есть; "
       "сверка TLS не путается со сверкой серий в выводе")
@@ -2245,7 +2245,7 @@ check(d59["paths"] == {"Москва": p_lost} and set(d59["refs"]) == {"rf1", "
       and "новый адрес не поможет" in blockwatch.name_note(d59),
       "ZL59 разбор целиком: у точки с закрытым входом — путь и имя на чужом сервере; сброс TLS сверен по метке с нодой")
 
-# ZL60–ZL64. VPN-точка: проверка плиток через свой клиент Xray на офисной машине (v10, часть E)
+# ZL60–ZL64. VPN-точка: проверка плиток через свой клиент Xray на отдельной машине (v10, часть E)
 class FakeRun:
     def __init__(self, out, rc=0):
         self.stdout, self.returncode = out, rc
@@ -2279,7 +2279,7 @@ agent5 = vantage_agent.Agent(("127.0.0.1", 0), dict(agent_cfg, vpn=True))
 agent6 = vantage_agent.Agent(("127.0.0.1", 0), agent_cfg)
 for a_ in (agent5, agent6):
     _th.Thread(target=a_.serve_forever, daemon=True).start()
-A5 = {"name": "Офис", "url": f"http://127.0.0.1:{agent5.server_address[1]}", "token": TOKEN, "vpn": True}
+A5 = {"name": "Точка Б", "url": f"http://127.0.0.1:{agent5.server_address[1]}", "token": TOKEN, "vpn": True}
 A6 = {"name": "Москва", "url": f"http://127.0.0.1:{agent6.server_address[1]}", "token": TOKEN}
 import urllib.parse as _up
 r61 = (blockwatch.agent_get(A5, "/vpn"), blockwatch.agent_get(A5, "/vpn?name=" + _up.quote("🇳🇱NL 3")),
@@ -2290,33 +2290,33 @@ agent5.shutdown()
 agent6.shutdown()
 check(r61 == ({"names": ["🇳🇱NL 3", "Poland"]}, {"ok": True, "bytes": 524288, "port": 21003, "name": "🇳🇱NL 3"}, None, None, True, False),
       "ZL61 агент VPN-точки: только плитки своего списка (чужое имя — отказ); точка без своего Xray на /vpn не отвечает")
-check(set(sweep) == {"Офис"} and sweep["Офис"]["Poland"]["ok"] is False and sweep["Офис"]["нет такой"] is None,
+check(set(sweep) == {"Точка Б"} and sweep["Точка Б"]["Poland"]["ok"] is False and sweep["Точка Б"]["нет такой"] is None,
       "ZL62 обход: все плитки через каждую VPN-точку; остальные точки не спрашиваются")
 vantage_agent.VPN_CHANNELS, netprobe.socks_load = real_vc, real_sl
 vt = blockwatch.vpn_text
 check(vt({"ok": True, "bytes": 524288, "s": 0.52, "mbit": 8.0}) == "работает (512 КБ за 0.52 с, 8.0 Мбит/с)"
       and vt({"ok": False, "bytes": 20480, "code": "200"}) == "не работает: пришло 20 КБ из 512"
       and vt({"ok": False, "bytes": 0, "code": "000"}) == "не работает" and vt(None) == "точка не ответила"
-      and blockwatch.vpn_line({"vpn_pt": {"ts": 1, "by": {"Офис": {"🇳🇱NL 3": {"ok": True}, "🇵🇱 Poland": {"ok": False}, "x": None}}}})
-      == "через VPN с точки Офис: работают 1 из 2 (не работают: 🇵🇱 Poland)"
+      and blockwatch.vpn_line({"vpn_pt": {"ts": 1, "by": {"Точка Б": {"🇳🇱NL 3": {"ok": True}, "🇵🇱 Poland": {"ok": False}, "x": None}}}})
+      == "через VPN с точки Точка Б: работают 1 из 2 (не работают: 🇵🇱 Poland)"
       and blockwatch.vpn_line({}) is None,
       "ZL63 строки VPN-точки: работает / не работает / сколько плиток работает в отчёте")
-d64 = dict(dd(pt("timeout"), {}, True), series={}, sni={}, vpn={"Офис": {"ok": True, "bytes": 524288, "s": 0.6, "mbit": 7.0}})
+d64 = dict(dd(pt("timeout"), {}, True), series={}, sni={}, vpn={"Точка Б": {"ok": True, "bytes": 524288, "s": 0.6, "mbit": 7.0}})
 live64 = blockwatch.DEEP_EXTRA_LIVE
 blockwatch.DEEP_EXTRA_LIVE = False
 shadow64 = blockwatch.deep_lines(d64)
 blockwatch.DEEP_EXTRA_LIVE = live64
-check("• через VPN с точки Офис: работает (512 КБ за 0.6 с, 7.0 Мбит/с)" in blockwatch.deep_lines(d64, extra=True)
+check("• через VPN с точки Точка Б: работает (512 КБ за 0.6 с, 7.0 Мбит/с)" in blockwatch.deep_lines(d64, extra=True)
       and not any("через VPN" in x for x in shadow64),
       "ZL64 разбор сбоя: что видит VPN-точка через эту плитку — в журнале (пробный режим), в сообщении пока нет")
 # основной проход забирает обход из файла службы --side
 fresh()
 blockwatch.SIDE_FILE = os.path.join(tmp, "side.json")
 t64 = clock["t"] + 1
-json.dump({"vpn": {"ts": t64, "by": {"Офис": {CHANS[0]["name"]: {"ok": False, "bytes": 0}}}}},
+json.dump({"vpn": {"ts": t64, "by": {"Точка Б": {CHANS[0]["name"]: {"ok": False, "bytes": 0}}}}},
           open(blockwatch.SIDE_FILE, "w", encoding="utf-8"))
 a64 = step()
-check(a64 == [] and "через VPN с точки Офис: работают 0 из 1" in report() and load()["vpn_pt"]["ts"] == t64,
+check(a64 == [] and "через VPN с точки Точка Б: работают 0 из 1" in report() and load()["vpn_pt"]["ts"] == t64,
       "ZL64а обход VPN-точки приходит из файла службы: строка в отчёте, тревог нет (пробный режим)")
 os.remove(blockwatch.SIDE_FILE)
 
@@ -2413,7 +2413,7 @@ T3 = ["DE1", "NL1", "Poland", "DE7"]
 
 
 def sweep(**bad):
-    return {"Офис": {t: (bad[t] if t in bad else OKR) for t in T3}}
+    return {"Точка Б": {t: (bad[t] if t in bad else OKR) for t in T3}}
 
 
 st69, ok_all = {}, {t: True for t in T3}
@@ -2421,7 +2421,7 @@ m1 = blockwatch.vpn_step(st69, sweep(Poland=BAD), ok_all)
 m2 = blockwatch.vpn_step(st69, sweep(Poland=BAD), ok_all)
 m3 = blockwatch.vpn_step(st69, sweep(Poland=BAD), ok_all)
 m4 = blockwatch.vpn_step(st69, sweep(), ok_all)
-check(m1 == [] and len(m2) == 1 and "Через VPN с точки Офис не работает: Poland" in m2[0] and "с rf1 плитка работает" in m2[0]
+check(m1 == [] and len(m2) == 1 and "Через VPN с точки Точка Б не работает: Poland" in m2[0] and "с rf1 плитка работает" in m2[0]
       and m3 == [] and len(m4) == 1 and "снова работает: Poland" in m4[0],
       "ZL70 плитка не работает через VPN-точку два обхода подряд, а с rf1 работает — одно сообщение; вернулась — «снова работает»")
 st70 = {}
@@ -2431,13 +2431,13 @@ both = [blockwatch.vpn_step(st70b, sweep(Poland=BAD), dict(ok_all, Poland=False)
 check(all(m == [] for m in alt) and all(m == [] for m in both),
       "ZL71 разовые сбои разных плиток (как в пробную ночь) — тишина; не работает и с rf1 — пишет основной сторож, не VPN-точка")
 st71 = {}
-dead = {"Офис": {t: None for t in T3}}
+dead = {"Точка Б": {t: None for t in T3}}
 p1 = blockwatch.vpn_step(st71, dead, ok_all)
 p2 = blockwatch.vpn_step(st71, sweep(DE1=BAD, NL1=BAD, Poland=BAD), ok_all)
 p3 = blockwatch.vpn_step(st71, dead, ok_all)
 p4 = blockwatch.vpn_step(st71, sweep(), ok_all)
-check(p1 == [] and len(p2) == 1 and "VPN-точка Офис не проверяет плитки" in p2[0] and "прошло 1 из 4" in p2[0] and p3 == []
-      and len(p4) == 1 and "снова проверяет плитки" in p4[0] and st71["vpn_alert"]["Офис"]["tiles"].get("Poland", {}).get("n", 0) == 0,
+check(p1 == [] and len(p2) == 1 and "VPN-точка Точка Б не проверяет плитки" in p2[0] and "прошло 1 из 4" in p2[0] and p3 == []
+      and len(p4) == 1 and "снова проверяет плитки" in p4[0] and st71["vpn_alert"]["Точка Б"]["tiles"].get("Poland", {}).get("n", 0) == 0,
       "ZL72 у самой VPN-точки беда (прошло меньше половины) — плитки не судим, о точке одно сообщение после двух обходов; наладилась — сообщение")
 
 import io

@@ -170,15 +170,15 @@ open(os.path.join(d, "s.json"), "w").write('{"local": ["a.ru"]}')
 fr, lo = rc.services_list(os.path.join(d, "s.json"))
 check(lo == ["a.ru"] and fr == list(rc.SERVICES) and rc.services_list(os.path.join(d, "нет")) == (list(rc.SERVICES), list(rc.LOCAL)),
       "R31 свой файл заменяет списки по отдельности; файла нет — по умолчанию")
-# --- проверка с точки (офис), сервер сторожа — запасной
+# --- проверка с точки у обычного провайдера, сервер сторожа — запасной
 asked = []
-office = {"name": "Офис", "url": "x", "token": "t", "rucheck": True}
+office = {"name": "Точка Б", "url": "x", "token": "t", "rucheck": True}
 good = lambda a, hosts: asked.append(a["name"]) or {h: {"verdict": "TCP_TIMEOUT" if h == "x.com" else "OK"} for h in hosts}
 r1 = rc.run_live([], geo_dir=tmp, services=(["x.com"], ["vk.com"]), net=Net(), points=[office], ask=good)
-check(r1["source"] == "Офис" and r1["services"]["x.com"]["verdict"] == "TCP_TIMEOUT" and r1["services"]["vk.com"]["local"]
-      and asked == ["Офис"], "R32 сервисы проверяются с точки, российские отмечаются")
+check(r1["source"] == "Точка Б" and r1["services"]["x.com"]["verdict"] == "TCP_TIMEOUT" and r1["services"]["vk.com"]["local"]
+      and asked == ["Точка Б"], "R32 сервисы проверяются с точки, российские отмечаются")
 r2 = rc.run_live([], geo_dir=tmp, services=(["x.com"], []), net=Net(), points=[office], ask=lambda a, h: None)
-check(r2["source"] is None and r2["missed"] == ["Офис"] and r2["services"]["x.com"]["verdict"] == "OK",
+check(r2["source"] is None and r2["missed"] == ["Точка Б"] and r2["services"]["x.com"]["verdict"] == "OK",
       "R33 точка не ответила — проверка с сервера сторожа")
 st3 = {}
 rc.step(st3, r2)
@@ -186,5 +186,5 @@ check(any("не ответила" in p for p in rc.items(st3)) and any(p.startsw
       "R34 в отчёте видно, откуда проверено и что точка молчит")
 st4 = {}
 rc.step(st4, r1)
-check(any(p.startswith("с точки «Офис» закрыто 1 из 1") for p in rc.items(st4)), "R35 в отчёте — точка, с которой проверено")
+check(any(p.startswith("с точки «Точка Б» закрыто 1 из 1") for p in rc.items(st4)), "R35 в отчёте — точка, с которой проверено")
 print("rucheck: тестов пройдено %d" % ok)
