@@ -656,6 +656,7 @@ def deep_diag(ch, via, agents, bases):
     beacon = next((n.get("beacon") for n in read_etc("nodes.json", []) if n.get("host") == host), None)
     tls = {f"{n}|tls": t for n, t in ((n, tls_ser(c)) for n, c in names.items()) if t}
     d["witness"] = witness_wait(witness_url(beacon), {**series, **tls}, via["port"] if via else None) if port == 443 else {}
+    add_hop_info(d)   # чей последний ответивший узел трассировки
     return d
 
 
@@ -1008,6 +1009,67 @@ def point_text(r):
     return f"порт открыт ({r['tcp_ms']} мс), TLS отвечает" if r["tls"] else f"порт открыт ({r['tcp_ms']} мс)"
 
 
+HOP_CACHE = "/var/lib/channel-watch/hops.json"   # кто владеет узлами трассировки: {адрес: {"ts", "info"}}
+HOP_TTL = 7 * 86400
+HOP_LOOKUP = None                                  # подмена запроса к гео-базе (тесты); None — ipinfo.io
+CGNAT = ipaddress.ip_network("100.64.0.0/10")
+
+
+def hop_lookup(ip, timeout=6):
+    """Сеть, страна и город адреса по ipinfo.io: {"org", "country", "city"} или None."""
+    try:
+        out = subprocess.run(["curl", "-s", "-m", str(timeout), f"https://ipinfo.io/{ip}/json"],
+                             capture_output=True, text=True, timeout=timeout + 4).stdout
+        d = json.loads(out)
+        return d if isinstance(d, dict) and (d.get("org") or d.get("country")) else None
+    except (ValueError, subprocess.TimeoutExpired, OSError):
+        return None
+
+
+def hop_info(ip, lookup=None, cache_file=None, now=None):
+    """Чей узел: «AS1299 Arelion Sweden AB · SE Stockholm»; частный адрес — «внутренняя сеть хостера»; не узнали — ""."""
+    try:
+        a = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return ""
+    if a.is_private or a.is_loopback or a.is_link_local or (a.version == 4 and a in CGNAT):
+        return "внутренняя сеть хостера"
+    cache_file, now = cache_file or HOP_CACHE, now or time.time()
+    try:
+        cache = json.load(open(cache_file, encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    hit = cache.get(str(a))
+    if hit and now - hit.get("ts", 0) <= HOP_TTL:
+        return hit.get("info", "")
+    d = (lookup or HOP_LOOKUP or hop_lookup)(str(a))
+    if not d:
+        return ""
+    where = " ".join(x for x in (d.get("country"), d.get("city")) if x)
+    info = " · ".join(x for x in (str(d.get("org") or "").strip(), where) if x)
+    cache[str(a)] = {"ts": int(now), "info": info}
+    try:
+        with open(cache_file + ".tmp", "w", encoding="utf-8") as f:
+            json.dump(cache, f, ensure_ascii=False)
+        os.replace(cache_file + ".tmp", cache_file)
+    except OSError:
+        pass
+    return info
+
+
+def add_hop_info(d, lookup=None, cache_file=None):
+    """Разбор сбоя: к последнему ответившему узлу трассировки (с rf1 и с точек) дописать, чей он."""
+    items = [d.get("trace")] + list((d.get("paths") or {}).values())
+    for t in items:
+        if t and not t.get("reached") and t.get("last"):
+            t["last_info"] = hop_info(t["last"][1], lookup, cache_file)
+    return d
+
+
+def _with_info(addr, info):
+    return f"{addr} — {info}" if info else f"{addr}"
+
+
 def path_text(p):
     """Путь с точки до ноды одной фразой; None — нечего сказать."""
     if not p or not p.get("addr") or "list" not in p:
@@ -1018,7 +1080,7 @@ def path_text(p):
     if rej:
         return f"узел шага {rej[0]} ({rej[2]}) ответил отказом — путь закрыт на нём"
     if p.get("last"):
-        return f"пропадает после шага {p['last'][0]} ({p['last'][1]})"
+        return f"пропадает после шага {p['last'][0]} ({_with_info(p['last'][1], p.get('last_info'))})"
     return "не ответил ни один шаг"
 
 
@@ -1085,7 +1147,7 @@ def deep_lines(d, extra=None):
         if t["reached"]:
             lines.append(f"• трассировка с rf1: пакеты доходят до ноды ({t['hops']} шагов)")
         elif t["last"]:
-            lines.append(f"• трассировка с rf1: пакеты пропадают после шага {t['last'][0]} ({t['last'][1]})")
+            lines.append(f"• трассировка с rf1: пакеты пропадают после шага {t['last'][0]} ({_with_info(t['last'][1], t.get('last_info'))})")
         else:
             lines.append("• трассировка с rf1: не ответил ни один шаг")
     ext = d.get("external")
