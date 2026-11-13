@@ -25,9 +25,11 @@ ETC = "/etc/channel-watch"
 DIR = "/var/lib/channel-watch/scanners"
 BASE = "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/"
 LISTS = {"antiscanner": "сканеры", "government_networks": "государственные сети", "skipa": "СКИПА (РКН)",
-         "c24be_gov": "госорганы РФ (C24Be)"}
+         "c24be_gov": "госорганы РФ (C24Be)", "antiscanner_sngvy": "сканеры и парсеры подписок (AntiScanner)"}
 # списки не из shadow-netlab — свой адрес (C24Be/AS_Network_List, BSD-2, обновляется ежедневно; IPv4 и IPv6)
-URLS = {"c24be_gov": "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt"}
+URLS = {"c24be_gov": "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt",
+        # sngvy/AntiScanner: ГРЧЦ/CyberOK, ЕСПД, Censys, Shodan, Netlas, «парсеры подписок» и др. (точечные сети)
+        "antiscanner_sngvy": "https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"}
 
 
 def list_url(name):

@@ -51,7 +51,7 @@ case "${ID:-}:${VERSION_ID:-}" in
   ubuntu:24.04|ubuntu:26.04) ;;
   *) echo "внимание: рассчитано на Ubuntu 24.04 / 26.04, здесь ${PRETTY_NAME:-неизвестная система}" ;;
 esac
-for f in probe.py nodewatch.py blockwatch.py netprobe.py build_channels.py; do
+for f in probe.py nodewatch.py blockwatch.py netprobe.py rucheck.py build_channels.py; do
   [ -s "$SRC/$f" ] || { echo "рядом со скриптом нет $f"; exit 1; }
 done
 missing=""
@@ -62,7 +62,7 @@ if [ -n "$missing" ]; then
   apt-get install -y -qq python3 curl iputils-ping traceroute
 fi
 python3 -c 'import ast, sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' \
-  "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/build_channels.py"
+  "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py"
 
 # --- ссылка подписки служебного пользователя ---
 install -d -m 700 "$ETC"
@@ -87,7 +87,7 @@ chmod 600 "$TG_ENV"
 
 # --- файлы ---
 install -d -m 755 /opt/channel-watch /var/lib/channel-watch
-install -m 755 "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/build_channels.py" /opt/channel-watch/
+install -m 755 "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py" /opt/channel-watch/
 
 # клиент Xray: тот же бинарник, что у ноды (ничего не скачиваем), либо указанный файл
 if [ -n "$xray_src" ]; then

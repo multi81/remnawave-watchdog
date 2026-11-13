@@ -48,6 +48,12 @@
 - Раз в 6 часов сверяет ваши адреса и домены с публичными списками блокировок и показывает соседей в реестре.
 - Проверяет, не подменяет ли обычный DNS адреса ваших сайтов и нод.
 - Следит за страной и сетью адресов нод по пяти гео-базам: заметит, если «Германия» вдруг стала «США».
+- **Сверяет шаблон подписки с блокировками.** Раз в 6 часов проверяет популярные сервисы прямо из России по слоям
+  (DNS, TCP, TLS, страница-заглушка) и разбирает правила каждой плитки подписки (domain/full/regexp, geosite и geoip из
+  `geosite.dat`/`geoip.dat` ноды, `domainStrategy`). Если сервис по шаблону идёт напрямую, а из России закрыт, придёт
+  тревога: у клиентов на этой плитке он не откроется. Плитки, где всё идёт напрямую («для заграницы»), не сверяются;
+  российские сервисы только отмечаются (часть из них не пускает адреса хостингов). Идея проверки по слоям —
+  [rkn-block-checker](https://github.com/MayersScott/rkn-block-checker).
 
 ### 🌐 Сайты, подписка, сертификаты
 - Панель, кабинет и другие ваши сайты — напрямую из РФ; страница подписки — **настоящей загрузкой** подписки.
@@ -81,6 +87,7 @@
   | `skipa` (shadow-netlab) | СКИПА — сканеры РКН |
   | `antiscanner` (shadow-netlab) | сканеры интернета |
   | `c24be_gov` ([C24Be/AS_Network_List](https://github.com/C24Be/AS_Network_List)) | сети госорганов РФ, IPv4 и IPv6 |
+  | `antiscanner_sngvy` ([sngvy/AntiScanner](https://github.com/sngvy/AntiScanner)) | сканеры и сборщики подписок |
   | `scanners-extra.txt` | ваши добавки |
 - Каждый список проверяется: скачался, разобрался, не уменьшился резко; иначе берётся прошлая копия и приходит сообщение.
 - По умолчанию попадания **только считаются**; отбрасывать — отдельной командой, когда убедились, что ваших клиентов
@@ -139,6 +146,7 @@
  │ ddoswatch.py  DDoS, нагрузка, контейнеры      │
  │ shieldbot.py  кнопки щита                     │
  │ scanlists.py  список сканеров                 │
+ │ rucheck.py    шаблон подписки и блокировки    │
  └──────┬────────────────────────┬───────────────┘
         │ SOCKS через Xray       │ SSH: ключ с command=…
         ▼                        ▼
@@ -196,6 +204,7 @@ bash install_ddos.sh add nl1 203.0.113.10 22
 | `/etc/channel-watch/scanners-extra.txt`, `scanners-exclude.txt` | добавки и исключения к списку сканеров |
 | `/etc/channel-watch/expected_exit.json` | ожидаемый выход для каскадов: `{"вход": "адрес выхода"}` |
 | `/etc/channel-watch/nodes.json` | маячки нод (`beacon_install.sh`) |
+| `/etc/channel-watch/rucheck.json` | свои списки сервисов для сверки шаблона: `{"services": [...], "local": [...]}` |
 | `/etc/channel-watch/vantage.json` | точки проверки (`probe.py --add-vantage`) |
 | `/etc/storozh-shield/config.json` | на сервере: пороги щита (`rate`, `burst`, `conns`), свои адреса (`allow`), калитка портов |
 
@@ -241,7 +250,8 @@ python3 /opt/channel-watch/scanlists.py --dry       # скачать и пров
 `speed.cloudflare.com`, `api.ipify.org`, Telegram, YouTube, Instagram, OpenAI (доступность сервисов); ваши сайты и
 `rdap.org` (сроки доменов); `antifilter.download`/`antifilter.network` (списки блокировок); `dns.google`,
 `cloudflare-dns.com` (сверка DNS); гео-базы `ipinfo.io`, `ip-api.com`, `ipwho.is`, `geojs.io`, `country.is`;
-`raw.githubusercontent.com` (списки сканеров). Внешний сервис проверки нод (`external.json`) — заглушка, выключена и
+`raw.githubusercontent.com`, `gist.githubusercontent.com` (списки сканеров); сверка шаблона — прямо с сервера
+к популярным сервисам (список в `rucheck.py`) и `cloudflare-dns.com`. Внешний сервис проверки нод (`external.json`) — заглушка, выключена и
 запроса не содержит: адреса ваших нод никуда не уходят.
 
 </details>
