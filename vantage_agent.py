@@ -19,6 +19,8 @@
   /series?host=ИМЯ[&port][&n=20][&mss=N]  n соединений подряд: сколько прошло (частичные потери)
   /sni?host=ИМЯ[&port][&sni=ИМЯ]          тот же адрес с настоящим именем, с нейтральным и без имени
   /dns?name=ИМЯ
+  /services                               популярные сервисы по слоям (DNS, TCP, TLS, заглушка) — для сверки шаблона;
+                                          список свой (rucheck.py или "services" в настройках), чужие имена не принимаются
 """
 import hmac
 import os
@@ -44,7 +46,8 @@ def vpn_channels():
         except (OSError, ValueError, AttributeError):
             continue
     return None
-VERSION = 5         # 5 — VPN-точка: /vpn?name=<плитка> через свой клиент Xray (если в настройках "vpn": true)
+VERSION = 6         # 5 — VPN-точка: /vpn?name=<плитка> через свой клиент Xray (если в настройках "vpn": true)
+                    # 6 — /services: проверка популярных сервисов отсюда (rucheck.py рядом)
 # список по умолчанию, если в настройках нет profile: заблокированные сайты (приветствие TLS) и зарубежные хостинги
 DEFAULT_PROFILE = {"sites": [["blocked", "rutracker.org"], ["blocked", "www.instagram.com"], ["blocked", "www.facebook.com"],
                              ["control", "www.example.org"], ["control", "ya.ru"]],
@@ -138,6 +141,24 @@ class Handler(http.server.BaseHTTPRequestHandler):
                 return self.reply(429, {"error": "busy"})
             try:
                 return self.reply(200, dict(netprobe.socks_load(ch["port"]), name=ch["name"]))
+            finally:
+                srv.slots.release()
+        if url.path == "/services":
+            try:
+                import rucheck
+            except ImportError:
+                return self.reply(400, {"error": "no rucheck"})
+            if not srv.slots.acquire(timeout=WAIT_SLOT):
+                return self.reply(429, {"error": "busy"})
+            try:
+                if isinstance(cfg.get("services"), list) and cfg["services"]:
+                    hosts = [str(h) for h in cfg["services"]]
+                else:
+                    foreign, local = rucheck.services_list()
+                    hosts = list(foreign) + list(local)
+                got = rucheck.check_all(hosts)
+                keep = ("verdict", "code", "sys", "doh")
+                return self.reply(200, {"services": {h: {k: v.get(k) for k in keep} for h, v in got.items()}})
             finally:
                 srv.slots.release()
         if url.path == "/profile":
