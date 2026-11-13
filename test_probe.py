@@ -28,6 +28,8 @@ probe.LOG = os.path.join(tmp, "log.txt")
 probe.HISTORY = os.path.join(tmp, "history.json")
 # проверки блокировок в общих сценариях молчат (сети нет); сами они проверяются в разделах U и X
 blockwatch.ETC = tmp
+blockwatch.HOP_CACHE = os.path.join(tmp, "hops.json")   # сведения об узлах трассировки — без сети
+blockwatch.HOP_LOOKUP = lambda ip: {"org": "AS64500 Тестовая сеть", "country": "XX", "city": "Город"}
 blockwatch.LISTS_FILE = os.path.join(tmp, "lists.json")
 real_dns_check, real_deep_many, real_health = blockwatch.dns_check, blockwatch.deep_many, blockwatch.agents_health
 blockwatch.dns_check = lambda names, port, agents=(): {}
@@ -2229,7 +2231,7 @@ os.remove(os.path.join(tmp, "nodes.json"))
 f59 = blockwatch.deep_lines(d59, extra=True)
 check(d59["paths"] == {"Москва": p_lost} and set(d59["refs"]) == {"rf1", "Москва"}
       and d59["witness"]["Москва|tls"]["rst_out"] == 0 and d59["witness"]["rf1|tls"]["rst_out"] == 1
-      and "• путь от Москва: пропадает после шага 3 (10.0.0.3)" in f59
+      and "• путь от Москва: пропадает после шага 3 (10.0.0.3 — внутренняя сеть хостера)" in f59
       and "• сброс TLS (Москва): нода сброса не отправляла — соединение оборвали по дороге" in f59
       and "новый адрес не поможет" in blockwatch.name_note(d59),
       "ZL59 разбор целиком: у точки с закрытым входом — путь и имя на чужом сервере; сброс TLS сверен по метке с нодой")
@@ -2438,6 +2440,30 @@ n74 = len(view_calls)
 out74 = step(6 * 60) + step()
 check(len(view_calls) == n74,
       "ZL74 основной проход «снаружи» сам не смотрит (раньше 16.10 он из-за этого не укладывался в 110 с) — это делает служба --side")
+
+# ZL75–ZL79. Последний ответивший узел трассировки — чей он (сеть, страна, город), с кэшем на неделю
+calls75 = []
+fake75 = lambda ip: calls75.append(ip) or {"org": "AS1299 Arelion Sweden AB", "country": "SE", "city": "Stockholm"}
+cache75 = os.path.join(tmp, "hops75.json")
+check(blockwatch.hop_info("62.115.196.193", lookup=fake75, cache_file=cache75, now=1000) == "AS1299 Arelion Sweden AB · SE Stockholm"
+      and blockwatch.hop_info("62.115.196.193", lookup=fake75, cache_file=cache75, now=2000) == "AS1299 Arelion Sweden AB · SE Stockholm"
+      and calls75 == ["62.115.196.193"],
+      "ZL75 узел: сеть, страна, город; повторно — из кэша, без нового запроса")
+blockwatch.hop_info("62.115.196.193", lookup=fake75, cache_file=cache75, now=1000 + blockwatch.HOP_TTL + 1)
+check(len(calls75) == 2, "ZL76 кэш старше недели — спрашиваем заново")
+check(blockwatch.hop_info("10.255.200.102", lookup=fake75, cache_file=cache75) == "внутренняя сеть хостера"
+      and blockwatch.hop_info("100.100.1.1", lookup=fake75, cache_file=cache75) == "внутренняя сеть хостера"
+      and blockwatch.hop_info("мусор", lookup=fake75, cache_file=cache75) == "" and len(calls75) == 2,
+      "ZL77 частные и CGNAT-адреса — «внутренняя сеть хостера» без запроса; не адрес — пусто")
+check(blockwatch.hop_info("62.1.1.1", lookup=lambda ip: None, cache_file=cache75) == "",
+      "ZL78 база не ответила — пусто, без ошибки")
+d79 = {"trace": {"reached": False, "hops": 9, "last": (7, "62.115.196.193")},
+       "paths": {"Москва": {"addr": "1.2.3.4", "reached": False, "hops": 8, "last": [6, "62.115.196.193"], "list": [[6, "hop", "62.115.196.193"]]}}}
+blockwatch.add_hop_info(d79, lookup=fake75, cache_file=cache75)
+check(d79["trace"]["last_info"] == "AS1299 Arelion Sweden AB · SE Stockholm"
+      and d79["paths"]["Москва"]["last_info"] == "AS1299 Arelion Sweden AB · SE Stockholm"
+      and "пропадает после шага 6 (62.115.196.193 — AS1299 Arelion Sweden AB · SE Stockholm)" in blockwatch.path_text(d79["paths"]["Москва"]),
+      "ZL79 в разборе сбоя рядом с последним узлом — чей он (с rf1 и с точек проверки)")
 
 print("\n--- пример сводки за неделю ---\n" + weekly_sample)
 print("\n--- пример отчёта ---\n" + summ[0])
