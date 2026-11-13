@@ -521,8 +521,9 @@ def probe_class(r):
 # ---------- трассировка TCP ----------
 
 def parse_trace(out, addr):
-    """Вывод traceroute -n -q 1: {"reached": дошли ли до addr, "hops": сколько шагов прошли, "last": (шаг, адрес)}."""
-    last, hops = None, 0
+    """Вывод traceroute -n -q 1: {"reached": дошли ли до addr, "hops": сколько шагов прошли, "last": (шаг, адрес),
+    "seen": [[шаг, адрес], ...] — все ответившие шаги}."""
+    last, hops, seen = None, 0, []
     for line in out.splitlines():
         p = line.split()
         if len(p) < 2 or not p[0].isdigit():
@@ -530,9 +531,21 @@ def parse_trace(out, addr):
         hops = int(p[0])
         if p[1] != "*":
             last = (hops, p[1])
+            seen.append([hops, p[1]])
             if p[1] == addr:
-                return {"reached": True, "hops": hops, "last": last}
-    return {"reached": False, "hops": hops, "last": last}
+                return {"reached": True, "hops": hops, "last": last, "seen": seen}
+    return {"reached": False, "hops": hops, "last": last, "seen": seen}
+
+
+def own_addr():
+    """Внешний адрес этого сервера по маршруту наружу (src); None — не узнали или адрес частный (за NAT)."""
+    import ipaddress
+    try:
+        out = subprocess.run(["ip", "-4", "route", "get", "1.1.1.1"], capture_output=True, text=True, timeout=5).stdout
+        a = out.split(" src ", 1)[1].split()[0]
+        return a if not ipaddress.ip_address(a).is_private else None
+    except (IndexError, ValueError, OSError, subprocess.TimeoutExpired):
+        return None
 
 
 def tcp_trace(addr, port=443, max_hops=16):

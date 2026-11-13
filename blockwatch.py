@@ -677,7 +677,7 @@ def deep_diag(ch, via, agents, bases):
     beacon = next((n.get("beacon") for n in read_etc("nodes.json", []) if n.get("host") == host), None)
     tls = {f"{n}|tls": t for n, t in ((n, tls_ser(c)) for n, c in names.items()) if t}
     d["witness"] = witness_wait(witness_url(beacon), {**series, **tls}, via["port"] if via else None) if port == 443 else {}
-    add_hop_info(d)   # чей последний ответивший узел трассировки
+    add_hop_info(d, own=netprobe.own_addr(), origins=agent_origins(agents))   # чей последний узел трассировки
     return d
 
 
@@ -1078,13 +1078,51 @@ def hop_info(ip, lookup=None, cache_file=None, now=None):
     return info
 
 
-def add_hop_info(d, lookup=None, cache_file=None):
-    """Разбор сбоя: к последнему ответившему узлу трассировки (с rf1 и с точек) дописать, чей он."""
-    items = [d.get("trace")] + list((d.get("paths") or {}).values())
-    for t in items:
-        if t and not t.get("reached") and t.get("last"):
-            t["last_info"] = hop_info(t["last"][1], lookup, cache_file)
+def _public(ip):
+    try:
+        a = ipaddress.ip_address(str(ip))
+    except ValueError:
+        return False
+    return not (a.is_private or a.is_loopback or a.is_link_local or (a.version == 4 and a in CGNAT))
+
+
+def last_owner(t, own, lookup=None, cache_file=None):
+    """Чей последний ответивший узел. Внешний — его сеть; внутренний — внешний узел перед ним, а если внешних не было —
+    сеть самой точки, откуда идёт проверка (адрес own)."""
+    ttl, ip = t["last"][0], t["last"][1]
+    if _public(ip):
+        return hop_info(ip, lookup, cache_file)
+    steps = t.get("seen") or [[r[0], r[2]] for r in t.get("list") or [] if r[2]]
+    before = [a for n, a in steps if n < ttl and _public(a)]
+    if before:
+        info = hop_info(before[-1], lookup, cache_file)
+        return f"внутренняя сеть, перед ней — {before[-1]}" + (f" — {info}" if info else "")
+    if own and _public(own):
+        info = hop_info(own, lookup, cache_file)
+        return f"внутренняя сеть хостера, откуда идёт проверка: {own}" + (f" — {info}" if info else "")
+    return "внутренняя сеть хостера"
+
+
+def add_hop_info(d, lookup=None, cache_file=None, own=None, origins=None):
+    """Разбор сбоя: к последнему ответившему узлу трассировки (с rf1 и с точек) дописать, чей он. own — внешний адрес
+    самого сторожа, origins — {точка: её адрес}: по ним называется сеть, если обрыв во внутренней сети хостера."""
+    t = d.get("trace")
+    if t and not t.get("reached") and t.get("last"):
+        t["last_info"] = last_owner(t, own, lookup, cache_file)
+    for name, p in (d.get("paths") or {}).items():
+        if p and not p.get("reached") and p.get("last"):
+            p["last_info"] = last_owner(p, (origins or {}).get(name), lookup, cache_file)
     return d
+
+
+def agent_origins(agents):
+    """{точка: её адрес} из vantage.json (адрес — хост в url, если это внешний IP)."""
+    out = {}
+    for a in agents or []:
+        host = urllib.parse.urlparse(str(a.get("url") or "")).hostname
+        if host and _public(host):
+            out[a.get("name")] = host
+    return out
 
 
 def _with_info(addr, info):

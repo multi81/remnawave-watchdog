@@ -1071,9 +1071,10 @@ TRACE_CUT = """traceroute to 9.9.9.9 (9.9.9.9), 16 hops max, 60 byte packets
  3  *
  4  *
 """
-check(netprobe.parse_trace(TRACE_OK, "9.9.9.9") == {"reached": True, "hops": 4, "last": (4, "9.9.9.9")}
-      and netprobe.parse_trace(TRACE_CUT, "9.9.9.9") == {"reached": False, "hops": 4, "last": (2, "62.115.196.193")}
-      and netprobe.parse_trace("", "9.9.9.9") == {"reached": False, "hops": 0, "last": None},
+pt3 = lambda r: {k: r[k] for k in ("reached", "hops", "last")}
+check(pt3(netprobe.parse_trace(TRACE_OK, "9.9.9.9")) == {"reached": True, "hops": 4, "last": (4, "9.9.9.9")}
+      and pt3(netprobe.parse_trace(TRACE_CUT, "9.9.9.9")) == {"reached": False, "hops": 4, "last": (2, "62.115.196.193")}
+      and pt3(netprobe.parse_trace("", "9.9.9.9")) == {"reached": False, "hops": 0, "last": None},
       "U8 трассировка: дошли или нет и после какого шага пропали пакеты")
 
 TOKEN = "t" * 40
@@ -2490,6 +2491,29 @@ d84.update(neighbours={"checked": 8, "open": []}, registry=True)
 v84 = v(d84, "DOWN")
 check("соседние адреса той же подсети из России тоже не отвечают" in v84 and "адрес есть в реестре РКН" in v84,
       "ZL84 вывод: соседи тоже молчат, адрес в реестре — так и сказано")
+
+# ZL85–ZL88. Внутренний адрес в трассировке — чья это сеть: внешний узел перед ним или сеть самой точки проверки
+look85 = lambda ip: {"93.196.44.236": {"org": "AS64502 Hoster LLC", "country": "RU", "city": "Saint Petersburg"},
+                     "62.115.196.193": {"org": "AS1299 Arelion Sweden AB", "country": "SE", "city": "Stockholm"},
+                     "5.5.5.5": {"org": "AS64501 Точка", "country": "RU", "city": "Moscow"}}.get(ip)
+c85 = os.path.join(tmp, "hops85.json")
+check(netprobe.parse_trace(TRACE_CUT, "9.9.9.9")["seen"] == [[1, "100.88.255.254"], [2, "62.115.196.193"]],
+      "ZL85 трассировка с rf1 помнит все ответившие шаги, не только последний")
+d86 = {"trace": {"reached": False, "hops": 16, "last": (6, "10.255.200.102"), "seen": [[1, "100.100.1.1"], [6, "10.255.200.102"]]}}
+blockwatch.add_hop_info(d86, lookup=look85, cache_file=c85, own="93.196.44.236")
+check(d86["trace"]["last_info"] == "внутренняя сеть хостера, откуда идёт проверка: 93.196.44.236 — AS64502 Hoster LLC · RU Saint Petersburg",
+      "ZL86 внешних узлов до обрыва нет — сеть самой точки: её адрес, AS, страна, город")
+d87 = {"trace": {"reached": False, "hops": 16, "last": (9, "10.9.9.9"), "seen": [[3, "62.115.196.193"], [9, "10.9.9.9"]]}}
+blockwatch.add_hop_info(d87, lookup=look85, cache_file=c85, own="93.196.44.236")
+check(d87["trace"]["last_info"] == "внутренняя сеть, перед ней — 62.115.196.193 — AS1299 Arelion Sweden AB · SE Stockholm",
+      "ZL87 внешний узел перед внутренним — указан он и чей он")
+d88 = {"paths": {"Москва": {"addr": "1.2.3.4", "reached": False, "hops": 5, "last": [2, "10.1.1.1"],
+                            "list": [[1, "hop", "192.168.0.1", 1], [2, "hop", "10.1.1.1", 2], [3, "silent", None, None]]}}}
+blockwatch.add_hop_info(d88, lookup=look85, cache_file=c85, origins={"Москва": "5.5.5.5"})
+check(d88["paths"]["Москва"]["last_info"] == "внутренняя сеть хостера, откуда идёт проверка: 5.5.5.5 — AS64501 Точка · RU Moscow"
+      and "пропадает после шага 2 (10.1.1.1 — внутренняя сеть хостера, откуда идёт проверка: 5.5.5.5 — AS64501 Точка · RU Moscow)"
+      in blockwatch.path_text(d88["paths"]["Москва"]),
+      "ZL88 путь с точки: внутренний узел — сеть этой точки по её адресу")
 
 print("\n--- пример сводки за неделю ---\n" + weekly_sample)
 print("\n--- пример отчёта ---\n" + summ[0])
