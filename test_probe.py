@@ -2460,7 +2460,7 @@ check(blockwatch.hop_info("62.115.196.193", lookup=fake75, cache_file=cache75, n
       "ZL75 узел: сеть, страна, город; повторно — из кэша, без нового запроса")
 blockwatch.hop_info("62.115.196.193", lookup=fake75, cache_file=cache75, now=1000 + blockwatch.HOP_TTL + 1)
 check(len(calls75) == 2, "ZL76 кэш старше недели — спрашиваем заново")
-check(blockwatch.hop_info("10.255.200.102", lookup=fake75, cache_file=cache75) == "внутренняя сеть хостера"
+check(blockwatch.hop_info("10.0.0.102", lookup=fake75, cache_file=cache75) == "внутренняя сеть хостера"
       and blockwatch.hop_info("100.100.1.1", lookup=fake75, cache_file=cache75) == "внутренняя сеть хостера"
       and blockwatch.hop_info("мусор", lookup=fake75, cache_file=cache75) == "" and len(calls75) == 2,
       "ZL77 частные и CGNAT-адреса — «внутренняя сеть хостера» без запроса; не адрес — пусто")
@@ -2505,7 +2505,7 @@ look85 = lambda ip: {"93.196.44.236": {"org": "AS64502 Hoster LLC", "country": "
 c85 = os.path.join(tmp, "hops85.json")
 check(netprobe.parse_trace(TRACE_CUT, "9.9.9.9")["seen"] == [[1, "100.88.255.254"], [2, "62.115.196.193"]],
       "ZL85 трассировка с rf1 помнит все ответившие шаги, не только последний")
-d86 = {"trace": {"reached": False, "hops": 16, "last": (6, "10.255.200.102"), "seen": [[1, "100.100.1.1"], [6, "10.255.200.102"]]}}
+d86 = {"trace": {"reached": False, "hops": 16, "last": (6, "10.0.0.102"), "seen": [[1, "100.100.1.1"], [6, "10.0.0.102"]]}}
 blockwatch.add_hop_info(d86, lookup=look85, cache_file=c85, own="93.196.44.236")
 check(d86["trace"]["last_info"] == "внутренняя сеть хостера, откуда идёт проверка: 93.196.44.236 — AS64502 Hoster LLC · RU Saint Petersburg",
       "ZL86 внешних узлов до обрыва нет — сеть самой точки: её адрес, AS, страна, город")
