@@ -10,11 +10,12 @@
 #        --ports a,b     порты, которые агенту разрешено проверять (по умолчанию 443)
 #        --hosts a,b     адреса вне своих доменов, которые тоже можно проверять (например свои ретрансляторы)
 #        --snis a,b      имена TLS, с которыми можно обращаться к таким адресам (у ретранслятора имя чужое)
-#   bash vantage_install.sh --entry               напечатать запись для vantage.json сторожа (в ней токен: не на экран,
+#   bash vantage_install.sh --entry [--rucheck]   напечатать запись для vantage.json сторожа (в ней токен: не на экран,
 #                                                 а конвейером на сервер сторожа)
+#        --rucheck       точка проверяет сервисы для сверки шаблона (лучше точка у обычного провайдера, не в дата-центре)
 #   bash vantage_install.sh --uninstall           убрать
 #
-# Что ставит: /opt/vantage-agent (два файла), настройки /etc/vantage-agent/agent.json (токен создаётся здесь же),
+# Что ставит: /opt/vantage-agent (агент и проверки), настройки /etc/vantage-agent/agent.json (токен создаётся здесь же),
 # службу vantage-agent от пользователя nobody. В ufw порт открывается только адресу сторожа.
 # Агент отвечает только сторожу (адрес и токен), проверяет только имена на разрешённых доменах и только порт 443.
 # Повторный запуск безопасен: файлы и служба обновляются, токен остаётся прежним.
@@ -33,6 +34,7 @@ while [ $# -gt 0 ]; do
     --snis) snis="${2:?после --snis нужны имена через запятую}"; shift 2 ;;
     --yes) yes=1; shift ;;
     --entry) mode=entry; shift ;;
+    --rucheck) rucheck=1; shift ;;
     --uninstall) mode=uninstall; shift ;;
     *) echo "не понимаю параметр: $1"; exit 2 ;;
   esac
@@ -40,12 +42,14 @@ done
 [ "$(id -u)" -eq 0 ] || { echo "нужны права root"; exit 1; }
 
 if [ "$mode" = entry ]; then
-  python3 - "$ETC/agent.json" <<'PY'
+  python3 - "$ETC/agent.json" "${rucheck:-0}" <<'PY'
 import json, sys
 c = json.load(open(sys.argv[1], encoding="utf-8"))
 e = {"name": c["name"], "url": "http://%s:%d" % (c["public"], c["port"]), "token": c["token"]}
 if c.get("vpn"):
     e["vpn"] = True  # VPN-точка (агент с собственным клиентом Xray): сторож будет проверять через неё плитки
+if sys.argv[2] == "1":
+    e["rucheck"] = True  # сервисы для сверки шаблона с блокировками проверяются с этой точки
 print(json.dumps(e, ensure_ascii=False))
 PY
   exit 0
