@@ -778,9 +778,12 @@ def scan_lines(hosts, summary_path=None):
         issues.append("🔎 <b>Список сканеров не приняли:</b> " + ", ".join(html.escape(h) for h in bad))
     cl = sm.get("clients") or {}
     if cl:
-        issues.append("🔎 <b>В списке сканеров наши клиенты: %d</b> — %s. Отрежутся, когда сканеры начнут отбрасываться; "
-                      "оставить или в исключения — решать вам" % (len(cl), html.escape(", ".join(
-                          "%s (%s)" % (v.get("user", "?"), v.get("list", "")) for v in list(cl.values())[:5]))))
+        import scanlists
+        issues.append("🔎 <b>В списке сканеров наши клиенты: %d</b>\n" % len(cl)
+                      + "\n".join("• " + html.escape(scanlists.client_text(a, v)) for a, v in list(cl.items())[:5])
+                      + ("\n…и ещё %d" % (len(cl) - 5) if len(cl) > 5 else "")
+                      + "\nОтрежутся, когда сканеры начнут отбрасываться; оставить или в исключения "
+                        "(/etc/channel-watch/scanners-exclude.txt) — решать вам")
     return issues, info
 
 

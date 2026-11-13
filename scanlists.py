@@ -13,9 +13,12 @@
 Сообщение — только когда что-то не так (список не скачался или резко уменьшился, сервер не принял) или в
 списке появились новые наши клиенты. Запуск: scanlists.py [--dry] [--only ИМЯ]   (--dry — скачать и проверить, никуда не слать; --only — один сервер)
 """
+import datetime as dt
+import html
 import ipaddress
 import json
 import os
+import re
 import subprocess
 import sys
 import threading
@@ -126,6 +129,72 @@ def combine(per_list, extra, exclude, own):
     return out, cut
 
 
+PANEL_USERS = "panel_users.json"   # {"host", "port", "key", "known_hosts"} — сервер панели и ключ только для чтения
+
+
+def panel_users(names, conf=None):
+    """Данные клиентов из панели Remnawave (скрипт watch-user-info на сервере панели, ключ с command=):
+    {username: {...}}. Нет настроек или панель не ответила — {} (в отчёте останется имя из журнала Xray)."""
+    names = [n for n in dict.fromkeys(names) if n and re.fullmatch(r"[A-Za-z0-9_.@-]{1,64}", n)][:20]
+    if conf is None:
+        try:
+            conf = json.load(open(os.path.join(ETC, PANEL_USERS), encoding="utf-8"))
+        except (OSError, ValueError):
+            return {}
+    if not names or not conf.get("host"):
+        return {}
+    cmd = ["ssh", "-i", conf.get("key", os.path.join(ETC, "panel_users_ed25519")), "-p", str(conf.get("port", 22)),
+           "-o", "BatchMode=yes", "-o", "ConnectTimeout=15", "-o", "StrictHostKeyChecking=yes",
+           "-o", "UserKnownHostsFile=" + conf.get("known_hosts", os.path.join(ETC, "panel_known_hosts")),
+           "root@" + conf["host"]] + names
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=40)
+        return {str(k): u for u in json.loads(r.stdout).get("users", []) for k in (u.get("username"), u.get("id")) if k}
+    except (OSError, ValueError, subprocess.TimeoutExpired, AttributeError, TypeError):
+        return {}
+
+
+def _date(ts):
+    return dt.datetime.fromtimestamp(ts, dt.timezone(dt.timedelta(hours=3))).strftime("%d.%m.%Y")
+
+
+def client_text(addr, v, now=None):
+    """Одна строка о нашем клиенте в списке сканеров: кто он (ник и имя в Telegram, ID), подписка, где и когда был."""
+    now = now or time.time()
+    info = v.get("info") or {}
+    who = [str(info.get("username") or v.get("user") or "?")]
+    if info.get("username") and str(v.get("user")) != str(info["username"]):
+        who[0] += " (№%s)" % v.get("user")   # в журнале Xray клиент записан номером в панели
+    desc = str(info.get("desc") or "")
+    nick = re.search(r"@([A-Za-z0-9_]{3,32})", desc)
+    name = re.sub(r"^\s*Bot user:\s*", "", desc)
+    name = re.sub(r"@[A-Za-z0-9_]{3,32}", "", name).strip(" ,;·-")
+    if nick:
+        who.append("@" + nick.group(1))
+    if name:
+        who.append(name[:60])
+    if info.get("tg"):
+        who.append("TG %s" % info["tg"])
+    parts = [" · ".join(who), "адрес %s" % addr, "список: %s" % (v.get("list") or "?")]
+    if info:
+        st = {"ACTIVE": "подписка активна", "DISABLED": "отключён", "LIMITED": "лимит трафика",
+              "EXPIRED": "подписка истекла"}.get(info.get("status"), str(info.get("status") or ""))
+        if info.get("expire"):
+            st += (" до " if info["expire"] > now else " с ") + _date(info["expire"])
+        parts.append(st)
+        if info.get("node") or info.get("online"):
+            parts.append("последний раз: " + ", ".join(x for x in (info.get("node"), _date(info["online"]) if info.get("online") else "") if x))
+        if info.get("devices"):
+            parts.append("устройств: %s" % info["devices"])
+        if info.get("traffic_gb") is not None:
+            parts.append("трафик за всё время: %s ГБ" % info["traffic_gb"])
+        if info.get("ua"):
+            parts.append("приложение: %s" % str(info["ua"]).split(" ")[0][:40])
+    elif v.get("node"):
+        parts.append("нода: %s" % v["node"])
+    return "; ".join(parts)
+
+
 def which_list(addr, per_list):
     try:
         a = ipaddress.ip_address(addr)
@@ -149,7 +218,7 @@ def write(path, text):
     os.replace(path + ".tmp", path)
 
 
-def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=DIR):
+def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=DIR, users=None):
     """Один проход. -> итог (dict). Все внешние вызовы подставляются (тесты)."""
     now = now or time.time()
     dry = "--dry" in argv
@@ -187,6 +256,11 @@ def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=
             cur = summary["clients"].get(a)
             if not cur or v.get("last", 0) > cur.get("last", 0):
                 summary["clients"][a] = dict(v, node=h, list=which_list(a, per_list))
+    if users and summary["clients"]:   # кто это: ник, имя, подписка — из панели (если настроен доступ)
+        info = users([v.get("user", "") for v in summary["clients"].values()]) or {}
+        for v in summary["clients"].values():
+            if v.get("user") in info:
+                v["info"] = info[v["user"]]
     prev = json.loads(read(os.path.join(base, "summary.json"), "{}") or "{}")
     new_clients = [a for a in summary["clients"] if a not in (prev.get("clients") or {})]
     failed = [h for h, s in summary["hosts"].items() if s != "ok"]
@@ -202,8 +276,7 @@ def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=
         if new_clients:
             lines.append("Новые наши клиенты в списке (%d) — они будут отрезаны, когда сканеры переведут в «отбрасывать»:" % len(new_clients))
             for a in new_clients[:10]:
-                v = summary["clients"][a]
-                lines.append("• <code>%s</code> — %s, %s, список: %s" % (a, v.get("user", ""), v.get("node", ""), v.get("list", "")))
+                lines.append("• " + html.escape(client_text(a, summary["clients"][a], now)))
             lines.append("Оставить в списке или в исключения — решать вам (исключения: /etc/channel-watch/scanners-exclude.txt).")
         send("\n".join(lines))
     return summary
@@ -219,7 +292,7 @@ def main(argv):
         hs = {k: v for k, v in hs.items() if k == only}
     routes = [None] + [r for r in probe.tg_routes() if r]
     s = run(argv, fetcher=lambda n: fetch(n, routes), run_ctl=lambda h, a, inp=None: shieldbot.run_ctl(h, a, hs, inp),
-            hosts=hs, send=None if "--dry" in argv else probe.tg_send)
+            hosts=hs, send=None if "--dry" in argv else probe.tg_send, users=panel_users)
     print(json.dumps({k: v for k, v in s.items() if k != "clients"}, ensure_ascii=False))
     print("наших клиентов в списке:", len(s["clients"]))
     if "--dry" not in argv:
