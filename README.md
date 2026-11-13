@@ -103,6 +103,9 @@
 ## 🆕 Что нового
 
 **13.11.2026**
+- 👤 **Кто из клиентов попал в список сканеров.** В отчёте и сообщении — ник и имя в Telegram, Telegram ID, подписка
+  (активна до…), последняя нода и дата, устройства, трафик, приложение. Данные берутся из панели скриптом только для
+  чтения (`panel_user_info.sh`) по ключу, который умеет только его запустить; не больше 20 клиентов за раз.
 - 🧭 **Сверка шаблона подписки с блокировками** (`rucheck.py`). Раз в 6 часов популярные сервисы проверяются из
   России по слоям (DNS, TCP, TLS, страница-заглушка), а правила каждой плитки подписки разбираются так, как это делает
   Xray (domain/full/regexp, geosite/geoip, `domainStrategy`). Если сервис по шаблону идёт напрямую, а из России закрыт,
@@ -276,6 +279,23 @@ bash vantage_install.sh --entry --rucheck | ssh root@АДРЕС_СТОРОЖА p
 `bash beacon_install.sh --site-dir ПАПКА_САЙТА` (нода с сайтом-прикрытием) или
 `bash beacon_install.sh --serve ПОРТ --allow АДРЕС_СТОРОЖА` (без сайта).
 
+**Кто из клиентов попал в список сканеров** — ник и имя в Telegram, подписка, нода, устройства и приложение
+вместо одного номера из журнала Xray. Сторожу нужен доступ к панели только на чтение и только к этим данным:
+
+```bash
+# на стороже: отдельный ключ
+ssh-keygen -q -t ed25519 -N '' -C channel-watch-users -f /etc/channel-watch/panel_users_ed25519
+cat /etc/channel-watch/panel_users_ed25519.pub
+# на сервере панели: скрипт только для чтения базы и ключ, который умеет только его запустить и только с адреса сторожа
+install -m 755 panel_user_info.sh /usr/local/sbin/watch-user-info
+echo 'from="АДРЕС_СТОРОЖА",command="/usr/local/sbin/watch-user-info",restrict ssh-ed25519 AAAA… channel-watch-users' >> /root/.ssh/authorized_keys
+# снова на стороже: ключ сервера панели и адрес панели
+ssh-keyscan -t ed25519 АДРЕС_ПАНЕЛИ > /etc/channel-watch/panel_known_hosts
+echo '{"host": "АДРЕС_ПАНЕЛИ"}' > /etc/channel-watch/panel_users.json
+```
+
+Без этих файлов всё работает как раньше: в отчёте будет имя из журнала Xray, нода и список.
+
 **Сторож за сторожем** — на любом другом сервере (рядом `guard.py`): `bash guard_install.sh`. Напишет, если сам
 сторож упал или пропал.
 
@@ -310,6 +330,7 @@ bash install_ddos.sh           # DDoS, щит, сканеры
 | `/etc/channel-watch/scanners-extra.txt`, `scanners-exclude.txt` | добавки и исключения к списку сканеров |
 | `/etc/channel-watch/expected_exit.json` | ожидаемый выход для каскадов: `{"вход": "адрес выхода"}` |
 | `/etc/channel-watch/nodes.json` | маячки нод (`beacon_install.sh`) |
+| `/etc/channel-watch/panel_users.json` | доступ к панели только на чтение — кто из клиентов в списке сканеров: `{"host", "port", "key", "known_hosts"}` (по умолчанию порт 22, `panel_users_ed25519`, `panel_known_hosts`) |
 | `/etc/channel-watch/rucheck.json` | свои списки сервисов для сверки шаблона: `{"services": [...], "local": [...]}` |
 | `/etc/channel-watch/vantage.json` | точки проверки (`probe.py --add-vantage`); точка с `"rucheck": true` проверяет сервисы для сверки шаблона — лучше у обычного провайдера: дата-центр видит не все блокировки |
 | `/etc/storozh-shield/config.json` | на сервере: пороги щита (`rate`, `burst`, `conns`), свои адреса (`allow`), калитка портов |

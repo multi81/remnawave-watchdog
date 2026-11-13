@@ -111,7 +111,12 @@ with tempfile.TemporaryDirectory() as tmp:
         if args == ["scan-clients"]:
             return {"ok": True, "clients": {"4.4.1.9": {"user": "user_gov", "last": 50, "n": 2}}} if h == "DE7" else {"ok": False}
         return {"ok": False}
-    sm = sl.run([], fetcher=lambda n: LST[n], run_ctl=ctl, hosts=HOSTS, send=sent.append, now=1000, base=tmp)
+    asked_users = []
+    USERS = {"user_gov": {"username": "user_gov", "status": "ACTIVE", "expire": 1900000000, "tg": 123456,
+                          "desc": "Bot user: Иван Петров @ivan_p", "node": "DE3", "online": 1000, "devices": 2,
+                          "traffic_gb": 12.5, "ua": "Happ/4.6.0/ios"}}
+    sm = sl.run([], fetcher=lambda n: LST[n], run_ctl=ctl, hosts=HOSTS, send=sent.append, now=1000, base=tmp,
+                users=lambda names: asked_users.append(list(names)) or USERS)
     check("собрано из четырёх списков и своих добавок (пересечения слиты)", sm["nets"] == 7
           and sm["per_list"] == {"antiscanner": 1, "government_networks": 2, "skipa": 1, "c24be_gov": 2,
                                  "antiscanner_sngvy": 2} and sm["extra"] == 1)
@@ -121,7 +126,18 @@ with tempfile.TemporaryDirectory() as tmp:
           and sm["clients"]["4.4.1.9"]["node"] == "DE7")
     check("сообщение владельцу: не принял сервер и клиент в списке", len(sent) == 1 and "NL1" in sent[0] and "user_gov" in sent[0]
           and "исключения" in sent[0])
-    check("итог сохранён для отчёта", json.load(open(os.path.join(tmp, "summary.json")))["nets"] == 7)
+    ct = sl.client_text("4.4.1.9", sm["clients"]["4.4.1.9"], now=1000)
+    check("кто клиент: ник и имя из панели, TG, подписка, где был, устройства", asked_users == [["user_gov"]]
+          and all(x in ct for x in ("user_gov", "@ivan_p", "Иван Петров", "TG 123456", "подписка активна до", "DE3",
+                                    "устройств: 2", "12.5 ГБ", "Happ/4.6.0/ios", "4.4.1.9", "госорганы"))
+          and "@ivan_p" in sent[0])
+    ct0 = sl.client_text("4.4.1.9", {"user": "u1", "node": "NL3", "list": "сканеры"})
+    check("панели нет — имя из журнала, нода и список", ct0 == "u1; адрес 4.4.1.9; список: сканеры; нода: NL3")
+    ct1 = sl.client_text("4.4.1.9", {"user": "150", "list": "сканеры", "info": {"id": "150", "username": "ivan_vpn", "status": "ACTIVE"}})
+    check("в журнале Xray номер — показываем имя из панели и номер", ct1.startswith("ivan_vpn (№150); адрес 4.4.1.9"))
+    check("в панель — только допустимые имена, без настроек — ничего не спрашиваем",
+          sl.panel_users(["x;rm", "ok"], conf={}) == {} and sl.panel_users(["a b"], conf={"host": "h"}) == {})
+    check("итог сохранён для отчёта", json.load(open(os.path.join(tmp, "summary.json"), encoding="utf-8"))["nets"] == 7)
     sent.clear()
 
     def ctl_ok(h, args, inp=None):
@@ -151,7 +167,7 @@ with tempfile.TemporaryDirectory() as tmp:
           and d.plural(22, "раз", "раза", "раз") == "22 раза" and d.plural(11, "сеть", "сети", "сетей") == "11 сетей"
           and "отбрасываем на: NL1" in inf[0] and "стучались 4 000 раз с 45 адресов" in inf[0] and inf[0].index("NL1 (3 100)") < inf[0].index("DE7 (900)"))
     check("отчёт: замечание по списку и клиенты в нём", any("не скачался" in x for x in iss)
-          and any("наши клиенты: 1" in x and "user_gov (государственные сети)" in x for x in iss))
+          and any("наши клиенты: 1" in x and "user_gov; адрес 4.4.1.9; список: государственные сети" in x for x in iss))
     check("отчёт: нет данных — нет строк", d.scan_lines({}, os.path.join(tmp, "нет.json")) == ([], []))
 
 # --- сборщик метрик передаёт счёт сканеров
