@@ -402,6 +402,46 @@ def name_ref(name, tries=2, ref=REF_HOST):
     return out
 
 
+NEIGHBOUR_LAST = (1, 10, 50, 100, 150, 200, 250)   # какие адреса той же /24 пробуем (плюс соседние ±1)
+
+
+def _tcp_ok(ip, port, timeout):
+    try:
+        socket.create_connection((ip, port), timeout=timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def neighbours(addr, ports=(443, 80), timeout=2, conn=None):
+    """Отвечают ли отсюда соседи ноды по подсети /24 (порт 443 или 80): {"checked", "open": [адреса]};
+    None — адрес частный или не адрес. Открытые соседи при молчащей ноде — признак, что закрыт именно её адрес."""
+    import ipaddress
+    try:
+        a = ipaddress.ip_address(str(addr))
+    except ValueError:
+        return None
+    if a.version != 4 or a.is_private or a.is_loopback:
+        return None
+    base, last = int(a) & ~0xFF, int(a) & 0xFF
+    picks = sorted({x for x in NEIGHBOUR_LAST + (last - 1, last + 1) if 0 < x < 255 and x != last})
+    ips = [str(ipaddress.ip_address(base + x)) for x in picks]
+    conn = conn or _tcp_ok
+
+    def one(ip):
+        return ip if any(conn(ip, p, timeout) for p in ports) else None
+    threads = []
+    res = {}
+    for ip in ips:
+        th = threading.Thread(target=lambda ip=ip: res.__setitem__(ip, one(ip)), daemon=True)
+        th.start()
+        threads.append(th)
+    for th in threads:
+        th.join(timeout * len(ports) + 2)
+    out = sorted(ip for ip in ips if res.get(ip))
+    return {"checked": len(ips), "open": out}
+
+
 def other_port(addr, port=80, timeout=3):
     """Отвечает ли адрес на другом порту: 'open' | 'refused' (сервер ответил отказом — адрес доступен) | None."""
     try:

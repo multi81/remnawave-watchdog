@@ -72,6 +72,13 @@ RESOLVERS = (("Google", "8.8.8.8"), ("Cloudflare", "1.1.1.1"), ("Яндекс", 
 DOH = ("https://dns.google/resolve?name={}&type=A", "https://cloudflare-dns.com/dns-query?name={}&type=A")
 
 
+def read_json_file(path, default=None):
+    try:
+        return json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        return default
+
+
 def read_etc(name, default):
     try:
         return json.load(open(os.path.join(ETC, name), encoding="utf-8"))
@@ -251,6 +258,16 @@ def list_alert(key, who, rec):
                        "Плитки и сайты на этом имени перестанут открываться у пользователей; нужен другой домен.")
     return head + ("<b>Что это значит:</b> адрес внесён в реестр — операторы в России обязаны его блокировать. "
                    "Плитка перестанет подключаться у части или у всех пользователей; готовьте замену адреса.")
+
+
+def registry_hit(addr, lists):
+    """Есть ли адрес в открытом реестре РКН (по последней сверке списков): True / False / None — сверки ещё не было.
+    Подсети CDN и хостеров — не реестр, их не считаем."""
+    hits = (lists or {}).get("hits")
+    if not hits:
+        return None
+    tail = f"({addr})"
+    return any(str(who).endswith(tail) for key, found in hits.items() if key.startswith("rkn") for who in found)
 
 
 def hard_hits(st):
@@ -647,11 +664,15 @@ def deep_diag(ch, via, agents, bases):
                 refs[name] = ref
         if f_ref is not None and f_ref.result():
             refs[SELF] = f_ref.result()
-        f_trace = ex.submit(netprobe.tcp_trace, direct["addr"], port) if direct["addr"] and direct["tcp"] != "open" else None
+        closed = direct["addr"] and direct["tcp"] != "open"
+        f_trace = ex.submit(netprobe.tcp_trace, direct["addr"], port) if closed else None
+        f_nb = ex.submit(netprobe.neighbours, direct["addr"]) if closed else None
         d = {"direct": direct, "agents": probes, "series": series, "sni": names,
              "abroad": f_abroad.result() if f_abroad else None, "via": via["name"] if via else None,
              "trace": f_trace.result() if f_trace else None, "external": external_scan({"host": host, "addr": direct["addr"]}),
-             "paths": paths, "refs": refs, "vpn": {n: f.result() for n, f in f_vpn.items()}}
+             "paths": paths, "refs": refs, "vpn": {n: f.result() for n, f in f_vpn.items()},
+             "neighbours": f_nb.result() if f_nb else None,
+             "registry": registry_hit(direct["addr"], read_json_file(LISTS_FILE)) if closed else None}
     # что из этих серий видела сама нода (её счётчики лежат рядом с маячком; забираем и через живой чужой канал)
     beacon = next((n.get("beacon") for n in read_etc("nodes.json", []) if n.get("host") == host), None)
     tls = {f"{n}|tls": t for n, t in ((n, tls_ser(c)) for n, c in names.items()) if t}
@@ -1213,10 +1234,29 @@ def deep_verdict(d, status):
                 if all(w["seen"] and w["rep"] for w in wit) else "")
         return (f"из-за рубежа нода отвечает, а из России {where} — нет: похоже на блокировку адреса ноды из России"
                 + (f" (пакеты пропадают после шага {d['trace']['last'][0]})"
-                   if d.get("trace") and not d["trace"]["reached"] and d["trace"]["last"] else "") + side)
+                   if d.get("trace") and not d["trace"]["reached"] and d["trace"]["last"] else "") + side
+                + block_detail(d))
     if abroad is False:
         return "нода не отвечает ни из России, ни из-за рубежа — сбой самой ноды или её хостера, а не блокировка"
     return f"нода не отвечает {where}; из-за рубежа проверить было не через что — блокировка это или поломка, не различить"
+
+
+def block_detail(d):
+    """К выводу «блокировка адреса»: соседи по подсети и открытый реестр РКН."""
+    out = ""
+    nb = d.get("neighbours")
+    if nb and nb.get("checked"):
+        if nb.get("open"):
+            out += (f"; соседние адреса той же подсети из России открываются ({len(nb['open'])} из {nb['checked']}) "
+                    "— закрыт именно адрес ноды")
+        else:
+            out += "; соседние адреса той же подсети из России тоже не отвечают — возможно, закрыта вся подсеть хостера"
+    reg = d.get("registry")
+    if reg is True:
+        out += "; адрес есть в реестре РКН"
+    elif reg is False:
+        out += "; в открытом реестре РКН адреса нет — похоже на блокировку на ТСПУ вне реестра"
+    return out
 
 
 def deep_text(d, status, extra=()):
