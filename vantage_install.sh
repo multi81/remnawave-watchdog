@@ -88,6 +88,8 @@ public="$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | cut -d'
 install -d -m 755 "$DIR"
 install -d -m 750 -g nogroup "$ETC"
 install -m 644 "$SRC/vantage_agent.py" "$SRC/netprobe.py" "$DIR/"
+# проверка сервисов для сверки шаблона (/services) — если rucheck.py лежит рядом
+if [ -s "$SRC/rucheck.py" ]; then install -m 644 "$SRC/rucheck.py" "$DIR/"; fi
 python3 - "$ETC/agent.json" "$allow" "$port" "$name" "$suffix" "$public" "$ports" "$hosts" "$snis" <<'PY'
 import json, os, secrets, sys
 path, allow, port, name, suffix, public, ports, hosts, snis = sys.argv[1:10]

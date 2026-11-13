@@ -441,20 +441,36 @@ def services_list(path=SERVICES_FILE):
     return out[0], out[1]
 
 
-def run_live(tiles, geo_dir=GEO_DIR, services=None, net=None):
-    """Полный проход: геобазы, сервисы по слоям, сверка. -> данные для STATE_FILE."""
+def check_all(hosts, net=None):
+    """Все сервисы по слоям, 8 разом: {host: ответ probe_service без лишнего}."""
+    hosts = list(dict.fromkeys(hosts))
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        return dict(zip(hosts, ex.map(lambda h: probe_service(h, net), hosts)))
+
+
+def run_live(tiles, geo_dir=GEO_DIR, services=None, net=None, points=(), ask=None):
+    """Полный проход: геобазы, сервисы, сверка. -> данные для STATE_FILE.
+    points — точки проверки с отметкой "rucheck" (обычный провайдер видит блокировки, дата-центр — не всегда);
+    ask(точка, список) -> {host: ответ} | None. Ни одна не ответила — проверяем отсюда и пишем об этом."""
     refresh_geo(geo_dir)
     geo = Geo(geo_dir)
     foreign, local = services or services_list()
     hosts = list(dict.fromkeys(list(foreign) + list(local)))
-    with concurrent.futures.ThreadPoolExecutor(8) as ex:
-        verdicts = dict(zip(hosts, ex.map(lambda h: probe_service(h, net), hosts)))
+    verdicts, source, missed = None, None, []
+    for p in points:
+        got = ask(p, hosts) if ask else None
+        if isinstance(got, dict) and got and all(isinstance(v, dict) and v.get("verdict") for v in got.values()):
+            verdicts, source = {h: got[h] for h in hosts if h in got}, p["name"]
+            break
+        missed.append(p["name"])
+    if not verdicts:
+        verdicts = check_all(hosts, net)
     for h in local:
         if h in verdicts and h not in foreign:
             verdicts[h]["local"] = True
     res = compare(tiles, verdicts, geo)
     return {"ts": int(time.time()), "services": verdicts, "templates": res["templates"], "mismatch": res["mismatch"],
-            "geo": bool(geo._read("geosite.dat"))}
+            "geo": bool(geo._read("geosite.dat")), "source": source, "missed": missed}
 
 
 # ---------- состояние, тревоги, отчёт ----------
@@ -483,7 +499,7 @@ def step(st, data):
                      "closed": sorted(h for h, v in sv.items() if blocked(v.get("verdict")) and not v.get("local")),
                      "total": sum(1 for v in sv.values() if not v.get("local")),
                      "local_down": sorted(h for h, v in sv.items() if v.get("local") and v.get("verdict") != "OK"),
-                     "geo": data.get("geo", True)}
+                     "geo": data.get("geo", True), "source": data.get("source"), "missed": data.get("missed") or []}
     return alerts
 
 
@@ -492,10 +508,14 @@ def items(st):
     rc = st.get("rucheck") or {}
     if not rc.get("ts"):
         return []
-    parts = ["с сервера сторожа закрыто %d из %d зарубежных сервисов%s" % (
-        len(rc.get("closed", [])), rc.get("total", 0), (": " + ", ".join(rc["closed"][:8])) if rc.get("closed") else "")]
+    where = "с точки «%s»" % rc["source"] if rc.get("source") else "с сервера сторожа"
+    parts = ["%s закрыто %d из %d зарубежных сервисов%s" % (
+        where, len(rc.get("closed", [])), rc.get("total", 0), (": " + ", ".join(rc["closed"][:8])) if rc.get("closed") else "")]
+    if rc.get("missed") and not rc.get("source"):
+        parts.append("⚠️ точка «%s» не ответила — сервисы проверены с сервера сторожа (дата-центр видит не все блокировки)"
+                     % "», «".join(rc["missed"]))
     if rc.get("local_down"):
-        parts.append("российские не открылись с сервера сторожа (часто не пускают хостинги): " + ", ".join(rc["local_down"][:6]))
+        parts.append("российские не открылись %s (часто не пускают хостинги): %s" % (where, ", ".join(rc["local_down"][:6])))
     mm = rc.get("mismatch") or []
     parts.append("⚠️ расхождения с шаблоном: " + "; ".join("«%s» — %s" % (m["template"], m["host"]) for m in mm[:6])
                  if mm else "расхождений с шаблоном нет")

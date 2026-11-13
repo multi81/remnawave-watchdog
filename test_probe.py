@@ -1604,10 +1604,16 @@ threading.Thread(target=agent2.serve_forever, daemon=True).start()
 A2 = {"name": "Офис", "url": f"http://127.0.0.1:{agent2.server_address[1]}", "token": TOKEN}
 h = blockwatch.agent_get(A2, "/health")
 r = blockwatch.agent_get(A2, f"/series?host=localhost&port={p_page}&n=4&mss=1213")
-check(h["v"] == 5 and h["ports"] == [p_page, p_silent] and (r["n"], r["ok"], r["mss"]) == (4, 4, 1213 if MARK else None)
+check(h["v"] == 6 and h["ports"] == [p_page, p_silent] and (r["n"], r["ok"], r["mss"]) == (4, 4, 1213 if MARK else None)
       and blockwatch.agent_get(A2, f"/series?host=localhost&port={p_page}&n=999&mss=9999")["mss"] == (1260 if MARK else None)
       and blockwatch.agent_get(A2, f"/series?host=localhost&port={dead_port}") is None,
       "ZL6 агент: серия соединений по запросу; число и метка — в своих пределах; чужой порт — отказ")
+agent2.cfg["services"] = ["localhost"]
+sv = blockwatch.agent_get(A2, "/services", 60)
+check(sv and set(sv["services"]) == {"localhost"} and sv["services"]["localhost"].get("verdict")
+      and set(sv["services"]["localhost"]) == {"verdict", "code", "sys", "doh"},
+      "ZL89 агент /services: свой список из настроек, ответ — вердикт по каждому (без тела страницы)")
+del agent2.cfg["services"]
 real_hello = netprobe.tls_hello
 seen_sni = []
 netprobe.tls_hello = lambda addr, port, name, timeout=5, mss=None: seen_sni.append(name) or "answer"
@@ -2178,7 +2184,7 @@ r56 = (g4(f"/path?host=localhost&port={p_page}"), g4(f"/sniref?host=localhost&po
 agent4.shutdown()
 netprobe.path_trace, netprobe.name_ref, netprobe.sni_compare = real_pt, real_nr, real_sc
 check(r56 == ({"asked": ["localhost", p_page]}, {"asked": "localhost"}, {"addr": "1", "mss": 1233}, {"addr": "1", "mss": 1260},
-              None, None, 5),
+              None, None, vantage_agent.VERSION),
       "ZL56 агент 4: путь и «закрыто ли имя» — только до разрешённого имени и порта; метка сравнения имён — в пределах")
 d57 = dict(dd(pt("timeout"), {"Офис": pt("timeout")}, True), series={}, sni={}, paths={"Офис": p_lost},
            refs={"rf1": r_cut, "Офис": r_cut}, witness={"Офис|tls": {"seen": 1, "rep": 0, "rst_out": 0, "rst_in": 0},

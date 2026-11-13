@@ -418,7 +418,7 @@ def agent_get(agent, path, timeout=20):
     try:
         req = urllib.request.Request(agent["url"].rstrip("/") + path, headers={"X-Token": agent["token"]})
         with urllib.request.urlopen(req, timeout=timeout) as r:
-            data = json.loads(r.read(65536).decode("utf-8"))
+            data = json.loads(r.read(262144).decode("utf-8"))
         return data if isinstance(data, dict) else None
     except Exception:  # сеть, отказ, не JSON — для сторожа одно и то же: «точка не ответила»
         return None

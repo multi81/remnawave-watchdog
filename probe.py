@@ -1802,7 +1802,11 @@ if __name__ == "__main__":
             req = urllib.request.Request(sub_url(), headers={"User-Agent": SUB_UA, "Accept": "application/json"})
             with urllib.request.urlopen(req, timeout=30) as r:
                 tiles = [c for c in json.loads(r.read().decode("utf-8")) if isinstance(c, dict) and c.get("routing")]
-            rc = rucheck.run_live(tiles)
+            points = [a for a in blockwatch.agents_cfg() if a.get("rucheck")]
+            ask = lambda a, hosts: (blockwatch.agent_get(a, "/services", 180) or {}).get("services")
+            rc = rucheck.run_live(tiles, points=points, ask=ask)
+            print("сервисы проверены " + (f"с точки «{rc['source']}»" if rc["source"] else "с сервера сторожа")
+                  + (f"; не ответили: {', '.join(rc['missed'])}" if rc["missed"] else ""))
             with open(rucheck.STATE_FILE + ".tmp", "w", encoding="utf-8") as f:
                 json.dump(rc, f, ensure_ascii=False)
             os.replace(rucheck.STATE_FILE + ".tmp", rucheck.STATE_FILE)
