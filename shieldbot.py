@@ -16,6 +16,7 @@ import datetime as dt
 import html
 import json
 import os
+import re
 import secrets
 import subprocess
 import sys
@@ -32,6 +33,8 @@ OFFERS_FILE = "/var/lib/channel-watch/shield_offers.json"
 BOT_STATE = "/var/lib/channel-watch/shieldbot.json"
 KEY = ETC + "/shield_ed25519"
 KNOWN = ETC + "/shield_known_hosts"
+CONFLICT_ALERT_AFTER = 600  # столько секунд подряд Telegram отвечает «другой getUpdates» — пишем владельцу
+CONFLICT_ALERT_EVERY = 6 * 3600
 OFFER_TTL = 12 * 3600       # кнопка живёт 12 ч: ночное предложение должно дожить до утра
 RECHECK_AFTER = 1800        # нажали позже 30 мин — сначала перепроверить, шумят ли адреса сейчас
 INCIDENT_WINDOW = 3600      # повтор по тому же серверу в течение часа — правим прежнее сообщение, не шлём новое
@@ -457,6 +460,25 @@ def process_followups(chat, tg=tg_call, run=run_ctl, now=None, offers_path=OFFER
     return len(due)
 
 
+def conflict_step(st, r, now):
+    """Учёт ответа getUpdates: 409 «terminated by other getUpdates request» подряд дольше CONFLICT_ALERT_AFTER —
+    кто-то ещё забирает обновления этого бота (кнопки не доходят). -> текст сообщения владельцу или None."""
+    if (r or {}).get("error_code") == 409:
+        st.setdefault("since", now)
+        if now - st["since"] >= CONFLICT_ALERT_AFTER and ("alerted" not in st or now - st["alerted"] >= CONFLICT_ALERT_EVERY):
+            st["alerted"] = now
+            return ("⚠️ <b>Кнопки щита могут не срабатывать</b>\n\nTelegram отвечает: этим ботом опрашивает ещё кто-то "
+                    "(«terminated by other getUpdates request») — уже %d мин. Нажатия уходят туда, а не сторожу.\n"
+                    "Что сделать: найти и остановить вторую копию (старый сервер сторожа?) или выпустить новый токен бота "
+                    "в @BotFather (/revoke) и вписать его сторожу." % ((now - st["since"]) // 60))
+    elif (r or {}).get("ok"):
+        if "alerted" in st:
+            st.clear()
+            return "🟢 <b>Кнопки щита снова доходят</b> — второй опрос бота прекратился."
+        st.clear()
+    return None
+
+
 def main(argv):
     probe = _probe()
     chat = owner_chat()
@@ -472,9 +494,14 @@ def main(argv):
         offset = 0
     tg_call("setMyCommands", {"commands": [{"command": "shield", "description": "Щит: что заблокировано"},
                                            {"command": "unblock", "description": "Щит: снять блокировки"}]})
+    conflict = {}
     while True:
         r = tg_call("getUpdates", {"offset": offset, "timeout": 50, "allowed_updates": ["message", "callback_query"]},
                     timeout=60)
+        note = conflict_step(conflict, r, time.time())
+        if note:
+            probe.log("shield: " + re.sub(r"<[^>]+>", "", note.split("\n", 1)[0]))
+            probe.tg_send(note)
         if not (r or {}).get("ok"):
             time.sleep(10)
             continue
