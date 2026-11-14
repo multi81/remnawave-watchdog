@@ -99,6 +99,11 @@ DOCKER_FORGET = 3 * 86400   # пропавший контейнер забыва
 SHIELD_OFFER_MIN = 1000     # лишних соединений за 10 минут у самого «громкого» адреса — предложить и без атаки
 SHIELD_OFFER_EVERY = 3600   # не чаще раза в час на сервер (атака — своё предложение сразу)
 SHIELD_OFFER_IPS = 10
+HOST_INFO = {}              # {имя сервера: (адрес, пометка)} — из ddos.json, для строки «Сервер» в сообщениях
+IPINFO_CACHE = "/var/lib/channel-watch/ipinfo.json"   # сведения об адресах-источниках: {адрес: {"ts", ...}}
+IPINFO_TTL = 7 * 86400
+IPINFO_LOOKUP = None        # подмена запроса (тесты); None — ip-api.com (пакетом), запасной — ipinfo.io
+SCAN_DIR = "/var/lib/channel-watch/scanners"
 
 STATE_TITLE = {   # notify.STATE_TITLE
     "attack": "🚨 <b>DDoS-атака обнаружена</b>",
@@ -257,8 +262,14 @@ def metric_lines(m):
     return out
 
 
+def server_label(name):
+    """«бот · 203.0.113.5 · бот Bedolaga» — имя, адрес и пометка из ddos.json (что есть)."""
+    addr, note = HOST_INFO.get(name) or (None, None)
+    return " · ".join(html.escape(str(x)) for x in (name, addr, note) if x)
+
+
 def text_change(name, prev, cur, m, now, attack=None, th=None):
-    head = ["🖥 <b>Сервер:</b> %s" % html.escape(name), "🕒 %s МСК" % msk(now).strftime("%d.%m %H:%M:%S")]
+    head = ["🖥 <b>Сервер:</b> %s" % server_label(name), "🕒 %s МСК" % msk(now).strftime("%d.%m %H:%M:%S")]
     st = cur["state"]
     if st == "attack":
         lines = head + ["💥 <b>Тип:</b> %s" % cur["attack_type"], "🔴 <b>Уровень:</b> %s" % SEVERITY_RU.get(cur["severity"], "?"),
@@ -705,16 +716,125 @@ def ago_ru(ts, now):
     return "только что" if m < 2 else "%d мин назад" % m if m < 60 else "%d ч назад" % (m // 60)
 
 
+def _ipapi_batch(ips, timeout=8):
+    """ip-api.com, пакет до 100 адресов: {адрес: {...}}. Бесплатно, без ключа (только http)."""
+    body = json.dumps([{"query": a, "fields": "status,query,countryCode,city,isp,org,as,mobile,proxy,hosting"} for a in ips[:100]])
+    try:
+        r = subprocess.run(["curl", "-s", "-m", str(timeout), "-X", "POST", "-H", "Content-Type: application/json",
+                            "-d", "@-", "http://ip-api.com/batch"], input=body, capture_output=True, text=True,
+                           timeout=timeout + 5)
+        return {x["query"]: x for x in json.loads(r.stdout or "[]") if isinstance(x, dict) and x.get("status") == "success"}
+    except (OSError, ValueError, subprocess.TimeoutExpired, KeyError, TypeError):
+        return {}
+
+
+def ip_lookup(ips):
+    """{адрес: {"as", "net", "country", "city", "mobile", "proxy", "hosting"}} — ip-api.com, кого не нашёл — ipinfo.io."""
+    if IPINFO_LOOKUP:
+        return IPINFO_LOOKUP(ips)
+    out = {}
+    for a, x in _ipapi_batch(list(ips)).items():
+        out[a] = {"as": (x.get("as") or "").split(" ")[0], "net": x.get("org") or x.get("isp") or "",
+                  "country": x.get("countryCode") or "", "city": x.get("city") or "",
+                  "mobile": bool(x.get("mobile")), "proxy": bool(x.get("proxy")), "hosting": bool(x.get("hosting"))}
+    rest = [a for a in ips if a not in out]
+    if rest:
+        try:
+            import blockwatch
+            for a in rest[:5]:
+                r = blockwatch.hop_lookup(a, timeout=4)
+                if r:
+                    org = r.get("org") or ""
+                    out[a] = {"as": org.split(" ")[0] if org.startswith("AS") else "", "net": org.split(" ", 1)[-1],
+                              "country": r.get("country") or "", "city": r.get("city") or ""}
+        except Exception:  # запасной источник не обязателен
+            pass
+    return out
+
+
+def ip_details(ips, now=None, cache_file=None):
+    """Сведения об адресах с кешем на неделю: {адрес: {...}}. Сеть недоступна — что есть в кеше."""
+    now = now or time.time()
+    path = cache_file or IPINFO_CACHE
+    try:
+        cache = json.load(open(path, encoding="utf-8"))
+    except (OSError, ValueError):
+        cache = {}
+    need = [a for a in ips if a not in cache or now - cache[a].get("ts", 0) > IPINFO_TTL]
+    if need:
+        for a, v in ip_lookup(need).items():
+            cache[a] = dict(v, ts=int(now))
+        cache = {a: v for a, v in cache.items() if now - v.get("ts", 0) <= IPINFO_TTL}
+        try:
+            with open(path + ".tmp", "w", encoding="utf-8") as f:
+                json.dump(cache, f, ensure_ascii=False)
+            os.replace(path + ".tmp", path)
+        except OSError:
+            pass
+    return {a: cache[a] for a in ips if a in cache}
+
+
+def scan_membership(ips, folder=None):
+    """{адрес: «сканеры, СКИПА (РКН)»} — в каких списках сканеров адрес (по скачанным спискам сторожа)."""
+    try:
+        import scanlists
+        per = {}
+        for name in scanlists.LISTS:
+            try:
+                per[name] = scanlists.parse(open(os.path.join(folder or SCAN_DIR, name + ".list"), encoding="utf-8").read())[0]
+            except OSError:
+                continue
+        out = {}
+        for a in ips:
+            w = scanlists.which_list(a, per)
+            if w and w != "свои добавки":
+                out[a] = w
+        return out
+    except Exception:  # списков нет — не беда
+        return {}
+
+
+def ip_line(info, scan=""):
+    """Строка под адресом: «AS12389 Rostelecom · RU Moscow · мобильная сеть · в списке сканеров: …»."""
+    parts = []
+    if info:
+        net = " ".join(x for x in (info.get("as"), info.get("net")) if x)
+        if net:
+            parts.append(net[:60])
+        place = " ".join(x for x in (info.get("country"), info.get("city")) if x)
+        if place:
+            parts.append(place)
+        tags = [t for k, t in (("mobile", "мобильная сеть — за адресом может быть много людей"), ("hosting", "хостинг / дата-центр"),
+                               ("proxy", "прокси или VPN")) if info.get(k)]
+        parts += tags
+    if scan:
+        parts.append("в списке сканеров: " + scan)
+    return ("   " + html.escape(" · ".join(parts))) if parts else ""
+
+
+def ports_line(sh):
+    ports = [x for x in (sh.get("ports") or []) if isinstance(x, list) and len(x) == 2][:3]
+    return ("🎯 <b>Куда бьют:</b> " + ", ".join("%s (%s)" % (html.escape(str(p)), cnt(n)) for p, n in ports)) if ports else ""
+
+
 def suspects_block(sh, ts, clients=None):
     """Источники для сообщения об атаке: кто больше всех сверх порога, с пометкой наш/не наш."""
     lim = (sh.get("limits") or {}).get("rate", 200)
     lines = ["🛡 <b>Больше всех сверх порога</b> (%d новых соединений в секунду с адреса) за 10 минут:" % lim]
+    shown = [a for a, _ in sh["suspects"][:SHIELD_OFFER_IPS]]
+    info, scan = ip_details(shown), scan_membership(shown)
     for a, p in sh["suspects"][:SHIELD_OFFER_IPS]:
         v = (clients or {}).get(a)
         mark = ("✅ наш клиент (%s, %s, %s)" % (html.escape(str(v.get("user", ""))[:28]), html.escape(str(v.get("node", ""))),
                                                ago_ru(v.get("last", ts), ts)) if v else
                 "❓ не клиент" if clients is not None else "сверка с клиентами не удалась")
         lines.append("• <code>%s</code> — %s лишних — %s" % (html.escape(a), cnt(p), mark))
+        extra = ip_line(info.get(a), scan.get(a, ""))
+        if extra:
+            lines.append(extra)
+    pl = ports_line(sh)
+    if pl:
+        lines.append(pl)
     return "\n".join(lines)
 
 
@@ -737,17 +857,26 @@ def shield_offer_text(name, sh, ts, attack=None, clients=None):
     lim = (sh.get("limits") or {}).get("rate", 200)
     head = ("🚨 <b>Щит: %s — атака, можно отрезать источники</b>" % html.escape(name) if attack else
             "🛡 <b>Щит: %s — кто-то открывает слишком много соединений</b>" % html.escape(name))
-    lines = [head, "🕒 %s МСК · сейчас щит %s" % (msk(ts).strftime("%d.%m %H:%M"),
-                                                 "включён" if sh.get("mode") == "on" else "в режиме наблюдения (ничего не режется)")]
+    lines = [head, "🖥 <b>Сервер:</b> %s" % server_label(name),
+             "🕒 %s МСК · сейчас щит %s" % (msk(ts).strftime("%d.%m %H:%M"),
+                                          "включён" if sh.get("mode") == "on" else "в режиме наблюдения (ничего не режется)")]
     if attack:
         lines.append("💥 %s, уровень %s" % (attack.get("type"), SEVERITY_RU.get(attack.get("severity"), "?").lower()))
+    pl = ports_line(sh)
+    if pl:
+        lines.append(pl)
     lines += ["", "Больше всех сверх порога (%d новых соединений в секунду с адреса) за 10 минут:" % lim]
+    shown0 = [a for a, _ in sh["suspects"][:SHIELD_OFFER_IPS]]
+    info, scan = ip_details(shown0), scan_membership(shown0)
     for a, p in sh["suspects"][:SHIELD_OFFER_IPS]:
         v = (clients or {}).get(a)
         mark = ("✅ наш клиент (%s, %s, %s)" % (html.escape(str(v.get("user", ""))[:28]), html.escape(str(v.get("node", ""))),
                                                ago_ru(v.get("last", ts), ts)) if v else
                 "❓ не клиент" if clients is not None else "сверка с клиентами не удалась")
         lines.append("• <code>%s</code> — %s лишних — %s" % (html.escape(a), cnt(p), mark))
+        extra = ip_line(info.get(a), scan.get(a, ""))
+        if extra:
+            lines.append(extra)
     if sh.get("suspects_total", 0) > SHIELD_OFFER_IPS:
         lines.append("… и ещё %d" % (sh["suspects_total"] - SHIELD_OFFER_IPS))
     shown = [a for a, _ in sh["suspects"][:SHIELD_OFFER_IPS]]
@@ -869,6 +998,8 @@ def process(state, data, c, now, db=None):
     msgs = []
     hosts = state.setdefault("hosts", {})
     overrides = load_overrides()
+    HOST_INFO.clear()
+    HOST_INFO.update({h["name"]: (h.get("host"), h.get("note")) for h in c.get("hosts", []) if h.get("name")})
     for h in c["hosts"]:
         name = h["name"]
         e = hosts.setdefault(name, new_entry())
@@ -1135,6 +1266,7 @@ def main(argv):
             srv = re.search(r"Сервер:</b> ([^\n·<]+)", t)
             probe.log("ddos: сообщение %s: %s%s" % ("отправлено" if res == "ok" else "НЕ отправлено (%s)" % res, title,
                                                     " — " + srv.group(1).strip() if srv else ""))
+    HOST_INFO.update({h["name"]: (h.get("host"), h.get("note")) for h in c.get("hosts", []) if h.get("name")})
     for o in state.pop("shield_pending", []):   # атака или подозрительные — одно сообщение с кнопками (выполняет shieldbot)
         import shieldbot
         cl = None

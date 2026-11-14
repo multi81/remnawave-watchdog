@@ -8,6 +8,8 @@ import tempfile
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ddos_collect as col  # noqa: E402
 import ddoswatch as d  # noqa: E402
+d.IPINFO_LOOKUP = lambda ips: {}   # без сети: сведения об адресах не запрашиваем
+d.SCAN_DIR = "/nonexistent"
 import shield_ctl as s  # noqa: E402
 import shieldbot as b  # noqa: E402
 

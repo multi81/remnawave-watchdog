@@ -6,6 +6,8 @@ import tempfile
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ddoswatch as d  # noqa: E402
+d.IPINFO_LOOKUP = lambda ips: {}   # без сети: сведения об адресах не запрашиваем
+d.SCAN_DIR = "/nonexistent"
 
 ok = 0
 
