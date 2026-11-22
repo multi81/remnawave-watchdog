@@ -78,7 +78,34 @@ def node_flags(node, now):
     if d.get("ufw") and d["ufw"] != "active":
         flags.append("файрвол выключен")
     flags += tune_flags(d.get("tune"))
+    flags += dns_flags(d.get("dns"))
     return flags
+
+
+DNS_FALLBACK_WARN = 12       # уходов на запасной DNS за сутки — уже пометка (таймер возвращает раз в 10 минут)
+DNS_EXCEEDED_SHARE = 0.001   # доля запросов, не влезших в очередь Unbound
+DNS_CACHE_FULL = 0.95        # кэш заполнен почти до предела
+
+
+def dns_flags(x):
+    """Свой резолвер (node_dns.sh): не работает, система на запасном, часто уходит на запасной, очередь или кэш полны."""
+    if not isinstance(x, dict):
+        return []   # резолвер не ставили или маячок старый
+    if not x.get("active"):
+        return ["свой DNS не работает (система на запасном)"]
+    out = []
+    if x.get("current") and x["current"] != "127.0.0.1":
+        out.append(f"DNS сейчас на запасном {x['current']}")
+    if (x.get("fallback_24h") or 0) >= DNS_FALLBACK_WARN:
+        out.append(f"DNS уходил на запасной {x['fallback_24h']} раз за сутки")
+    q, e = x.get("queries") or 0, x.get("exceeded") or 0
+    if q >= 1000 and e / q > DNS_EXCEEDED_SHARE:
+        out.append(f"очередь DNS переполняется ({e} из {q} запросов)")
+    for key, name in (("rrset", "записей"), ("msg", "ответов")):
+        cur, top = x.get(key + "_mb") or 0, x.get(key + "_max_mb") or 0
+        if top and cur >= DNS_CACHE_FULL * top:
+            out.append(f"кэш DNS {name} заполнен ({cur:g} из {top:g} МБ)")
+    return out
 
 
 def tune_flags(t):

@@ -92,6 +92,16 @@ check("T3 старый маячок без профиля — молчим", nw.
 node = {"data": {"ts": NOW, "disk_pct": 10, "mem_avail_mb": 900, "ufw": "active", "tune": {"cc": "cubic"}}, "ok_ts": NOW}
 check("T4 пометка в отчёте о сервере", nw.node_flags(node, NOW) == ["TCP cubic, не BBR"])
 
+D = {"active": True, "current": "127.0.0.1", "queries": 755000, "hits": 727000, "exceeded": 81, "rrset_mb": 20.0,
+     "rrset_max_mb": 64, "msg_mb": 10.0, "msg_max_mb": 32, "fallback_24h": 2}
+check("D1 резолвер в порядке — без пометок", nw.dns_flags(D) == [])
+check("D2 не ставили — молчим", nw.dns_flags(None) == [])
+check("D3 не работает", nw.dns_flags(dict(D, active=False)) == ["свой DNS не работает (система на запасном)"])
+f = nw.dns_flags(dict(D, current="1.1.1.1", fallback_24h=30, exceeded=2000, rrset_mb=63.5))
+check("D4 запасной, частые уходы, очередь, кэш", f == ["DNS сейчас на запасном 1.1.1.1", "DNS уходил на запасной 30 раз за сутки",
+                                                     "очередь DNS переполняется (2000 из 755000 запросов)",
+                                                     "кэш DNS записей заполнен (63.5 из 64 МБ)"])
+
 per = {"skipa": [ipaddress.ip_network("203.0.113.0/24")], sl.BEHAVIOR: [ipaddress.ip_network("198.51.100.5/32")]}
 check("L1 имя своего списка", sl.which_list("198.51.100.5", per) == "по поведению на наших серверах")
 d = tempfile.mkdtemp()

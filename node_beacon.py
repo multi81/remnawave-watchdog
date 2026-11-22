@@ -8,6 +8,7 @@
 
 С 22.11.2026 ещё:
   tune   — сетевой профиль (BBR, очередь fq, таблица соединений, MPTCP, synflood): сторож пишет, если профиль слетел;
+  dns    — свой резолвер Unbound (node_dns.sh): работает ли, на нём ли система, кэш, очередь, уходы на запасной;
   knocks — кто за сутки стучался в закрытые порты (по журналу ufw, только SYN): адрес, сколько разных портов, сколько
            раз, стучался ли на 80/443/8443. Из этого сторож собирает свой список сканеров «по поведению».
 """
@@ -108,6 +109,41 @@ def knocks(lines, now, since=86400):
     return out[:KNOCK_MAX]
 
 
+def dns():
+    """Свой резолвер Unbound (node_dns.sh): работает ли, на нём ли система, кэш, очередь, уходы на запасной. Нет — None."""
+    if not os.path.exists("/etc/unbound/unbound.conf.d/storozh.conf"):
+        return None
+    st = {}
+    for line in run(["unbound-control", "stats_noreset"]).splitlines():
+        k, _, v = line.partition("=")
+        try:
+            st[k] = float(v)
+        except ValueError:
+            pass
+    conf = open("/etc/unbound/unbound.conf.d/storozh.conf").read()
+
+    def size_mb(key, default):
+        m = re.search(r"^\s*%s:\s*(\d+)([kmg]?)" % key, conf, re.M | re.I)
+        if not m:
+            return default
+        return int(m.group(1)) * {"": 1 / 1048576, "k": 1 / 1024, "m": 1, "g": 1024}[m.group(2).lower()]
+
+    cur = run(["resolvectl", "status"])
+    m = re.search(r"Current DNS Server:\s*(\S+)", cur)
+    since = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(time.time() - 86400))
+    try:
+        fb = sum(1 for ln in open("/var/log/storozh-unbound.log", errors="replace") if ln[:16] >= since and "вернула" in ln)
+    except OSError:
+        fb = 0
+    g = lambda k: int(st[k]) if k in st else None
+    return {"active": run(["systemctl", "is-active", "unbound"]).strip() == "active", "current": m.group(1) if m else None,
+            "queries": g("total.num.queries"), "hits": g("total.num.cachehits"), "exceeded": g("total.requestlist.exceeded"),
+            "servfail": g("num.answer.rcode.SERVFAIL"), "uptime": g("time.up"),
+            "rrset_mb": round(st.get("mem.cache.rrset", 0) / 1048576, 1), "rrset_max_mb": size_mb("rrset-cache-size", 4),
+            "msg_mb": round(st.get("mem.cache.message", 0) / 1048576, 1), "msg_max_mb": size_mb("msg-cache-size", 4),
+            "fallback_24h": fb}
+
+
 def ufw_lines():
     out = []
     for f in ("/var/log/ufw.log.1", "/var/log/ufw.log"):
@@ -150,6 +186,7 @@ def collect():
         "failed_units": [line.split()[0] for line in run(["systemctl", "--failed", "--no-legend", "--plain"]).splitlines() if line.split()],
         "tune": tune(),
         "knocks": knocks(ufw_lines(), time.time()),
+        "dns": dns(),
     }
 
 
