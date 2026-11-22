@@ -71,6 +71,18 @@ own2 = own + [ipaddress.ip_network("203.0.113.1/32")]
 l4, _ = bs.step(st3, beacons, own2, NOW + 60, lookup)
 check("S8 добавили в исключения — пропал из списка", "203.0.113.1" not in l4)
 
+st5 = {}
+bs.step(st5, beacons, own, NOW, lookup)
+l5, _ = bs.step(st5, beacons, own, NOW + 60, lookup, clients_of=lambda ips: {"203.0.113.3"} & set(ips))
+check("C1 клиент выпадает из списка", "203.0.113.3" not in l5 and st5["ips"]["203.0.113.3"]["client"] == NOW + 60)
+l6, _ = bs.step(st5, beacons, own, NOW + 86400, lookup, clients_of=lambda ips: set())
+check("C2 бывший клиент не возвращается 30 дней", "203.0.113.3" not in l6)
+l7, _ = bs.step(st5, beacons, own, NOW + 31 * 86400 + 120, lookup, clients_of=lambda ips: set())
+check("C3 через 30 дней без подключений — снова может попасть", "203.0.113.3" in l7)
+st6 = {}
+l8, _ = bs.step(st6, beacons, own, NOW, lookup, clients_of=lambda ips: {"203.0.113.1"})
+check("C4 клиент не попадает с первого прохода", "203.0.113.1" not in l8 and "203.0.113.3" in l8)
+
 check("T1 профиль в порядке — без пометок", nw.tune_flags({"cc": "bbr", "qdisc": "fq", "conntrack_max": 100000, "mptcp": 0}) == [])
 f = nw.tune_flags({"cc": "cubic", "qdisc": "fq_codel", "conntrack_max": 8192, "mptcp": 1})
 check("T2 слетевший профиль — четыре пометки", f == ["TCP cubic, не BBR", "очередь fq_codel, не fq", "MPTCP включён",

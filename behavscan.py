@@ -8,7 +8,8 @@
   2. отбирает подозрительных: стучался на 80/443/8443 закрытого порта, или в 3+ разных закрытых порта, или замечен на
      2+ наших серверах;
   3. убирает наши адреса и исключения (те же, что у scanlists: адреса владельца, все серверы из ddos.json,
-     /etc/channel-watch/scanners-exclude.txt);
+     /etc/channel-watch/scanners-exclude.txt) и **адреса клиентов**: спрашивает щит каждой ноды (shield-ctl clients —
+     кто из адресов подключался к Xray за сутки); адрес, хоть раз оказавшийся клиентом, не берётся 30 дней;
   4. берёт только адреса хостингов/ЦОД (по ip-api.com, кэш 30 дней) — домашние и мобильные сети не трогаем, кроме тех,
      кто простучал 10+ портов: за домашним адресом может сидеть наш клиент;
   5. держит адрес в списке 30 дней после последнего стука; пишет /var/lib/channel-watch/scanners/behavior.list —
@@ -79,11 +80,17 @@ def ip_api(ips):
     return out
 
 
-def step(state, beacons, own, now, lookup=ip_api):
-    """Один проход: обновить state (на месте). -> (адреса в списке, новых за проход)."""
+def step(state, beacons, own, now, lookup=ip_api, clients_of=None):
+    """Один проход: обновить state (на месте). -> (адреса в списке, новых за проход).
+    clients_of(адреса) -> множество тех, кто наш клиент (щиты нод); None — не спрашивать (тесты, нет связи)."""
     ips = state.setdefault("ips", {})
     agg = aggregate(beacons)
     cand = {ip: v for ip, v in agg.items() if suspicious(v) and not is_own(ip, own)}
+    asked = list(cand) + [ip for ip, e in ips.items() if e.get("listed") and ip not in cand]
+    for ip in (clients_of(asked) if clients_of and asked else set()):
+        e = ips.setdefault(ip, {"first": int(now)})
+        e.update(client=int(now), listed=False, last=int(now))
+    cand = {ip: v for ip, v in cand.items() if now - ips.get(ip, {}).get("client", 0) > KEEP_DAYS * 86400}
     need = [ip for ip in cand if ip not in ips or now - ips[ip].get("looked", 0) > KEEP_DAYS * 86400]
     info = lookup(need) if need else {}
     new = 0
@@ -104,8 +111,8 @@ def step(state, beacons, own, now, lookup=ip_api):
         ips[ip] = e
     for ip in [ip for ip, e in ips.items() if now - e.get("last", 0) > KEEP_DAYS * 86400]:
         del ips[ip]
-    for ip, e in ips.items():   # свой адрес мог попасть в список раньше (добавили в исключения позже)
-        if e.get("listed") and is_own(ip, own):
+    for ip, e in ips.items():   # свой адрес или клиент мог попасть в список раньше
+        if e.get("listed") and (is_own(ip, own) or now - e.get("client", 0) <= KEEP_DAYS * 86400):
             e["listed"] = False
     state["ts"] = int(now)
     listed = sorted((ip for ip, e in ips.items() if e.get("listed")), key=lambda x: ipaddress.ip_address(x))
@@ -127,8 +134,20 @@ def main(argv):
         state = json.load(open(STATE, encoding="utf-8"))
     except (OSError, ValueError):
         state = {}
-    listed, new = step(state, beacons, own, time.time())
-    msg = "behavscan: маячков со стуками %d из %d, в списке %d адресов, новых %d" % (got, len(beacons), len(listed), new)
+    hs = shieldbot.hosts()
+
+    def clients_of(addrs):
+        found = set()
+        for h in hs:
+            for i in range(0, len(addrs), 300):
+                r = shieldbot.run_ctl(h, ["clients"] + addrs[i:i + 300], hs) or {}
+                found |= set((r.get("clients") or {}).keys())
+        return found
+
+    listed, new = step(state, beacons, own, time.time(), clients_of=clients_of)
+    nclients = sum(1 for e in state["ips"].values() if e.get("client"))
+    msg = "behavscan: маячков со стуками %d из %d, в списке %d адресов, новых %d, клиентов отсеяно %d" % (
+        got, len(beacons), len(listed), new, nclients)
     print(msg)
     if "--dry" in argv:
         return 0
