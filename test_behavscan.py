@@ -95,6 +95,7 @@ check("T4 пометка в отчёте о сервере", nw.node_flags(node,
 D = {"active": True, "current": "127.0.0.1", "queries": 755000, "hits": 727000, "exceeded": 81, "rrset_mb": 20.0,
      "rrset_max_mb": 64, "msg_mb": 10.0, "msg_max_mb": 32, "fallback_24h": 2}
 check("D1 резолвер в порядке — без пометок", nw.dns_flags(D) == [])
+check("D1b после перезапуска мелкие числа — без пометки", nw.dns_flags(dict(D, queries=1868, exceeded=3)) == [])
 check("D2 не ставили — молчим", nw.dns_flags(None) == [])
 check("D3 не работает", nw.dns_flags(dict(D, active=False)) == ["свой DNS не работает (система на запасном)"])
 f = nw.dns_flags(dict(D, current="1.1.1.1", fallback_24h=30, exceeded=2000, rrset_mb=63.5))

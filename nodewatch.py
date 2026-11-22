@@ -99,7 +99,7 @@ def dns_flags(x):
     if (x.get("fallback_24h") or 0) >= DNS_FALLBACK_WARN:
         out.append(f"DNS уходил на запасной {x['fallback_24h']} раз за сутки")
     q, e = x.get("queries") or 0, x.get("exceeded") or 0
-    if q >= 1000 and e / q > DNS_EXCEEDED_SHARE:
+    if q >= 20000 and e >= 50 and e / q > DNS_EXCEEDED_SHARE:   # после перезапуска на малых числах доля врёт
         out.append(f"очередь DNS переполняется ({e} из {q} запросов)")
     for key, name in (("rrset", "записей"), ("msg", "ответов")):
         cur, top = x.get(key + "_mb") or 0, x.get(key + "_max_mb") or 0
