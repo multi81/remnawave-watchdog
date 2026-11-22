@@ -77,7 +77,24 @@ def node_flags(node, now):
         flags.append(f"свободной памяти {d['mem_avail_mb']} МБ")
     if d.get("ufw") and d["ufw"] != "active":
         flags.append("файрвол выключен")
+    flags += tune_flags(d.get("tune"))
     return flags
+
+
+def tune_flags(t):
+    """Сетевой профиль слетел (node_tune.sh: bbr, fq или cake, таблица соединений ≥ 65536, MPTCP выключен) — короткие пометки."""
+    if not isinstance(t, dict):
+        return []   # старый маячок без профиля — молчим
+    out = []
+    if t.get("cc") and t["cc"] != "bbr":
+        out.append(f"TCP {t['cc']}, не BBR")
+    if t.get("qdisc") and t["qdisc"] not in ("fq", "cake"):   # cake ставит «Решала» (режим boost) — с BBR тоже годится
+        out.append(f"очередь {t['qdisc']}, не fq")
+    if t.get("mptcp") == 1:
+        out.append("MPTCP включён")
+    if isinstance(t.get("conntrack_max"), int) and t["conntrack_max"] < 65536:
+        out.append(f"таблица соединений {t['conntrack_max']}")
+    return out
 
 
 def disk_level(node):

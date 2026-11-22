@@ -35,6 +35,11 @@ URLS = {"c24be_gov": "https://raw.githubusercontent.com/C24Be/AS_Network_List/ma
         "antiscanner_sngvy": "https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"}
 
 
+# свой список «по поведению» (behavscan.py: кто стучался в закрытые порты наших серверов) — не скачивается, лежит рядом
+BEHAVIOR = "behavior"
+LOCAL_NAMES = {BEHAVIOR: "по поведению на наших серверах"}
+
+
 def list_url(name):
     return URLS.get(name) or BASE + name + ".list"
 SHRINK_MAX = 0.3
@@ -200,7 +205,7 @@ def which_list(addr, per_list):
         a = ipaddress.ip_address(addr)
     except ValueError:
         return ""
-    names = [LISTS.get(k, k) for k, ns in per_list.items() if any(a in n for n in ns if n.version == a.version)]
+    names = [dict(LISTS, **LOCAL_NAMES).get(k, k) for k, ns in per_list.items() if any(a in n for n in ns if n.version == a.version)]
     return ", ".join(names) or "свои добавки"
 
 
@@ -231,6 +236,9 @@ def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=
         if text and not note and not dry:
             write(os.path.join(base, name + ".list"), text)
         per_list[name] = nets
+    behav = parse(read(os.path.join(base, BEHAVIOR + ".list")))[0]
+    if behav:
+        per_list[BEHAVIOR] = behav
     extra = parse(read(os.path.join(ETC, "scanners-extra.txt")))[0]
     exclude = parse(read(os.path.join(ETC, "scanners-exclude.txt")))[0]
     final, cut = combine(per_list, extra, exclude, own_networks(hosts.values()))

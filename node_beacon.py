@@ -5,7 +5,13 @@
 включён ли файрвол, сколько было неудачных входов по SSH за сутки и сколько пакетов отбил файрвол (счётчики с момента
 загрузки правил — сторож сам считает разницу). Ничего не меняет на сервере и никуда не ходит: файл забирает сторож.
 Секретов в файле нет.
+
+С 22.11.2026 ещё:
+  tune   — сетевой профиль (BBR, очередь fq, таблица соединений, MPTCP, synflood): сторож пишет, если профиль слетел;
+  knocks — кто за сутки стучался в закрытые порты (по журналу ufw, только SYN): адрес, сколько разных портов, сколько
+           раз, стучался ли на 80/443/8443. Из этого сторож собирает свой список сканеров «по поведению».
 """
+import datetime as dt
 import json
 import os
 import re
@@ -46,6 +52,73 @@ def policy_drops():
     return int(m.group(1)) if m else None
 
 
+def sysctl(key):
+    try:
+        v = open("/proc/sys/" + key.replace(".", "/")).read().strip()
+        return int(v) if v.lstrip("-").isdigit() else v
+    except OSError:
+        return None
+
+
+def tune():
+    """Сетевой профиль ноды как есть (node_tune.sh ставит: bbr, fq, conntrack 100000, mptcp 0, synack 2, fin 15)."""
+    dev = (run(["ip", "-o", "route", "show", "default"]).split(" dev ") + [""])[1].split(" ")[0]
+    q = run(["tc", "qdisc", "show", "dev", dev]) if dev else ""
+    qdisc = "fq" if re.search(r"^qdisc fq ", q, re.M) else (q.split() + ["", "?"])[1] if q else None
+    return {"cc": sysctl("net.ipv4.tcp_congestion_control"), "qdisc": qdisc,
+            "conntrack_max": sysctl("net.netfilter.nf_conntrack_max"), "mptcp": sysctl("net.mptcp.enabled"),
+            "synack": sysctl("net.ipv4.tcp_synack_retries"), "fin_timeout": sysctl("net.ipv4.tcp_fin_timeout")}
+
+
+KNOCK_PORTS = {80, 443, 8443}   # стук сюда при закрытом порте — почти наверняка сканер (клиенты сюда не ходят мимо правил)
+KNOCK_MAX = 400                 # не больше стольких адресов в файле (маячок читается целиком, до 64 КБ)
+LINE = re.compile(r"UFW BLOCK.* SRC=([0-9.]+) .*PROTO=TCP .*DPT=(\d+) .*\bSYN\b")
+
+
+def knock_ts(ln, now):
+    """Время строки журнала: ISO (2026-11-22T00:00:05.009+00:00) или классическое «Nov 22 00:00:05» (местное, год текущий)."""
+    try:
+        if ln[:4].isdigit():
+            return dt.datetime.fromisoformat(ln.split()[0]).timestamp()
+        t = time.strptime("%d %s" % (time.localtime(now).tm_year, ln[:15]), "%Y %b %d %H:%M:%S")
+        return time.mktime(t)
+    except (ValueError, IndexError):
+        return None
+
+
+
+def knocks(lines, now, since=86400):
+    """[[адрес, разных портов, стуков, 1 если стучался на 80/443/8443], …] — сначала самые подозрительные."""
+    src = {}
+    for ln in lines:
+        m = LINE.search(ln)
+        if not m:
+            continue
+        ts = knock_ts(ln, now)
+        if ts is None or now - ts > since:
+            continue
+        ip, port = m.group(1), int(m.group(2))
+        if ip.startswith(("10.", "192.168.", "127.")) or re.match(r"172\.(1[6-9]|2\d|3[01])\.", ip):
+            continue
+        v = src.setdefault(ip, [set(), 0])
+        v[0].add(port)
+        v[1] += 1
+    out = [[ip, len(p), n, int(bool(p & KNOCK_PORTS))] for ip, (p, n) in src.items()]
+    out.sort(key=lambda r: (-r[3], -r[1], -r[2]))
+    return out[:KNOCK_MAX]
+
+
+def ufw_lines():
+    out = []
+    for f in ("/var/log/ufw.log.1", "/var/log/ufw.log"):
+        try:
+            with open(f, errors="replace") as fh:
+                out += [ln for ln in fh if "UFW BLOCK" in ln]
+        except OSError:
+            pass
+    return out
+
+
 def collect():
     disk = os.statvfs("/")
     mem = meminfo()
@@ -75,6 +148,8 @@ def collect():
         "finwait2": len(run(["ss", "-Htn", "state", "fin-wait-2"]).splitlines()),
         "conntrack": conn,
         "failed_units": [line.split()[0] for line in run(["systemctl", "--failed", "--no-legend", "--plain"]).splitlines() if line.split()],
+        "tune": tune(),
+        "knocks": knocks(ufw_lines(), time.time()),
     }
 
 

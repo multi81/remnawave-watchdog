@@ -29,9 +29,9 @@ keys() {
 
 case "${1:-}" in
   --uninstall)
-    systemctl disable --now channel-watch-ddos.timer channel-watch-shieldbot.service channel-watch-scanlists.timer 2>/dev/null || true
+    systemctl disable --now channel-watch-ddos.timer channel-watch-shieldbot.service channel-watch-scanlists.timer channel-watch-behavscan.timer 2>/dev/null || true
     rm -f /etc/systemd/system/channel-watch-ddos.{service,timer} /etc/systemd/system/channel-watch-shieldbot.service \
-          /etc/systemd/system/channel-watch-scanlists.{service,timer}
+          /etc/systemd/system/channel-watch-scanlists.{service,timer} /etc/systemd/system/channel-watch-behavscan.{service,timer}
     systemctl daemon-reload
     echo "службы DDoS, щита и сканеров убраны; ключи и $ETC/ddos.json остались"; exit 0 ;;
   keys) keys; exit 0 ;;
@@ -64,10 +64,10 @@ PY
 esac
 
 [ -s "$OPT/probe.py" ] || { echo "сначала install.sh: через probe.py уходят сообщения в Telegram"; exit 1; }
-for f in ddoswatch.py shieldbot.py scanlists.py; do [ -s "$SRC/$f" ] || { echo "рядом нет $f"; exit 1; }; done
+for f in ddoswatch.py shieldbot.py scanlists.py behavscan.py; do [ -s "$SRC/$f" ] || { echo "рядом нет $f"; exit 1; }; done
 python3 -c 'import ast, sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' \
-  "$SRC/ddoswatch.py" "$SRC/shieldbot.py" "$SRC/scanlists.py"
-install -m 755 "$SRC/ddoswatch.py" "$SRC/shieldbot.py" "$SRC/scanlists.py" "$OPT/"
+  "$SRC/ddoswatch.py" "$SRC/shieldbot.py" "$SRC/scanlists.py" "$SRC/behavscan.py"
+install -m 755 "$SRC/ddoswatch.py" "$SRC/shieldbot.py" "$SRC/scanlists.py" "$SRC/behavscan.py" "$OPT/"
 
 for k in ddos shield; do
   [ -f "$ETC/${k}_ed25519" ] || ssh-keygen -q -t ed25519 -N '' -C "channel-watch-$k" -f "$ETC/${k}_ed25519"
@@ -135,8 +135,29 @@ Persistent=true
 [Install]
 WantedBy=timers.target
 UNIT
+cat > /etc/systemd/system/channel-watch-behavscan.service <<'UNIT'
+[Unit]
+Description=channel-watch: свой список сканеров по поведению (стуки в закрытые порты ваших серверов)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/python3 /opt/channel-watch/behavscan.py
+Nice=15
+TimeoutStartSec=600
+UNIT
+cat > /etc/systemd/system/channel-watch-behavscan.timer <<'UNIT'
+[Unit]
+Description=channel-watch: свой список сканеров раз в сутки, перед общим списком
+
+[Timer]
+OnCalendar=*-*-* 01:20:00 UTC
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+UNIT
 systemctl daemon-reload
-systemctl enable --now channel-watch-ddos.timer channel-watch-shieldbot.service channel-watch-scanlists.timer >/dev/null 2>&1
+systemctl enable --now channel-watch-ddos.timer channel-watch-shieldbot.service channel-watch-scanlists.timer channel-watch-behavscan.timer >/dev/null 2>&1
 
 echo "== готово: DDoS $(systemctl is-active channel-watch-ddos.timer), кнопки $(systemctl is-active channel-watch-shieldbot.service), сканеры $(systemctl is-active channel-watch-scanlists.timer)"
 echo "   ваши адреса (никогда не блокировать и не считать сканерами) — по одному в строке в $ETC/owner.txt"

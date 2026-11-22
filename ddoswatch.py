@@ -779,7 +779,7 @@ def scan_membership(ips, folder=None):
     try:
         import scanlists
         per = {}
-        for name in scanlists.LISTS:
+        for name in list(scanlists.LISTS) + [getattr(scanlists, "BEHAVIOR", "behavior")]:
             try:
                 per[name] = scanlists.parse(open(os.path.join(folder or SCAN_DIR, name + ".list"), encoding="utf-8").read())[0]
             except OSError:
