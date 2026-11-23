@@ -21,6 +21,13 @@ import blockwatch  # noqa: E402
 import build_channels  # noqa: E402
 import probe  # noqa: E402
 
+# прокси из окружения машины в тестах не нужны: запросы к своим серверам на 127.0.0.1 ушли бы через них
+for _k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    os.environ.pop(_k, None)
+os.environ["NO_PROXY"] = os.environ["no_proxy"] = "*"
+import urllib.request as _ur  # noqa: E402
+_ur.install_opener(_ur.build_opener(_ur.ProxyHandler({})))
+
 tmp = tempfile.mkdtemp()
 probe.ETC = tmp
 probe.STATE = os.path.join(tmp, "state.json")
@@ -35,6 +42,8 @@ blockwatch.netprobe.neighbours = lambda addr, **kw: None
 blockwatch.LISTS_FILE = os.path.join(tmp, "lists.json")
 real_dns_check, real_deep_many, real_health = blockwatch.dns_check, blockwatch.deep_many, blockwatch.agents_health
 blockwatch.dns_check = lambda names, port, agents=(): {}
+real_dns_run, real_dns_own = probe.dns_check, probe.dns_check_own
+probe.dns_check = lambda names, port, agents=(): {}
 blockwatch.deep_many = lambda chans, via_for, agents, bases: {}
 blockwatch.agents_health = lambda agents: {}
 # сводку за неделю в общих сценариях не шлём (проверяется отдельно, в разделе W)
@@ -121,7 +130,7 @@ def fake_tg(text):
     return "ok"
 
 
-probe.tg_send = fake_tg
+real_tg_send, probe.tg_send = probe.tg_send, fake_tg
 probe.time.time = lambda: clock["t"]
 probe.STAGGER = 0  # в тестах каналы не ждут друг друга
 # отчёт в этих сценариях не шлём: помечаем, что за текущий час из списка он уже был
@@ -725,16 +734,16 @@ probe.time.sleep = real_sleep
 
 # P. пульс для внешнего сторожа
 probe.HEARTBEAT = os.path.join(tmp, "heartbeat.path")
+probe.HEARTBEAT_FULL = os.path.join(tmp, "heartbeat-full.path")
 pulse = os.path.join(tmp, "pulse.json")
 probe.beat()
 check(not os.path.exists(pulse), "P1 файла с путём нет — пульс не пишется")
 open(probe.HEARTBEAT, "w", encoding="utf-8").write(pulse + "\n")
 probe.beat()
 beat = json.load(open(pulse, encoding="utf-8"))
-check({k: beat[k] for k in ("ts", "summary", "hours", "unsent", "offline")}
-      == {"ts": int(clock["t"]), "summary": load()["last_summary"], "hours": [0], "unsent": 0, "offline": False}
-      and beat["nodes"] == {} and beat["sites"]["panel"] == "OK" and beat["sites"]["sub"] == "OK",
-      "P2 в пульсе: время запуска, последний отчёт, часы отчётов, очередь неотправленного, состояние сайтов")
+check(beat == {"ts": int(clock["t"]), "summary": load()["last_summary"], "hours": [0], "unsent": 0, "offline": False},
+      "P2 в пульсе: время запуска, последний отчёт, часы отчётов, очередь неотправленного — и ничего больше "
+      "(перечень нод и сайтов в папку сайта не кладём)")
 
 # V. серверы (маячки нод), взгляд снаружи, закачка побольше
 nw = probe.nodewatch
@@ -926,29 +935,70 @@ tls_srv.shutdown()
 for sv in servers:
     sv.shutdown()
 
-# Z. сверка со вторым сторожем: в пульсе — состояние каждой ноды и сайта
+# Z. сверка со вторым сторожем: в полном пульсе — состояние каждой ноды и сайта
+pulse_full = os.path.join(tmp, "pulse-full.json")
+open(probe.HEARTBEAT_FULL, "w", encoding="utf-8").write(pulse_full + "\n")
 probe.socket.gethostbyname = lambda h: {"de1.example.net": "1.1.1.1", "srv1.example.net": "9.9.9.9"}[h]
 world["alive"], world["deep"] = {}, {}
 for _ in range(8):
     step(10)
 probe.beat()
-beat = json.load(open(pulse, encoding="utf-8"))
+beat = json.load(open(pulse_full, encoding="utf-8"))
+short = json.load(open(pulse, encoding="utf-8"))
+check(set(short) == {"ts", "summary", "hours", "unsent", "offline"} and {k: beat[k] for k in short} == short
+      and {"ts", "unsent", "offline", "nodes", "sites"} <= set(beat),
+      "Z0 полный пульс — только по отдельному пути: в нём всё, что читает второй сторож (ts, unsent, offline, "
+      "nodes, sites); короткий пульс для guard — без нод")
 check(set(beat["nodes"]) == {"de1.example.net", "srv1.example.net"}
       and beat["nodes"]["de1.example.net"]["status"] == "OK" and beat["nodes"]["srv1.example.net"]["status"] == "OK",
       "Z1 канал относится к ноде, на которой он выходит (по адресу выхода), — так находятся ноды за ретрансляторами")
 world["alive"][21003] = False
 step(), step()
 probe.beat()
-beat = json.load(open(pulse, encoding="utf-8"))
+beat = json.load(open(pulse_full, encoding="utf-8"))
 check(beat["nodes"]["de1.example.net"]["status"] == "DOWN" and beat["nodes"]["srv1.example.net"]["status"] == "OK",
       "Z2 у ноды несколько каналов — в пульсе худшее состояние")
 world["alive"] = {}
 world["sites"]["панель"] = "000"
 step(10), step()
 probe.beat()
-check(json.load(open(pulse, encoding="utf-8"))["sites"] == {"panel": "DOWN", "sub": "OK", "cabinet": "OK", "admin": "OK"},
+check(json.load(open(pulse_full, encoding="utf-8"))["sites"] == {"panel": "DOWN", "sub": "OK", "cabinet": "OK", "admin": "OK"},
       "Z3 состояние сайтов в пульсе — под именами, которые понимает второй сторож")
 world["sites"] = {}
+# переходный вариант: в heartbeat-full.path тот же путь, что в heartbeat.path, — один полный файл, как до разделения
+open(probe.HEARTBEAT_FULL, "w", encoding="utf-8").write(pulse + "\n")
+probe.beat()
+same = json.load(open(pulse, encoding="utf-8"))
+check("nodes" in same and "sites" in same and isinstance(same["ts"], int) and "summary" in same and "hours" in same,
+      "Z4 тот же путь в обоих файлах — пишется один полный пульс (и guard, и второй сторож читают его, как раньше)")
+os.remove(probe.HEARTBEAT_FULL)
+probe.beat()
+check("nodes" not in json.load(open(pulse, encoding="utf-8")), "Z5 убрали heartbeat-full.path — ноды из пульса пропали")
+# запись пульса: подложенный в папку сайта файл или ссылка не затираются и не открываются всем
+victim = os.path.join(tmp, "victim.txt")
+open(victim, "w", encoding="utf-8").write("SECRET")
+open(pulse + ".tmp", "w", encoding="utf-8").write("PLANTED")
+probe.beat()
+check(open(pulse + ".tmp", encoding="utf-8").read() == "PLANTED" and json.load(open(pulse, encoding="utf-8"))["ts"]
+      and not [f for f in os.listdir(tmp) if f.startswith(".hb-")],
+      "Z6 временный файл пульса — свой, с неугадываемым именем: чужой «pulse.json.tmp» не тронут, мусора не осталось")
+os.remove(pulse + ".tmp")
+try:
+    os.remove(pulse)
+    os.symlink(victim, pulse)
+    linked = True
+except (OSError, NotImplementedError):
+    linked = False  # Windows без права на ссылки
+if linked:
+    probe.beat()
+    check(open(victim, encoding="utf-8").read() == "SECRET" and not os.path.islink(pulse)
+          and json.load(open(pulse, encoding="utf-8"))["ts"],
+          "Z7 на месте пульса подложена ссылка на чужой файл — заменяется сама ссылка, чужой файл цел")
+else:
+    print("SKIP Z7 нельзя создать ссылку на этой машине")
+    probe.beat()
+if hasattr(os, "fchmod"):
+    check(os.stat(pulse).st_mode & 0o777 == 0o644, "Z8 у пульса права 0644 (его отдаёт веб-сервер)")
 
 # ====== версия 8: блокировки (netprobe, vantage_agent, blockwatch) ======
 import struct
@@ -1258,7 +1308,7 @@ def until_dns(times=1):
     raise SystemExit("проверка DNS не запускается")
 
 
-blockwatch.dns_check = fake_dns
+probe.dns_check = fake_dns
 out = until_dns()
 check(out == [] and dns_calls[-1][1] == list(probe.SITE_HOSTS) and dns_calls[-1][2] == 21004
       and "подмены DNS нет (имён: 4)" in report(),
@@ -1279,7 +1329,7 @@ world_dns.clear()
 out = until_dns(2)
 check(len(out) == 1 and "DNS снова отвечает верно: sub.example.com" in out[0] and "подмены DNS нет" in report(),
       "X23 ответы снова совпадают — сообщение о возврате")
-blockwatch.dns_check = lambda names, port, agents=(): {}
+probe.dns_check = lambda names, port, agents=(): {}
 
 
 # разбор сбоя: на что похоже
@@ -1604,7 +1654,7 @@ threading.Thread(target=agent2.serve_forever, daemon=True).start()
 A2 = {"name": "Точка Б", "url": f"http://127.0.0.1:{agent2.server_address[1]}", "token": TOKEN}
 h = blockwatch.agent_get(A2, "/health")
 r = blockwatch.agent_get(A2, f"/series?host=localhost&port={p_page}&n=4&mss=1213")
-check(h["v"] == 6 and h["ports"] == [p_page, p_silent] and (r["n"], r["ok"], r["mss"]) == (4, 4, 1213 if MARK else None)
+check(h["v"] == vantage_agent.VERSION and h["ports"] == [p_page, p_silent] and (r["n"], r["ok"], r["mss"]) == (4, 4, 1213 if MARK else None)
       and blockwatch.agent_get(A2, f"/series?host=localhost&port={p_page}&n=999&mss=9999")["mss"] == (1260 if MARK else None)
       and blockwatch.agent_get(A2, f"/series?host=localhost&port={dead_port}") is None,
       "ZL6 агент: серия соединений по запросу; число и метка — в своих пределах; чужой порт — отказ")
@@ -1961,20 +2011,20 @@ check(blockwatch.dns_points(dns_res, [{"name": "Точка Б"}]) == {"rf1": (0,
       and "снова находит" in blockwatch.dns_point_text("Точка Б", "ok", 0, 3),
       "ZL37 по проверке DNS видно, у какой точки свой DNS не находит наши имена")
 fresh()
-real_dns_check_fake = blockwatch.dns_check
-blockwatch.dns_check = lambda names, port, agents=(): {n: {"truth": ["1.1.1.1"], "odd": [], "asked": 3,
+real_dns_check_fake = probe.dns_check
+probe.dns_check = lambda names, port, agents=(): {n: {"truth": ["1.1.1.1"], "odd": [], "asked": 3,
                                                           "system": {"rf1": "ok", "Москва": "err"}} for n in names}
 blockwatch.agents_cfg = lambda: [{"name": "Москва", "url": "u", "token": "t"}]
 out = []
 for _ in range(40):
     out += step()
 dns_msgs = [x for x in out if "свой DNS не находит" in x]
-blockwatch.dns_check = lambda names, port, agents=(): {n: {"truth": ["1.1.1.1"], "odd": [], "asked": 3,
+probe.dns_check = lambda names, port, agents=(): {n: {"truth": ["1.1.1.1"], "odd": [], "asked": 3,
                                                           "system": {"rf1": "ok", "Москва": "ok"}} for n in names}
 out2 = []
 for _ in range(40):
     out2 += step()
-blockwatch.dns_check = real_dns_check_fake
+probe.dns_check = real_dns_check_fake
 blockwatch.agents_cfg = lambda: []
 check(len(dns_msgs) == 1 and "«Москва»" in dns_msgs[0] and len([x for x in out2 if "снова находит наши имена" in x]) == 1,
       "ZL37а сторож: свой DNS точки не находит наши имена две проверки подряд — одно сообщение; снова находит — одно")
@@ -2520,6 +2570,261 @@ check(d88["paths"]["Москва"]["last_info"] == "внутренняя сет�
       and "пропадает после шага 2 (10.1.1.1 — внутренняя сеть хостера, откуда идёт проверка: 5.5.5.5 — AS64501 Точка · RU Moscow)"
       in blockwatch.path_text(d88["paths"]["Москва"]),
       "ZL88 путь с точки: внутренний узел — сеть этой точки по её адресу")
+
+# ====== Telegram: токен не в аргументах curl, длинные сообщения, отказ 400; DNS без наших имён в открытом UDP ======
+import shutil
+import urllib.parse as _up34
+
+tg_hits, tg_mode = [], {"code": lambda form: 200}
+
+
+class TgHandler(http.server.BaseHTTPRequestHandler):
+    def do_POST(self):
+        n = int(self.headers.get("Content-Length") or 0)
+        form = {k: v[0] for k, v in _up34.parse_qs(self.rfile.read(n).decode("utf-8"), keep_blank_values=True).items()}
+        tg_hits.append((self.path, form))
+        self.send_response(tg_mode["code"](form))
+        self.end_headers()
+        self.wfile.write(b"{}")
+
+    def log_message(self, *args):
+        pass
+
+
+saved_tg = (probe.TG_API, probe.tg_env, probe.tg_routes, probe.tg_send)
+tg_srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), TgHandler)
+threading.Thread(target=tg_srv.serve_forever, daemon=True).start()
+probe.TG_API = f"http://127.0.0.1:{tg_srv.server_address[1]}"
+probe.tg_env = lambda: ("123456:SECRETTOKEN", "-100500")
+probe.tg_routes = lambda: [None]
+probe.tg_send = real_tg_send
+argv_seen = []
+real_run34 = probe.subprocess.run
+
+
+def spy_run(cmd, *a, **kw):
+    argv_seen.append((list(cmd), kw.get("input") or ""))
+    return real_run34(cmd, *a, **kw)
+
+
+probe.subprocess.run = spy_run
+SAMPLE = 'Нода <b>de1</b> "кавычки" \\ обратная\nвторая строка\tтаб & <i>x</i> ник @user_1'
+if shutil.which("curl"):
+    r = probe.tg_send(SAMPLE)
+    path, form = tg_hits[-1]
+    check(r == "ok" and path == "/bot123456:SECRETTOKEN/sendMessage" and form["text"] == SAMPLE
+          and form["chat_id"] == "-100500" and form["parse_mode"] == "HTML" and form["disable_web_page_preview"] == "true",
+          "TG1 сообщение доходит как есть (кавычки, обратная косая, переводы строки, табуляция, разметка)")
+    check(all("SECRETTOKEN" not in x and "кавычки" not in x and "-100500" not in x for cmd, _ in argv_seen for x in cmd)
+          and all("SECRETTOKEN" in inp for _, inp in argv_seen) and ["-K", "-"] == argv_seen[-1][0][-2:],
+          "TG2 токен, чат и текст — в конфиге curl на stdin (-K -), в аргументах процесса их нет (ps их не покажет)")
+    tg_hits.clear()
+    tg_mode["code"] = lambda form: 400 if form.get("parse_mode") else 200
+    r = probe.tg_send("<b>Нода</b> 5 &lt; 6 <oops & x")
+    check(r == "ok" and len(tg_hits) == 2 and "parse_mode" not in tg_hits[1][1]
+          and tg_hits[1][1]["text"] == "Нода 5 < 6 <oops & x",
+          "TG3 Telegram не принял разметку (400) — то же сообщение уходит простым текстом, без тегов")
+    tg_hits.clear()
+    tg_mode["code"] = lambda form: 400
+    check(probe.tg_send("<b>x</b>") == "bad" and len(tg_hits) == 2,
+          "TG4 отверг и простой текст — «bad» (повторять бесполезно), лишних попыток нет")
+    tg_hits.clear()
+    tg_mode["code"] = lambda form: 200
+    long_text = "\n".join(f"строка {i:03d} " + "ж" * 90 for i in range(100))
+    r = probe.tg_send(long_text)
+    texts = [f["text"] for _, f in tg_hits]
+    check(r == "ok" and len(texts) == 3 and all(probe.tg_len(t) <= probe.TG_LIMIT for t in texts)
+          and "\n".join(texts) == long_text,
+          "TG5 длинное сообщение (больше 4096) уходит несколькими, разрезано между строками, ничего не потеряно")
+    tg_srv.shutdown()
+    tg_srv.server_close()
+    check(probe.tg_send("x") == "fail", "TG6 сервер не отвечает — «fail» (сообщение останется в очереди)")
+else:
+    print("SKIP TG1–TG6: нет curl")
+probe.subprocess.run = real_run34
+probe.TG_API, probe.tg_env, probe.tg_routes, probe.tg_send = saved_tg
+
+# разрезание: по пустой строке между тревогами, длина по UTF-16 (эмодзи — два знака)
+parts = probe.tg_split("а" * 3000 + "\n\n" + "б" * 3000 + "\nв")
+check(parts == ["а" * 3000, "б" * 3000 + "\nв"], "TG7 режем на пустой строке между тревогами")
+parts = probe.tg_split("😀" * 2500)
+check([probe.tg_len(x) for x in parts] == [4000, 1000] and "".join(parts) == "😀" * 2500,
+      "TG8 длину считаем, как Telegram (UTF-16): строка из эмодзи режется по 2000 штук")
+check(probe.tg_split("коротко") == ["коротко"] and probe.curl_quote('a"b\\c\nd') == '"a\\"b\\\\c\\nd"',
+      "TG9 короткое — как есть; строка для конфига curl экранирована")
+
+# очередь: пачку отвергли — по одной; строки из старой очереди шлются как есть
+fresh()
+step()
+tg_calls = []
+
+
+def tg_bad_marker(text):
+    tg_calls.append(text)
+    if "ПЛОХАЯ" in text:
+        return "bad"
+    sent.append(text)
+    return "ok"
+
+
+probe.tg_send = tg_bad_marker
+st = load()
+st["unsent"] = [["первая", "ПЛОХАЯ <b", "третья"], "🛰 старая строка из очереди"]
+json.dump(st, open(probe.STATE, "w", encoding="utf-8"), ensure_ascii=False)
+sent.clear()
+out = step()
+logtxt = open(probe.LOG, encoding="utf-8").read()
+check(probe.TG_HEAD + "первая" in out and probe.TG_HEAD + "третья" in out and "🛰 старая строка из очереди" in out
+      and not any("ПЛОХАЯ" in m for m in out) and load()["unsent"] == []
+      and "отверг пачку из 3 оповещений — шлю по одной" in logtxt and "отверг оповещение — пропускаю: 🛰 Сторож" in logtxt,
+      "TG10 Telegram отверг пачку — тревоги уходят по одной, пропадает только плохая; старая очередь (строки) понятна")
+
+# пачка длиннее TG_LIMIT — сразу по одной: часть кусков дошла, другой отвергнут — дублей нет
+real_tg_send2 = probe.tg_send
+probe.tg_send = real_tg_send
+posted34 = []
+
+
+def tg_post34(token, chat, text, proxy=None, markup=True):
+    posted34.append(text)
+    return "400" if "ПЛОХАЯ" in text else "200"
+
+
+saved34 = probe.tg_env, probe.tg_routes, probe.tg_post
+probe.tg_env, probe.tg_routes, probe.tg_post = lambda: ("t", "c"), lambda: [None], tg_post34
+long_a, long_b = "А" * 2500, "Б" * 2500
+st = load()
+st["unsent"] = [[long_a, long_b + " ПЛОХАЯ"], ["короткая 1", "короткая 2"]]
+json.dump(st, open(probe.STATE, "w", encoding="utf-8"), ensure_ascii=False)
+step()
+probe.tg_env, probe.tg_routes, probe.tg_post = saved34
+probe.tg_send = real_tg_send2
+good = [m for m in posted34 if "ПЛОХАЯ" not in m]
+check(sum(m.count(long_a) for m in good) == 1 and probe.TG_HEAD + "короткая 1\n\nкороткая 2" in good
+      and all(probe.tg_len(m) <= probe.TG_LIMIT for m in posted34) and load()["unsent"] == [],
+      "TG10а пачка длиннее TG_LIMIT сразу раскладывается на одиночные тревоги: отказ одной не повторяет "
+      "уже доставленную; короткая пачка уходит одним сообщением")
+
+# полный отчёт и сводка: отвергнутые не повторяются каждые 2 минуты
+st = load()
+st["last_summary"], st["last_weekly"] = "", ""
+json.dump(st, open(probe.STATE, "w", encoding="utf-8"), ensure_ascii=False)
+probe.tg_send = lambda text: tg_calls.append(text) or "bad"
+probe.weekly_text = lambda st, hist, now: "сводка"
+tg_calls.clear()
+step()
+n_first = len(tg_calls)
+st = load()
+logtxt = open(probe.LOG, encoding="utf-8").read()
+check(n_first >= 2 and "сводка" in tg_calls and st["summary_bad"] == today and st["last_summary"] == ""
+      and st["last_weekly"] == probe.week_key(clock["t"])
+      and "отверг полный отчёт" in logtxt and "отверг сводку за неделю" in logtxt,
+      "TG11 отчёт и сводку отвергли — записано в журнал; отчёт не помечен ушедшим (внешний сторож это увидит)")
+tg_calls.clear()
+step()
+step()
+check(tg_calls == [], "TG12 до следующего часа отчёта отвергнутое не повторяется")
+st = load()
+st["last_summary"] = today
+json.dump(st, open(probe.STATE, "w", encoding="utf-8"), ensure_ascii=False)
+probe.tg_send = fake_tg
+probe.weekly_text = lambda st, hist, now: None
+
+# DNS: наши имена — только системный резолвер rf1 и точек против DoH; публичные DNS по UDP — только чужие имена.
+# Своя проверка probe.py — на случай, когда на сервере ещё старый blockwatch (спрашивает наши имена открытым UDP)
+udp_asked, agent_paths = [], []
+real34 = (blockwatch.doh, blockwatch.netprobe.resolve_system, blockwatch.netprobe.dns_udp, blockwatch.agent_get,
+          blockwatch.dns_truth)
+blockwatch.doh = lambda name, socks_port=None: ({"1.1.1.1"} if socks_port == 21003 else None) if socks_port else {"2.2.2.2"}
+blockwatch.dns_truth = lambda name, port: {"9.9.9.9"}
+blockwatch.netprobe.resolve_system = lambda name: ("ok", ["6.6.6.6"])
+blockwatch.netprobe.dns_udp = lambda name, ip, *a, **k: udp_asked.append(name) or ("ok", ["9.9.9.9"])
+
+
+def agent34(agent, path, timeout=20):
+    agent_paths.append((agent["name"], path))
+    if path == "/health":
+        return {"ok": True, "caps": [probe.AGENT_DNS_CAP]} if agent["name"] == "Москва" else {"ok": True}
+    return {"system": ["ok", ["1.1.1.1"]], "udp": {}}
+
+
+blockwatch.agent_get = agent34
+AG = [{"name": "Москва", "url": "http://x", "token": "t"}, {"name": "Старая", "url": "http://y", "token": "t"}]
+res = real_dns_own(["pl1.example.net"], 21003, AG)
+check(res == {"pl1.example.net": {"truth": ["1.1.1.1"], "odd": [["rf1: системный", "6.6.6.6"]], "asked": 2,
+                                    "system": {"rf1": "ok", "Москва": "ok"}}}
+      and not {"pl1.example.net"} & set(udp_asked) and set(udp_asked) <= set(probe.DNS_NEUTRAL)
+      and ("Москва", "/dns?name=pl1.example.net&udp=0") in agent_paths
+      and not any(n == "Старая" and p.startswith("/dns") for n, p in agent_paths),
+      "DN1 своя проверка: наше имя открытым UDP с rf1 не спрашиваем; новой точке — /dns с udp=0, старой (без caps) "
+      "имя не отдаём; верим DoH через канал")
+check(real_dns_own(["a.test"], 21004, [])["a.test"]["truth"] == ["2.2.2.2"]
+      and real_dns_own(["a.test"], None, [])["a.test"]["truth"] == ["2.2.2.2"],
+      "DN2 канал не ответил или его нет — DoH напрямую (зашифрован, на пути имени не видно)")
+X1, X2 = ["rf1: системный", "6.6.6.6"], ["Москва: системный", "6.6.6.6"]
+check(probe.dns_need({"asked": 1}) == probe.dns_need({"asked": 5}) == probe.dns_need({}) == blockwatch.DNS_MIN
+      and probe.dns_level({"asked": 1, "odd": [X1]}) is None and probe.dns_level({"asked": 1, "odd": []}) == "ok"
+      and probe.dns_level({"asked": 5, "odd": [X1]}) == "ok" and probe.dns_level({"asked": 2, "odd": [X1, X2]}) == "bad"
+      and blockwatch.dns_level({"asked": 1, "odd": [X1]}) is None
+      and blockwatch.dns_level({"asked": 2, "odd": [X1, X2]}) == "bad",
+      "DN3 порог прежний — DNS_MIN независимых расхождений; ответивших меньше DNS_MIN — вывода нет (None), "
+      "одного расхождения на одной rf1 для тревоги мало")
+udp_asked.clear()
+blockwatch.netprobe.dns_udp = lambda name, ip, *a, **k: (udp_asked.append(name) or
+                                                         ("ok", ["6.6.6.6"] if ip in ("77.88.8.8", "8.8.8.8")
+                                                          and name == "rutracker.org" else ["9.9.9.9"]))
+res = real_dns_own(["pl1.example.net", "sub.example.com"], 21003, [])
+check(set(udp_asked) == set(probe.DNS_NEUTRAL)
+      and res["pl1.example.net"]["path"] == res["sub.example.com"]["path"]
+      == [["rf1: Google", "rutracker.org", "6.6.6.6"], ["rf1: Яндекс", "rutracker.org", "6.6.6.6"]],
+      "DN4 публичные DNS по UDP — только о чужих именах; подменяют по пути — у каждого нашего имени пометка path")
+(blockwatch.doh, blockwatch.netprobe.resolve_system, blockwatch.netprobe.dns_udp, blockwatch.agent_get,
+ blockwatch.dns_truth) = real34
+# какой проверкой пользуется сторож: новой из blockwatch, а со старым blockwatch — своей
+calls34 = []
+real_bw_check, real_own34 = blockwatch.dns_check, probe.dns_check_own
+blockwatch.dns_check = lambda names, port, agents=(): calls34.append("blockwatch") or {}
+probe.dns_check_own = lambda names, port, agents=(): calls34.append("probe") or {}
+had_ref = hasattr(blockwatch, "DNS_REF_NAMES")
+real_dns_run(["a"], 1, [])
+ref = blockwatch.__dict__.pop("DNS_REF_NAMES", None)
+real_dns_run(["a"], 1, [])
+if ref is not None:
+    blockwatch.DNS_REF_NAMES = ref
+blockwatch.dns_check, probe.dns_check_own = real_bw_check, real_own34
+check(calls34 == (["blockwatch", "probe"] if had_ref else ["probe", "probe"]),
+      "DN5 новый blockwatch (DNS_REF_NAMES) — его проверка; старый — своя, без наших имён в открытом UDP")
+
+fresh()
+dns_calls, world_dns = [], {}
+probe.dns_check = fake_dns
+PATH34 = [["rf1: Google", "rutracker.org", "6.6.6.6"], ["rf1: Яндекс", "rutracker.org", "6.6.6.6"]]
+world_dns["sub.example.com"] = {"truth": ["203.0.113.31"], "odd": [["rf1: системный", "1.2.3.4"]], "asked": 1,
+                              "path": PATH34}
+out = until_dns(1) + until_dns(1) + until_dns(1)
+log34 = open(probe.LOG, encoding="utf-8").read()
+check(out == [] and load()["dns"]["weak"] == {"sub.example.com": [["rf1: системный", "1.2.3.4"]]}
+      and load()["dns_lvl"]["sub.example.com"]["lvl"] == "ok" and load()["dns"]["path"] == ["rutracker.org"]
+      and "DNS sub.example.com: по защищённому 203.0.113.31; расходятся: rf1: системный — 1.2.3.4 (ответили 1 из "
+          f"нужных {blockwatch.DNS_MIN} — для тревоги мало)" in log34
+      and "DNS по пути: публичные резолверы по UDP подменяют чужие имена: rf1: Google — rutracker.org: 6.6.6.6" in log34,
+      "DN6 одна rf1 (точки не умеют udp=0): её расхождение — только в журнал и state[dns][weak], тревоги нет "
+      "и после трёх проверок подряд")
+world_dns["sub.example.com"] = {"truth": ["203.0.113.31"], "asked": 2, "path": PATH34,
+                              "odd": [["rf1: системный", "1.2.3.4"], ["Москва: системный", "1.2.3.4"]]}
+out = until_dns(1) + until_dns(1)
+check(len(out) == 1 and "Подмена DNS: sub.example.com" in out[0] and out[0].count("По пути:") == 1
+      and "rutracker.org" in out[0] and load()["dns"]["weak"] == {},
+      "DN6а DNS_MIN независимых расхождений (rf1 и точка) — тревога после перепроверки; о подмене по пути — одна строка")
+world_dns["sub.example.com"] = {"truth": ["203.0.113.31"], "odd": [["rf1: системный", "1.2.3.4"]], "asked": 1}
+out = until_dns(1) + until_dns(1)
+check(out == [] and load()["dns_lvl"]["sub.example.com"]["lvl"] == "bad",
+      "DN6б ответила одна rf1 — вывода нет ни о подмене, ни о её конце: ложного «снова отвечает верно» нет")
+world_dns.clear()
+out = until_dns(2)
+check(len(out) == 1 and "DNS снова отвечает верно: sub.example.com" in out[0] and load()["dns"]["path"] == [],
+      "DN7 возврат — как раньше")
+probe.dns_check = lambda names, port, agents=(): {}
 
 print("\n--- пример сводки за неделю ---\n" + weekly_sample)
 print("\n--- пример отчёта ---\n" + summ[0])

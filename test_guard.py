@@ -38,8 +38,10 @@ def fake_tg(env, text):
     return "ok"
 
 
+real_fetch, real_control = guard.fetch, guard.control_ok
 guard.fetch = fake_fetch
 guard.port_open = lambda url: world["port"]
+guard.control_ok = lambda env: world.get("net", True)
 guard.tg_send = fake_tg
 guard.time.time = lambda: clock["t"]
 
@@ -139,5 +141,91 @@ tg["up"] = True
 out = step()
 check(len(out) == 1 and "rf1 не отвечает" in out[0] and state()["unsent"] == [], "F2 связь вернулась — тревога ушла")
 
-print("\n--- пример тревоги ---\n" + out[0])
+example = out[0]
+
+# G. у самого guard нет сети: rf1 «не отвечает», но и контрольный узел недоступен — состояние не меняется
+world["kind"] = "ok"
+step(), step()
+sent.clear()
+world["kind"], world["net"] = "unreach", False
+before = state()
+out = step() + step() + step()
+after = state()
+check(out == [] and after["status"] == "OK" and after["streak"] == before["streak"] and after["cand"] == before["cand"],
+      "G1 своя сеть пропала — ни тревоги, ни счёта подтверждений")
+check("сбой сети этого сервера" in open(guard.LOG, encoding="utf-8").read().splitlines()[-1], "G2 в журнале — что это своя сеть")
+world["net"] = True
+out = step() + step()
+check(len(out) == 1 and "rf1 не отвечает" in out[0], "G3 контрольный узел доступен, rf1 нет — тревога как раньше")
+world["kind"] = "ok"
+out = step() + step()
+check(len(out) == 1 and "снова в порядке" in out[0], "G4 rf1 вернулся")
+
+# H. пульс с чужим часом отчёта не роняет guard
+now_h = dt.datetime(2026, 10, 5, 13, 0, tzinfo=dt.timezone.utc).timestamp()
+check(guard.overdue_report({"hours": [25, -1, True, "6"], "summary": ""}, now_h) is None,
+      "H1 часы вне 0–23, логические и строки — пропущены, без ValueError")
+check(guard.overdue_report({"hours": [12, 99], "summary": "2026-10-05 06"}, now_h) == 12,
+      "H2 верные часы рядом с неверными — работают")
+check(guard.overdue_report({"hours": "6,12", "summary": ""}, now_h) is None, "H3 часы не списком — не тревожимся")
+check(guard.observe("ok", {"ts": now_h - 30, "hours": [24], "summary": ""}, now_h, False)[0] == "OK",
+      "H4 observe с часом 24 — «в порядке», не падение")
+
+# I. настоящий fetch на 127.0.0.1: 5xx — не «файла нет»; 404 — «файла нет»; пульс — ok
+import http.server  # noqa: E402
+import socket  # noqa: E402
+import threading  # noqa: E402
+import time as _time  # noqa: E402
+
+answers = {}
+for k in ("HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"):
+    os.environ.pop(k, None)  # urllib пошёл бы на 127.0.0.1 через прокси
+
+
+class HB(http.server.BaseHTTPRequestHandler):
+    def log_message(self, *a):
+        pass
+
+    def do_GET(self):
+        code, body = answers[self.path]
+        self.send_response(code)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), HB)
+threading.Thread(target=srv.serve_forever, daemon=True).start()
+base = "http://127.0.0.1:%d" % srv.server_address[1]
+answers.update({"/500": (502, b"bad gateway"), "/404": (404, b"no"), "/hb": (200, b'{"ts": 1700000000}'),
+                "/html": (200, b"<html>site</html>")})
+real_sleep = guard.time.sleep
+guard.time.sleep = lambda s: None
+try:
+    check(real_fetch(base + "/500") == ("unreach", None), "I1 ответ 5xx — «сайт не отвечает», не «файла пульса нет»")
+    check(real_fetch(base + "/404") == ("nofile", None), "I2 ответ 404 — «файла пульса нет»")
+    check(real_fetch(base + "/hb") == ("ok", {"ts": 1700000000}), "I3 пульс читается")
+    check(real_fetch(base + "/html") == ("nofile", None), "I4 вместо пульса страница сайта — «файла нет»")
+finally:
+    guard.time.sleep = real_sleep
+check(guard.observe("unreach", None, now_h, True)[1].startswith("порт сайта на rf1 открыт"),
+      "I5 5xx при открытом порте — «сайт не отвечает» в подробности")
+
+# J. контрольный узел: настоящая проверка TCP
+lsn = socket.socket()
+lsn.bind(("127.0.0.1", 0))
+lsn.listen(4)
+port_up = lsn.getsockname()[1]
+dead = socket.socket()
+dead.bind(("127.0.0.1", 0))
+port_dead = dead.getsockname()[1]
+dead.close()
+check(real_control({"GUARD_CONTROL": "127.0.0.1:%d" % port_up}), "J1 контрольный узел отвечает — True")
+check(not real_control({"GUARD_CONTROL": "127.0.0.1:%d" % port_dead}), "J2 порт закрыт — False")
+check(not real_control({"GUARD_CONTROL": "127.0.0.1:нет"}) and not real_control({"GUARD_CONTROL": "без-порта"}),
+      "J3 испорченная настройка — False, без падения")
+lsn.close()
+srv.shutdown()
+
+print("\n--- пример тревоги ---\n" + example)
 print("\nвсе проверки пройдены")

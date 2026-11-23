@@ -4,13 +4,15 @@
 1. Списки (probe.py --lists, раз в 6 часов): адреса и домены наших серверов сверяются с реестром РКН
    (antifilter.download, antifilter.network) и с подсетями CDN и хостеров, которые в России душат «после 16–20 КБ»
    (github.com/123jjck/cdn-ip-ranges). Списки скачиваются сюда и сверяются на месте — наши адреса никуда не уходят.
-2. Подмена DNS (раз в DNS_EVERY): ответ обычного DNS по UDP сравнивается с ответом по защищённому DNS (DoH).
+2. Подмена DNS (раз в DNS_EVERY): ответ обычного DNS сравнивается с ответом по защищённому DNS (DoH). Наши имена —
+   только системным DNS rf1 и точек; публичные DNS по UDP — только на чужих именах (подменяют ли ответы по пути).
 3. Разбор сбоя канала: нода проверяется напрямую с rf1 и с других российских точек (агенты vantage_agent.py),
    из-за рубежа (через чужой канал) и трассировкой — чтобы отличить блокировку от поломки ноды.
 4. Заглушка под внешний сервис с добровольными сканерами в сетях операторов — ВЫКЛЮЧЕНА (см. external_scan).
 """
 import concurrent.futures
 import html
+import inspect
 import ipaddress
 import json
 import os
@@ -24,6 +26,11 @@ import urllib.request
 import netprobe
 import nodewatch
 import rucheck
+
+try:
+    import vantage_client  # TLS к точке проверки с закреплённым отпечатком (лежит рядом, ставит install.sh)
+except ImportError:  # сторож обновили частично: точки без sha256 работают по HTTP, с sha256 — «не ответила»
+    vantage_client = None
 
 ETC = "/etc/channel-watch"
 LISTS_FILE = "/var/lib/channel-watch/lists.json"
@@ -69,7 +76,12 @@ LIST_NAMES = {"rkn_ip": "реестр РКН, адреса", "rkn_net": "рее�
               "cdn": "подсети CDN и хостеров, которые в России душат"}
 MAX_LIST = 120 * 1024 * 1024
 SITE_LABELS = {"panel": "панель", "sub": "подписка", "cab": "кабинет", "admin": "админка"}
+# публичные DNS по UDP спрашиваем только о чужих именах DNS_REF_NAMES: так видно, подменяют ли ответы по пути, а имена
+# наших нод и сайтов открытым текстом к ним не уходят (наши имена — системным DNS и защищённым DoH)
 RESOLVERS = (("Google", "8.8.8.8"), ("Cloudflare", "1.1.1.1"), ("Яндекс", "77.88.8.8"), ("Quad9", "9.9.9.9"))
+DNS_REF_NAMES = ("rutracker.org", "www.facebook.com", "www.example.org")  # те же, что в профиле rf1 (PROFILE_LOCAL)
+AGENT_DNS_CAP = "dns_udp0"  # агент в /health ("caps") обещает: /dns?udp=0 — только системный DNS, без публичных
+CERT_CHECK = True           # разбор сбоя: сверять сертификат у каналов с обычным TLS (CDN); Reality не сверяем
 DOH = ("https://dns.google/resolve?name={}&type=A", "https://cloudflare-dns.com/dns-query?name={}&type=A")
 
 
@@ -309,13 +321,17 @@ def dns_truth(name, socks_port):
 
 
 def dns_observe(name, agents=()):
-    """Что отвечает обычный DNS: {кто: (итог, [адреса])} — системный резолвер rf1, публичные резолверы по UDP,
-    и то же самое с точек проверки."""
+    """Что отвечает обычный DNS: {кто: (итог, [адреса])}. Наше имя — системный резолвер rf1 и системный DNS точек
+    проверки, которые умеют /dns без публичных резолверов; чужое имя из DNS_REF_NAMES — ещё и публичные по UDP."""
     seen = {"rf1: системный": netprobe.resolve_system(name)}
-    for who, ip in RESOLVERS:
-        seen[f"rf1: {who}"] = netprobe.dns_udp(name, ip)
+    if name in DNS_REF_NAMES:
+        for who, ip in RESOLVERS:
+            seen[f"rf1: {who}"] = netprobe.dns_udp(name, ip)
+        return seen  # точкам чужие имена не разрешены
     for a in agents:
-        data = agent_get(a, "/dns?name=" + urllib.parse.quote(name), 12)
+        if not a.get(AGENT_DNS_CAP):
+            continue  # старый агент спросил бы о нашем имени публичные DNS открытым текстом — ему не отдаём
+        data = agent_get(a, "/dns?name=" + urllib.parse.quote(name) + "&udp=0", 12)
         if not data:
             continue
         seen[f"{a['name']}: системный"] = tuple(data.get("system") or ("err", []))
@@ -337,9 +353,52 @@ def dns_judge(truth, seen):
     return odd
 
 
+def agent_dns_udp0(agent):
+    """Умеет ли агент /dns?udp=0 (только системный DNS): так он пишет в /health, в списке "caps"."""
+    caps = (agent_get(agent, "/health", 8) or {}).get("caps")
+    return isinstance(caps, list) and AGENT_DNS_CAP in caps
+
+
+def agents_each(fn, agents):
+    """fn(точка) для всех точек разом: [результат] в порядке agents. Недоступная точка (ожидание до таймаута)
+    не задерживает остальные — шаг занимает одно ожидание, а не сумму."""
+    agents = list(agents)
+    if not agents:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(agents))) as ex:
+        return list(ex.map(fn, agents))
+
+
+def dns_level(res):
+    """Уровень имени для тревоги «Подмена DNS»: 'bad' — разошлись не меньше DNS_MIN независимых ответов; 'ok' —
+    меньше; None — ответивших меньше DNS_MIN, а расхождение есть: для вывода мало, только журнал и state."""
+    odd = len(res.get("odd") or [])
+    if res.get("asked", 0) < DNS_MIN and odd:
+        return None
+    return "bad" if odd >= DNS_MIN else "ok"
+
+
+def dns_path(socks_port):
+    """Подменяют ли по пути ответы публичных DNS по UDP — на чужих именах DNS_REF_NAMES: [[кто, имя, что ответил]],
+    если хоть на одном имени разошлись не меньше DNS_MIN публичных резолверов; иначе []."""
+    out = []
+    for name in DNS_REF_NAMES:
+        truth = dns_truth(name, socks_port)
+        if not truth:
+            continue
+        public = {who: res for who, res in dns_observe(name).items() if not who.endswith(": системный")}
+        odd = dns_judge(truth, public)
+        if len(odd) >= DNS_MIN:
+            out += [[who, name, what] for who, what in odd]
+    return out
+
+
 def dns_check(names, socks_port, agents=()):
-    """{имя: {"truth": [адреса], "odd": [[кто, что]], "asked": сколько ответов}}; имя без ответа DoH пропускается."""
+    """{имя: {"truth": [адреса], "odd": [[кто, что]], "asked": сколько ответов, "system": {точка: итог}}}; имя без
+    ответа DoH пропускается. Если по пути подменяют ответы публичных DNS (dns_path) — у каждого имени ещё "path"."""
     out = {}
+    agents = list(agents)
+    agents = [dict(a, **{AGENT_DNS_CAP: cap}) for a, cap in zip(agents, agents_each(agent_dns_udp0, agents))]
 
     def one(name):
         truth = dns_truth(name, socks_port)
@@ -351,9 +410,14 @@ def dns_check(names, socks_port, agents=()):
                       "asked": sum(1 for s, _ in seen.values() if s != "err"), "system": system}
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        f_path = ex.submit(dns_path, socks_port)
         for name, res in ex.map(one, names):
             if res is not None:
                 out[name] = res
+        path = f_path.result()
+    if path:
+        for res in out.values():
+            res["path"] = path
     return out
 
 
@@ -388,8 +452,17 @@ def dns_alert(name, res, lvl):
     return (f"🧭 <b>Подмена DNS: {html.escape(name)}</b>\nПо защищённому DNS адрес — "
             f"{html.escape(', '.join(res['truth']) or 'нет записи')}, а обычный DNS отвечает иначе:\n{html.escape(odd)}\n"
             "<b>Похоже на:</b> оператор или его DNS подменяет ответ — так блокируют по имени. Если адрес недавно меняли "
-            "вы сами, это может быть устаревший ответ и пройдёт само.\n"
+            "вы сами, это может быть устаревший ответ и пройдёт само.\n" + dns_path_text(res.get("path")) +
             "<b>Для пользователей:</b> у кого DNS оператора — приложение не найдёт сервер по этому имени.")
+
+
+def dns_path_text(path):
+    """Строка к тревоге о подмене: публичные DNS по UDP отвечают не то и на чужие имена (dns_path)."""
+    if not path:
+        return ""
+    names = sorted({name for _, name, _ in path})
+    return (f"<b>По пути:</b> публичные DNS по UDP отвечают не то и на чужие имена ({html.escape(', '.join(names))}) "
+            "— ответы подменяют по дороге (ТСПУ).\n")
 
 
 # ---------- 3. точки проверки и разбор сбоя ----------
@@ -404,6 +477,11 @@ def add_vantage(text):
     new = json.loads(text)
     if not (isinstance(new, dict) and all(isinstance(new.get(k), str) and new[k] for k in ("name", "url", "token"))):
         raise ValueError("запись точки проверки не того вида: нужны name, url и token")
+    if vantage_client is not None:
+        vantage_client.check_entry(new)  # sha256, если есть, — настоящий отпечаток, иначе точка молча замолчит
+    elif "sha256" in new:
+        raise ValueError("в записи точки есть sha256, а рядом со сторожем нет vantage_client.py — "
+                         "сначала обновите сторож (install.sh), иначе точка не будет отвечать")
     path = os.path.join(ETC, VANTAGE)
     items = [a for a in read_etc(VANTAGE, []) if a.get("name") != new["name"]] + [new]
     fd = os.open(path + ".tmp", os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -414,7 +492,11 @@ def add_vantage(text):
 
 
 def agent_get(agent, path, timeout=20):
-    """Запрос к агенту точки проверки; None — не ответил или ответил не тем."""
+    """Запрос к агенту точки проверки; None — не ответил или ответил не тем. У точки в vantage.json есть "sha256" —
+    только TLS с этим сертификатом (vantage_client), на HTTP не откатываемся: иначе подменивший ответ TLS на пути
+    получил бы X-Token и вопросы открытым текстом. Нет "sha256" — по-старому, HTTP."""
+    if agent.get("sha256"):
+        return vantage_client.agent_get(agent, path, timeout) if vantage_client is not None else None
     try:
         req = urllib.request.Request(agent["url"].rstrip("/") + path, headers={"X-Token": agent["token"]})
         with urllib.request.urlopen(req, timeout=timeout) as r:
@@ -425,7 +507,10 @@ def agent_get(agent, path, timeout=20):
 
 
 def agents_health(agents):
-    return {a["name"]: bool((agent_get(a, "/health", 8) or {}).get("ok")) for a in agents}
+    """{точка: на связи ли} — /health всех точек разом, а не по очереди по 8 с."""
+    agents = list(agents)
+    oks = agents_each(lambda a: bool((agent_get(a, "/health", 8) or {}).get("ok")), agents)
+    return {a["name"]: v for a, v in zip(agents, oks)}
 
 
 def vpn_points(agents):
@@ -615,18 +700,20 @@ def point_mss(i):
     return netprobe.MSS_MARK[0] + 2 * i
 
 
-def agent_bundle(agent, i, query):
+def agent_bundle(agent, i, query, verify=False):
     """Всё, что точка проверки делает при разборе: проверка входа, серия соединений, сравнение имён (с меткой). Если
     вход с точки закрыт — ещё путь до ноды и «закрыто ли имя», параллельно с серией (у агента шесть мест).
+    verify — просить сверку сертификата (старый агент параметр не знает и проверяет как раньше).
     (вход, серия, имена, путь, имя на чужом сервере); старый агент на новое не отвечает — там None."""
-    probe = agent_get(agent, "/probe?" + query, 25)
+    probe_q = "/probe?" + query + ("&verify=1" if verify else "")
+    probe = agent_get(agent, probe_q, 25)
     closed = bool(probe and probe.get("tcp") in ("timeout", "refused"))
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as ex:
         f_more = ex.submit(lambda: (agent_get(agent, "/path?" + query, 30),
                                     agent_get(agent, "/sniref?" + query, 30))) if closed else None
         ser = agent_get(agent, f"/series?{query}&n={DEEP_SERIES}&mss={point_mss(i)}", 30)
         if probe and probe.get("tcp") == "timeout" and ser and ser.get("ok"):
-            probe = agent_get(agent, "/probe?" + query, 25) or probe  # одиночная проверка попала на потерянное соединение
+            probe = agent_get(agent, probe_q, 25) or probe  # одиночная проверка попала на потерянное соединение
         cmp_ = agent_get(agent, f"/sni?{query}&mss={tls_mss(i)}", 30)
         path, ref = f_more.result() if f_more else (None, None)
     return probe, ser, cmp_, path, ref
@@ -640,16 +727,18 @@ def deep_diag(ch, via, agents, bases):
     sni = ch.get("sni") or host
     own = str(host).endswith(tuple("." + b for b in bases)) and sni == host
     query = f"host={urllib.parse.quote(str(host))}&port={port}" + ("" if sni == host else f"&sni={urllib.parse.quote(sni)}")
+    verify = CERT_CHECK and ch.get("security") == "tls"   # у Reality сертификат чужой по устройству — не сверяем
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents) + 6) as ex:
-        f_direct = ex.submit(netprobe.direct_probe, host, port, sni)
+        f_direct = ex.submit(direct_check, host, port, sni, verify)
         f_series = ex.submit(netprobe.series, host, port, DEEP_SERIES, point_mss(0))
         f_sni = ex.submit(netprobe.sni_compare, host, port, sni, tls_mss(0))
-        f_agents = {a["name"]: ex.submit(agent_bundle, a, i + 1, query) for i, a in enumerate(agents)}
+        f_agents = {a["name"]: (ex.submit(agent_bundle, a, i + 1, query, True) if verify
+                                else ex.submit(agent_bundle, a, i + 1, query)) for i, a in enumerate(agents)}
         f_abroad = (ex.submit(nodewatch.socks_open, via["port"], host, port, 5, ch.get("security") in ("reality", "tls"))
                     if via else None)
         direct, series, names = f_direct.result(), {SELF: f_series.result()}, {SELF: f_sni.result()}
         if direct["tcp"] == "timeout" and (series[SELF] or {}).get("ok"):
-            direct = netprobe.direct_probe(host, port, sni)  # одиночная проверка попала на потерянное соединение
+            direct = direct_check(host, port, sni, verify)  # одиночная проверка попала на потерянное соединение
         f_ref = ex.submit(netprobe.name_ref, sni) if direct["tcp"] in ("timeout", "refused") else None
         f_vpn = {a["name"]: ex.submit(agent_get, a, "/vpn?name=" + urllib.parse.quote(ch["name"]), 40)
                  for a in vpn_points(agents)}
@@ -680,6 +769,18 @@ def deep_diag(ch, via, agents, bases):
     d["witness"] = witness_wait(witness_url(beacon), {**series, **tls}, via["port"] if via else None) if port == 443 else {}
     add_hop_info(d, own=netprobe.own_addr(), origins=agent_origins(agents))   # чей последний узел трассировки
     return d
+
+
+def direct_check(host, port, sni, verify=False):
+    """Прямая проверка входа с rf1; со сверкой сертификата, если её просят и netprobe её умеет (старый — как раньше)."""
+    if verify:
+        try:
+            params = inspect.signature(netprobe.direct_probe).parameters
+        except (TypeError, ValueError):
+            params = {}
+        if "verify" in params or any(p.kind == p.VAR_KEYWORD for p in params.values()):
+            return netprobe.direct_probe(host, port, sni, verify=True)
+    return netprobe.direct_probe(host, port, sni)
 
 
 def tls_ser(cmp_):
@@ -1012,6 +1113,34 @@ def sni_cut(cmp_):
                 and "answer" in (cmp_.get("neutral"), cmp_.get("none")))
 
 
+def cert_why(r):
+    """Чем не тот сертификат (по netprobe.cert_check) — для текста."""
+    cn = str(r.get("cert_cn") or "")[:80]
+    if r.get("cert") == "name":
+        return f"выдан на другое имя ({cn})" if cn else "выдан на другое имя"
+    if r.get("cert") == "expired":
+        return "просрочен"
+    return "не заверен доверенным центром" + (f" (на имя {cn})" if cn else "")
+
+
+def cert_verdict(points, results):
+    """Вывод «сертификат не тот», если хоть одна точка его видит; None — не тот случай. points — {точка: класс},
+    results — {точка: проба}. Точка, где сертификат сверен и он настоящий, — довод против (подмена у части путей)."""
+    bad = [p for p, k in points.items() if k == "cert"]
+    if not bad:
+        return None
+    real = [p for p, k in points.items() if k == "ok" and (results.get(p) or {}).get("cert") == "ok"]
+    why = cert_why(results[bad[0]])
+    if real:
+        return (f"с части российских точек ({', '.join(bad)}) отдаётся не тот сертификат — {why}, а с других "
+                f"({', '.join(real)}) настоящий: похоже на подмену по пути у отдельных провайдеров")
+    where = "с rf1" if bad == [SELF] else f"с точек: {', '.join(bad)}"
+    down = [p for p, k in points.items() if k not in ("cert", "ok", "none")]
+    return (f"сервер отвечает {where}, но сертификат не тот — {why}: клиенты получат ошибку TLS. Похоже, CDN или фронт "
+            "отдаёт свой сертификат вместо нашего (ресурс выключен, кончился срок, сменили настройки) — дело не в Xray "
+            "и не в блокировке адреса" + (f"; с {', '.join(down)} нода не отвечает вовсе" if down else ""))
+
+
 def point_text(r):
     """Одна точка проверки одной фразой."""
     kind = netprobe.probe_class(r)
@@ -1024,6 +1153,8 @@ def point_text(r):
         return text + (", а порт 80 на том же адресе отвечает" if r.get("alt80") else "")
     if kind == "tls":
         return f"порт открыт ({r['tcp_ms']} мс), TLS не отвечает"
+    if kind == "cert":
+        return f"порт открыт ({r['tcp_ms']} мс), TLS отвечает, но сертификат не тот: {cert_why(r)}"
     if kind == "stall":
         return f"соединение есть, но данные встали после {max(1, r['bytes'] // 1024)} КБ"
     if r["end"] == "ok":
@@ -1223,6 +1354,9 @@ def deep_verdict(d, status):
     points = {"rf1": netprobe.probe_class(d["direct"])}
     points.update({name: netprobe.probe_class(r) for name, r in d["agents"].items() if name not in d.get("skip", ())})
     answered = {k: v for k, v in points.items() if v != "none"}
+    cert = cert_verdict(answered, {"rf1": d["direct"], **d["agents"]})
+    if cert:
+        return cert
     kinds = set(answered.values())
     n = len(answered)
     filt = d.get("filtered") or []
@@ -1401,8 +1535,11 @@ def check_text(res, when):
     out += ["", "<b>DNS</b> <i>(обычный ответ против защищённого)</i>"]
     odd = {n: r for n, r in res["dns"].items() if r["odd"]}
     for name, r in sorted(odd.items()):
-        out.append(html.escape(f"⚠️ {name}: по защищённому DNS {', '.join(r['truth']) or 'нет записи'}; иначе отвечают: "
-                               + "; ".join(f"{who} — {what}" for who, what in r["odd"])))
+        weak = dns_level(r) is None
+        out.append(html.escape(f"{'ℹ️' if weak else '⚠️'} {name}: по защищённому DNS {', '.join(r['truth']) or 'нет записи'}; "
+                               "иначе отвечают: " + "; ".join(f"{who} — {what}" for who, what in r["odd"])
+                               + (f" (ответили {r.get('asked', 0)}, для вывода о подмене нужно {DNS_MIN} — пока "
+                                  "это не подмена)" if weak else "")))
     if not odd:
         out.append(f"✅ подмены нет — имён: {len(res['dns'])}")
     if len(res["dns"]) < res["dns_names"]:

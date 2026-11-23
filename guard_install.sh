@@ -9,7 +9,9 @@
 #
 # Ключи: HEARTBEAT_URL — адрес файла пульса на rf1; TG_TOKEN и TG_CHAT — бот и чат для сообщений
 # (понимает и имена BW_TG_TOKEN / BW_TG_CHAT, как в /etc/bridge-watch/guard.env на rf1); GUARD_NAME — как
-# подписывать сообщения (по умолчанию имя сервера). Секреты аргументами не передаются: их видно в списке процессов.
+# подписывать сообщения (по умолчанию имя сервера); GUARD_CONTROL — по желанию, контрольный узел «хост:порт»
+# (по умолчанию api.telegram.org:443: если недоступен и он, это сбой сети самого guard, тревоги о rf1 нет).
+# Секреты аргументами не передаются: их видно в списке процессов.
 # Откат: bash guard_install.sh --uninstall
 set -euo pipefail
 
@@ -30,10 +32,13 @@ done
 
 if [ "$uninstall" -eq 1 ]; then
   systemctl disable --now channel-watch-guard.timer 2>/dev/null || true
+  systemctl stop channel-watch-guard.service 2>/dev/null || true
   rm -rf "$DIR" "$ETC" /var/lib/channel-watch-guard /var/log/channel-watch-guard.log* \
          /etc/systemd/system/channel-watch-guard.service /etc/systemd/system/channel-watch-guard.timer \
          /etc/logrotate.d/channel-watch-guard
   systemctl daemon-reload
+  # иначе в systemctl --failed навсегда останется «channel-watch-guard.service not-found failed»
+  systemctl reset-failed channel-watch-guard.service channel-watch-guard.timer 2>/dev/null || true
   echo "сторож за сторожем убран"
   exit 0
 fi
@@ -48,7 +53,7 @@ command -v python3 >/dev/null || { echo "ставлю python3"; apt-get update -
 python3 -c 'import ast, sys; ast.parse(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1])' "$SRC/guard.py"
 
 # значения: из файла или стандартного ввода, недостающие — вопросами
-HEARTBEAT_URL="" TG_TOKEN="" TG_CHAT="" GUARD_NAME=""
+HEARTBEAT_URL="" TG_TOKEN="" TG_CHAT="" GUARD_NAME="" GUARD_CONTROL=""
 if [ -n "$env_file" ]; then
   [ "$env_file" = "-" ] && env_file=/dev/stdin
   while IFS= read -r line || [ -n "$line" ]; do
@@ -59,6 +64,7 @@ if [ -n "$env_file" ]; then
       TG_TOKEN|BW_TG_TOKEN) TG_TOKEN="$val" ;;
       TG_CHAT|BW_TG_CHAT) TG_CHAT="$val" ;;
       GUARD_NAME) GUARD_NAME="$val" ;;
+      GUARD_CONTROL) GUARD_CONTROL="$val" ;;
     esac
   done < "$env_file"
 fi
@@ -71,12 +77,19 @@ fi
 GUARD_NAME="${GUARD_NAME:-$(hostname)}"
 [ -n "$HEARTBEAT_URL" ] && [ -n "$TG_TOKEN" ] && [ -n "$TG_CHAT" ] || { echo "не хватает HEARTBEAT_URL, TG_TOKEN или TG_CHAT"; exit 1; }
 case "$HEARTBEAT_URL" in https://*) ;; *) echo "адрес пульса должен начинаться с https://"; exit 1 ;; esac
+case "$GUARD_CONTROL" in
+  "") ;;
+  *[!0-9A-Za-z.:-]*|*[!0-9]|:*) echo "GUARD_CONTROL «$GUARD_CONTROL» не похож на хост:порт — пропускаю"; GUARD_CONTROL="" ;;
+  *:*) ;;
+  *) echo "GUARD_CONTROL без порта — пропускаю"; GUARD_CONTROL="" ;;
+esac
 
 install -d -m 755 "$DIR" /var/lib/channel-watch-guard
 install -d -m 700 "$ETC"
 install -m 755 "$SRC/guard.py" "$DIR/guard.py"
 umask 077
 printf 'HEARTBEAT_URL=%s\nTG_TOKEN=%s\nTG_CHAT=%s\nGUARD_NAME=%s\n' "$HEARTBEAT_URL" "$TG_TOKEN" "$TG_CHAT" "$GUARD_NAME" > "$ETC/guard.env"
+[ -z "$GUARD_CONTROL" ] || printf 'GUARD_CONTROL=%s\n' "$GUARD_CONTROL" >> "$ETC/guard.env"
 umask 022
 
 cat > /etc/systemd/system/channel-watch-guard.service <<'UNIT'
@@ -117,9 +130,17 @@ ROT
 
 # самопроверка: пульс читается, Telegram принимает сообщение — и только потом таймер
 echo "== самопроверка"
-rc=0; python3 "$DIR/guard.py" --test || rc=$?
+rc=0; out="$(python3 "$DIR/guard.py" --test)" || rc=$?
+printf '%s\n' "$out"
 systemctl daemon-reload
 systemctl enable --now channel-watch-guard.timer >/dev/null 2>&1
-[ "$rc" -eq 0 ] || echo "внимание: сейчас сторож каналов не в порядке (см. строку выше) — таймер включён, тревога придёт после второй проверки"
+if [ "$rc" -ne 0 ]; then
+  case "$out" in
+    SELF:*)  # с этого сервера не видно ни rf1, ни контрольного узла: тревоги о rf1 по замыслу не будет
+      echo "внимание: с этого сервера не видно ни rf1, ни контрольного узла — проверьте сеть этого сервера или"
+      echo "   GUARD_CONTROL в $ETC/guard.env (узел должен быть доступен отсюда напрямую). Пока так, guard молчит." ;;
+    *) echo "внимание: сейчас сторож каналов не в порядке (см. строку выше) — таймер включён, тревога придёт после второй проверки" ;;
+  esac
+fi
 echo "== готово: таймер $(systemctl is-active channel-watch-guard.timer); настройки $ETC/guard.env (600); журнал /var/log/channel-watch-guard.log"
 echo "== вручную: python3 $DIR/guard.py --show"

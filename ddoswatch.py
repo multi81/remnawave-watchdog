@@ -10,7 +10,9 @@
 Что изменено против плагина:
   * подстройка по нагрузке работает для всех серверов и в обе стороны: порог = max(p95 за 7 дней × формула, минимум);
     пока истории меньше BASELINE_MIN_SAMPLES — статические пороги плагина. В плагине было max(статический, baseline) —
-    порог только рос, и для серверов с ddos-agent baseline не применялся вовсе;
+    порог только рос, и для серверов с ddos-agent baseline не применялся вовсе; в базу идут только чистые срезы
+    (без атак и перекоса), рост порога — не больше ×1,5 за сутки и ×2 за неделю, потолок — от "link_mbps";
+  * симметричный флуд (нода отвечает тем же): излишек rx − tx, рост против нормы, ICMP из щита, канал заполнен;
   * трафик/пакеты проверяются для всех (в плагине для серверов с агентом смотрелись только tcp/udp/icmp_bytes,
     которых агент не присылал, — объёмный и пакетный флуд там не ловился);
   * «пакетный флуд» — когда превышены пакеты; иначе «объёмный» (в плагине условие было истинно при любом rx_pps);
@@ -20,6 +22,7 @@
 Состояние — /var/lib/channel-watch/ddos_state.json, история — /var/lib/channel-watch/ddos.sqlite (срезы 8 дней,
 атаки 90 дней). Запуск: ddoswatch.py [--dry] | --summary | --status.
 """
+import bisect
 import datetime as dt
 import html
 import json
@@ -41,7 +44,11 @@ STATIC = {
     "rx_bps": 200_000_000.0, "rx_pps": 30_000.0, "syncookies_ps": 200.0, "listen_drop_ps": 100.0,
     "conntrack_ratio": 0.75, "rx_drop_ps": 50.0, "cpu_percent": 90.0, "memory_percent": 90.0,
     "load_per_cpu": 2.0, "disk_percent": 85.0, "swap_percent": 90.0,
+    # симметричный флуд (нода отвечает тем же объёмом — перекоса нет): излишек входящего над исходящим, рост против
+    # нормы и ICMP. Пока своей нормы нет: излишек — как rx_bps/rx_pps, рост — эти запасные (берутся и из ddos.json)
+    "rx_bps_sym": 800_000_000.0, "rx_pps_sym": 150_000.0, "icmp_pps": 5000.0,
 }
+EXCESS = {"rx_excess_bps": "rx_bps", "rx_excess_pps": "rx_pps"}   # излишек без своей нормы — порог основной метрики
 # Подстройка (poller._DEFAULT_EXPRESSIONS / _DEFAULT_MIN): порог = max(p95 ∘ формула, минимум)
 BASELINE = {
     # калибровка: нижние границы плагина 20 Мбит/с и 5000 пак/с у VPN-нод — это обычная закачка клиента
@@ -51,7 +58,20 @@ BASELINE = {
     "syncookies_ps": (lambda v: v + 5, 10.0),
     "listen_drop_ps": (lambda v: v + 3, 5.0),
     "rx_drop_ps": (lambda v: v + 3, 5.0),
+    # излишек rx − tx (без перекоса) и весь входящий против нормы — учатся только на чистых срезах
+    "rx_excess_bps": (lambda v: v * 3, 150_000_000.0),
+    "rx_excess_pps": (lambda v: v * 3, 30_000.0),
+    "rx_bps_sym": (lambda v: v * 4, 300_000_000.0),
+    "rx_pps_sym": (lambda v: v * 4, 60_000.0),
 }
+# Рост порога (прежде p95 учился на самих атаках и рос без предела): не больше ×1,5 за сутки и ×2 за неделю.
+# Потолок от скорости канала: "link_mbps" сервера (или общий) в ddos.json — пороги объёма не выше 80% канала,
+# входящий от 90% канала — тревога при любом перекосе
+BASELINE_GROWTH_DAY, BASELINE_GROWTH_WEEK = 1.5, 2.0
+LINK_CAP_SHARE, LINK_FULL_SHARE = 0.8, 0.9
+SUSPECT_PAD = 60                # срезы за минуту до записанной атаки — тоже не в базу (подтверждение)
+# перекос ниже этого не поднимет порог выше минимума (100 Мбит/с = 33×3, 20 000 пак/с = 10 000×2) — тихий фон в базе
+ASYM_LEARN_MIN = {"rx_bps": 33_000_000.0, "rx_pps": 10_000.0}
 BASELINE_DAYS = 7
 BASELINE_MIN_SAMPLES = 8640     # сутки срезов по 10 с — раньше подстройку не включаем
 BASELINE_EVERY = 3600
@@ -139,15 +159,31 @@ def num(v, d=0.0):
 
 
 # ---------- пороги ----------
-def thresholds(c, baseline, override=None):
+def thresholds(c, baseline, override=None, link_bps=0.0):
     th = dict(STATIC)
     th.update({k: float(v) for k, v in (c.get("thresholds") or {}).items() if k in STATIC})
-    for k, v in (baseline or {}).items():
-        if k in BASELINE:
-            th[k] = v
-    for k in ("rx_bps", "rx_pps"):   # поднято кнопкой «Это не атака» — только вверх
-        if override and num(override.get(k)) > th[k]:
-            th[k] = num(override[k])
+    base = {k: v for k, v in (baseline or {}).items() if k in BASELINE}
+    th.update(base)
+    for k, src in EXCESS.items():
+        th.setdefault(k, th[src])
+    # прежняя база (только rx_bps = p95×3, rx_pps = p95×2) — норма для роста из неё, пока своей нет
+    if "rx_bps_sym" not in base and "rx_bps" in base:
+        th["rx_bps_sym"] = max(th["rx_bps_sym"], base["rx_bps"] * 4 / 3)
+    if "rx_pps_sym" not in base and "rx_pps" in base:
+        th["rx_pps_sym"] = max(th["rx_pps_sym"], base["rx_pps"] * 2)
+    link = num(link_bps)
+    th["link_full_bps"] = link * LINK_FULL_SHARE if link > 0 else 0.0
+    if link > 0:
+        for k in ("rx_bps", "rx_excess_bps", "rx_bps_sym"):
+            th[k] = min(th[k], link * LINK_CAP_SHARE)
+    if override:   # поднято кнопкой «Это не атака» — только вверх (пик входящего ×1,5 — и для новых признаков)
+        for k, src in (("rx_bps", "rx_bps"), ("rx_excess_bps", "rx_bps"), ("rx_bps_sym", "rx_bps"),
+                       ("link_full_bps", "rx_bps"), ("rx_pps", "rx_pps"), ("rx_excess_pps", "rx_pps"),
+                       ("rx_pps_sym", "rx_pps"), ("icmp_pps", "rx_pps")):
+            if k == "link_full_bps" and not th[k]:
+                continue
+            if num(override.get(src)) > th[k]:
+                th[k] = num(override[src])
     return th
 
 
@@ -181,6 +217,11 @@ def classify(m, th, prev_syn=None, interval=0.0):
     # объём и пакеты считаем атакой только при перекосе (входящего вдвое больше исходящего): закачка клиента — симметрична
     rx_eff = rx_bps if rx_bps >= ASYM * num(m.get("tx_bps")) else 0.0
     pps_eff = rx_pps if rx_pps >= ASYM * num(m.get("tx_pps")) else 0.0
+    # перекоса нет, а лишнее есть: флуд поверх трафика клиентов (излишек rx − tx), пинг-флуд с ответами (рост против
+    # нормы, ICMP), канал заполнен. Порогов нет в старом th (чужой вызов) — признак молчит
+    rx_exc, pps_exc = max(rx_bps - num(m.get("tx_bps")), 0.0), max(rx_pps - num(m.get("tx_pps")), 0.0)
+    sh = m.get("shield") if isinstance(m.get("shield"), dict) else {}
+    icmp = num((sh.get("proto_pps") if isinstance(sh.get("proto_pps"), dict) else {}).get("icmp"))
     syncookies, ldrop = num(m.get("syncookies_ps")), num(m.get("listen_drop_ps")) + num(m.get("listen_overflow_ps"))
     ct, ctmax = num(m.get("conntrack_count")), num(m.get("conntrack_max"))
     ct_ratio = ct / ctmax if ctmax > 0 else 0.0
@@ -190,7 +231,13 @@ def classify(m, th, prev_syn=None, interval=0.0):
         return v / t if t > 0 else 0.0
     checks = {"входящий трафик": r(rx_eff, th["rx_bps"]), "пакеты в секунду": r(pps_eff, th["rx_pps"]),
               "SYN cookies": r(syncookies, th["syncookies_ps"]), "listen drop": r(ldrop, th["listen_drop_ps"]),
-              "conntrack": r(ct_ratio, th["conntrack_ratio"]), "SYN_RECV": r(syn, SYN_RECV_LIMIT)}
+              "conntrack": r(ct_ratio, th["conntrack_ratio"]), "SYN_RECV": r(syn, SYN_RECV_LIMIT),
+              "входящий сверх исходящего": r(rx_exc, th.get("rx_excess_bps", 0)),
+              "пакеты сверх исходящих": r(pps_exc, th.get("rx_excess_pps", 0)),
+              "входящий выше нормы": r(rx_bps, th.get("rx_bps_sym", 0)),
+              "пакеты выше нормы": r(rx_pps, th.get("rx_pps_sym", 0)),
+              "ICMP": r(icmp, th.get("icmp_pps", 0)),
+              "канал заполнен": r(rx_bps, th.get("link_full_bps", 0))}
     syn_rate = (syn - prev_syn) / interval if prev_syn is not None and interval > 0 and syn > prev_syn else 0.0
     checks["скорость SYN_RECV"] = r(syn_rate, SYN_RATE)
     reasons = [k for k, v in checks.items() if v >= 1.0]
@@ -203,7 +250,9 @@ def classify(m, th, prev_syn=None, interval=0.0):
             atype = "conntrack-исчерпание"
         elif checks["listen drop"] >= 1:
             atype = "TCP-флуд (переполнение очереди)"
-        elif checks["пакеты в секунду"] >= 1:
+        elif checks["ICMP"] >= 1:
+            atype = "ICMP-флуд"
+        elif checks["пакеты в секунду"] >= 1 or checks["пакеты сверх исходящих"] >= 1 or checks["пакеты выше нормы"] >= 1:
             atype = "пакетный флуд"
         else:
             atype = "объёмный флуд"
@@ -279,12 +328,13 @@ def text_change(name, prev, cur, m, now, attack=None, th=None):
     st = cur["state"]
     if st == "attack":
         lines = head + ["💥 <b>Тип:</b> %s" % cur["attack_type"], "🔴 <b>Уровень:</b> %s" % SEVERITY_RU.get(cur["severity"], "?"),
-                        "📌 <b>Сработало:</b> %s" % ", ".join(cur["reasons"]), ""] + metric_lines(m)
+                        "📌 <b>Сработало:</b> %s" % html.escape(", ".join(cur["reasons"])), ""] + metric_lines(m)
         if th:
             lines.append("📏 Пороги этого сервера: RX %s Мбит/с · %s пак/с" % (mbit(th["rx_bps"]), cnt(th["rx_pps"])))
         return STATE_TITLE["attack"] + "\n\n" + "\n".join(lines)
     if st in ("load", "health"):
-        return STATE_TITLE[st] + "\n\n" + "\n".join(head + ["📌 <b>Сработало:</b> %s" % ", ".join(cur["reasons"]), ""] + metric_lines(m))
+        return STATE_TITLE[st] + "\n\n" + "\n".join(head + ["📌 <b>Сработало:</b> %s" % html.escape(", ".join(cur["reasons"])), ""]
+                                                     + metric_lines(m))
     if st == "offline":
         return STATE_TITLE["offline"] + "\n\n" + "\n".join(head + ["🧩 Причина: %s" % html.escape(cur.get("error") or "нет телеметрии")])
     # stable после другого состояния
@@ -308,7 +358,12 @@ def db_open(path=DB_FILE):
                " type text, severity text, reasons text, peak text)")
     db.execute("create table if not exists baseline (host text, metric text, value real, computed integer,"
                " primary key (host, metric))")
-    for table, col, typ in (("samples", "tx_bps", "real"), ("samples", "tx_pps", "real"), ("attacks", "notified", "integer default 0")):
+    # опорные значения для предела роста — отдельной таблицей: прежняя версия пишет в baseline 4 значения без имён
+    db.execute("create table if not exists baseline_cap (host text, metric text, day_value real, day_ts integer,"
+               " week_value real, week_ts integer, primary key (host, metric))")
+    # susp = 1: срез во время атаки или её подтверждения — в базу порогов не идёт (у старых строк null — чистый)
+    for table, col, typ in (("samples", "tx_bps", "real"), ("samples", "tx_pps", "real"), ("attacks", "notified", "integer default 0"),
+                            ("samples", "susp", "integer")):
         if col not in [r[1] for r in db.execute("pragma table_info(%s)" % table)]:
             db.execute("alter table %s add column %s %s" % (table, col, typ))
     return db
@@ -318,18 +373,74 @@ def db_baseline(db, host):
     return {m: v for m, v in db.execute("select metric, value from baseline where host = ?", (host,))}
 
 
+def clean_values(rows, attacks=()):
+    """Срезы -> {метрика: [числа]} для базы порогов. rows: (ts, rx_bps, rx_pps, syncookies, listen_drop, rx_drop,
+    tx_bps, tx_pps, susp). Не берём: срезы атак и их подтверждения (susp; для старых строк — по записанным атакам),
+    для объёма и пакетов — заметные срезы с перекосом (rx ≥ ASYM·tx): иначе порог учится на самих атаках."""
+    vals = {k: [] for k in BASELINE}
+    spans = []   # слитые отрезки атак по началу — поиск делением пополам (атак за неделю бывают сотни)
+    for a, b in sorted((num(a) - SUSPECT_PAD, num(b)) for a, b in attacks):
+        if spans and a <= spans[-1][1]:
+            spans[-1][1] = max(spans[-1][1], b)
+        else:
+            spans.append([a, b])
+    starts = [a for a, _ in spans]
+    for ts, rx, pps, sc, ld, rd, tx, txp, susp in rows:
+        if susp:
+            continue
+        if susp is None and spans:   # строка прежней версии — пометки нет, смотрим записанные атаки
+            i = bisect.bisect_right(starts, num(ts)) - 1
+            if i >= 0 and num(ts) <= spans[i][1]:
+                continue
+        for k, v in (("syncookies_ps", sc), ("listen_drop_ps", ld), ("rx_drop_ps", rd)):
+            if v is not None:
+                vals[k].append(v)
+        for k, raw, out, sym, exc in (("rx_bps", rx, tx, "rx_bps_sym", "rx_excess_bps"),
+                                      ("rx_pps", pps, txp, "rx_pps_sym", "rx_excess_pps")):
+            if raw is None or (out is not None and num(raw) >= ASYM * num(out) and num(raw) >= ASYM_LEARN_MIN[k]):
+                continue
+            vals[k].append(raw)
+            vals[sym].append(raw)
+            if out is not None:   # излишек — только где исходящий известен
+                vals[exc].append(max(num(raw) - num(out), 0.0))
+    return vals
+
+
+def cap_growth(new, prev, ref, now):
+    """Предел роста порога. ref = [day_value, day_ts, week_value, week_ts] (меняется) -> новый порог.
+    Опора суток/недели — порог в начале окна; снижается без ограничений."""
+    if prev is None:
+        ref[:] = [new, now, new, now]
+        return new
+    for i, span in ((0, 86400), (2, 7 * 86400)):
+        if ref[i] is None or ref[i + 1] is None or now - ref[i + 1] >= span:
+            ref[i], ref[i + 1] = prev, now
+    out = min(new, ref[0] * BASELINE_GROWTH_DAY, ref[2] * BASELINE_GROWTH_WEEK)
+    return max(out, min(new, prev))   # не ниже прежнего, если новый не ниже: предел только на рост
+
+
 def recompute_baseline(db, hosts, now):
     since = now - BASELINE_DAYS * 86400
     for h in hosts:
-        vals = {k: [] for k in BASELINE}
-        for row in db.execute("select rx_bps, rx_pps, syncookies_ps, listen_drop_ps, rx_drop_ps from samples"
-                              " where host = ? and ts > ?", (h, since)):
-            for k, v in zip(("rx_bps", "rx_pps", "syncookies_ps", "listen_drop_ps", "rx_drop_ps"), row):
-                if v is not None:
-                    vals[k].append(v)
+        rows = list(db.execute("select ts, rx_bps, rx_pps, syncookies_ps, listen_drop_ps, rx_drop_ps, tx_bps, tx_pps, susp"
+                               " from samples where host = ? and ts > ?", (h, since)))
+        attacks = list(db.execute("select start, end from attacks where host = ? and end > ?", (h, since)))
+        vals = clean_values(rows, attacks)
+        prev = db_baseline(db, h)
+        refs = {m: list(r) for m, *r in db.execute("select metric, day_value, day_ts, week_value, week_ts from baseline_cap"
+                                                    " where host = ?", (h,))}
+        new = compute_baseline(vals)
+        if len(rows) >= BASELINE_MIN_SAMPLES:   # история есть, но чистых срезов мало (долгая атака) — прежний порог
+            for k in BASELINE:
+                if k not in new and k in prev:
+                    new[k] = prev[k]
         db.execute("delete from baseline where host = ?", (h,))
-        for k, v in compute_baseline(vals).items():
+        db.execute("delete from baseline_cap where host = ?", (h,))
+        for k, v in new.items():
+            ref = refs.get(k) or [None] * 4
+            v = cap_growth(v, prev.get(k), ref, int(now))
             db.execute("insert into baseline values (?, ?, ?, ?)", (h, k, v, int(now)))
+            db.execute("insert into baseline_cap values (?, ?, ?, ?, ?, ?)", (h, k, *ref))
     db.execute("delete from samples where ts < ?", (now - KEEP_SAMPLES_DAYS * 86400,))
     db.execute("delete from attacks where start < ?", (now - KEEP_ATTACKS_DAYS * 86400,))
     db.commit()
@@ -375,7 +486,7 @@ def proto_line(m):
     if not pp:
         return ""
     names = {"tcp": "TCP", "udp": "UDP", "icmp": "ICMP"}
-    line = "📦 <b>Протоколы</b> (за минуту): " + " · ".join("%s %s пак/с" % (names.get(k, k), cnt(v))
+    line = "📦 <b>Протоколы</b> (за минуту): " + " · ".join("%s %s пак/с" % (html.escape(str(names.get(k, k))), cnt(v))
                                                            for k, v in sorted(pp.items(), key=lambda kv: -kv[1]))
     ports = [x for x in (sh.get("ports") or []) if isinstance(x, list) and len(x) == 2][:3]
     if ports:
@@ -1079,6 +1190,12 @@ def docker_issue(n, e):
     return "🐳 <b>%s</b> — %s" % (html.escape(n), html.escape("; ".join("%s: %s" % (ct_label(k), t) for k, t in act.items())))
 
 
+def link_bps(c, h):
+    """Скорость канала сервера, бит/с: "link_mbps" у сервера в ddos.json, иначе общий; 0 — не задана."""
+    v = num((h or {}).get("link_mbps")) or num(c.get("link_mbps"))
+    return v * 1e6 if v > 0 else 0.0
+
+
 def process(state, data, c, now, db=None):
     """-> список текстов. data: {имя: ответ сборщика или None}."""
     msgs = []
@@ -1096,7 +1213,8 @@ def process(state, data, c, now, db=None):
             if t:
                 msgs.append(t)
             continue
-        th = thresholds(c, db_baseline(db, name) if db is not None else state.get("baseline", {}).get(name), overrides.get(name))
+        th = thresholds(c, db_baseline(db, name) if db is not None else state.get("baseline", {}).get(name), overrides.get(name),
+                        link_bps(c, h))
         ign = set(c.get("ignore_units") or [])
         for s in sorted(fresh, key=lambda s: s["ts"]):
             s["failed_units"] = [u for u in (s.get("failed_units") or []) if u not in ign]
@@ -1111,12 +1229,13 @@ def process(state, data, c, now, db=None):
             if v["state"] == e["verdict"]:
                 e["reasons"] = v["reasons"]
             e["last_ts"], e["last_syn"], e["last_m"] = s["ts"], int(num(s.get("syn_recv"))), s
-            if db is not None:
+            if db is not None:   # срез атаки, её подтверждения или спада — в базу порогов не пойдёт
+                susp = 1 if v["state"] == "attack" or e["verdict"] == "attack" or e["cand"] == "attack" else 0
                 db.execute("insert or ignore into samples (host, ts, rx_bps, rx_pps, syncookies_ps, listen_drop_ps, rx_drop_ps,"
-                           " tx_bps, tx_pps) values (?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                           " tx_bps, tx_pps, susp) values (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                            (name, int(s["ts"]), s.get("rx_bps"), s.get("rx_pps"), s.get("syncookies_ps"),
                             num(s.get("listen_drop_ps")) + num(s.get("listen_overflow_ps")), s.get("rx_drop_ps"),
-                            s.get("tx_bps"), s.get("tx_pps")))
+                            s.get("tx_bps"), s.get("tx_pps"), susp))
         if fresh:
             last = max(fresh, key=lambda s: s["ts"])
             msgs += docker_pass(e, name, last, c)
@@ -1147,7 +1266,8 @@ def summary(state, c, now, db=None):
     deferred = [(n, d) for n, e in hosts.items() for d in e.get("deferred", [])]
     if deferred:
         lines.append("Ночью было (без сообщений): " + "; ".join(
-            "%s %s — %s" % (html.escape(n), msk(d["ts"]).strftime("%H:%M"), ", ".join(d["reasons"])) for n, d in deferred[:10]))
+            "%s %s — %s" % (html.escape(n), msk(d["ts"]).strftime("%H:%M"), html.escape(", ".join(d["reasons"])))
+            for n, d in deferred[:10]))
     lines.append("Серверов под наблюдением: %d" % len(c["hosts"]))
     return "\n".join(lines)
 
@@ -1196,7 +1316,8 @@ def report_lines(since, now, state=None, c=None, db=None):
         night =[(n, d) for n, e in hosts.items() for d in e.get("deferred", []) if d["ts"] >= since]
         if night:
             out.append("ночью без сообщений: " + "; ".join("%s %s — %s" % (html.escape(n), msk(d["ts"]).strftime("%H:%M"),
-                                                                             ", ".join(d["reasons"])) for n, d in night[:5]))
+                                                                             html.escape(", ".join(d["reasons"])))
+                                                            for n, d in night[:5]))
         peaks = list(db.execute("select host, max(rx_bps) m from samples where ts >= ? group by host order by m desc limit 3",
                                 (int(since),)))
         tail = []
@@ -1344,7 +1465,8 @@ def main(argv):
     if "--status" in argv:
         for n, e in state.get("hosts", {}).items():
             print("%-24s %-8s последний срез %s, порог RX %s" % (n, e.get("verdict"), msk(e.get("last_ts") or 0).strftime("%H:%M:%S"),
-                                                               mbit(thresholds(c, db_baseline(db, n))["rx_bps"])))
+                                                               mbit(thresholds(c, db_baseline(db, n), None, link_bps(
+                                                                   c, next((h for h in c["hosts"] if h.get("name") == n), None)))["rx_bps"])))
         return 0
     data = fetch_all(c)
     for t in process(state, data, c, now, db):

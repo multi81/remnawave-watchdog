@@ -65,6 +65,16 @@ def _probe():
     return probe
 
 
+def curl_quote(s):
+    """Строка в кавычках для конфига curl (-K): экранируются \\ и кавычка; переводов строки в s быть не должно."""
+    return '"' + str(s).replace("\\", "\\\\").replace('"', '\\"') + '"'
+
+
+def curl_config(url, body):
+    """Конфиг curl для stdin (-K -): адрес с токеном и тело не попадают в argv, их не видно в ps и /proc/*/cmdline."""
+    return "url = %s\ndata-binary = %s\n" % (curl_quote(url), curl_quote(body))
+
+
 def tg_call(method, payload, timeout=20):
     """-> ответ Telegram (dict) или None. Маршруты — как у сторожа (напрямую, через свой канал, мост)."""
     probe = _probe()
@@ -72,12 +82,14 @@ def tg_call(method, payload, timeout=20):
     if not token:
         return None
     url = "https://api.telegram.org/bot%s/%s" % (token, method)
+    # json.dumps без отступов — одна строка ASCII, начинается с «{» (не «@файл»)
+    conf = curl_config(url, json.dumps(payload))
     for proxy in probe.tg_routes():
-        cmd = ["curl", "-s", "-m", str(timeout), "-X", "POST", "-H", "Content-Type: application/json", "-d", "@-", url]
+        cmd = ["curl", "-s", "-m", str(timeout), "-X", "POST", "-H", "Content-Type: application/json", "-K", "-"]
         if proxy:
             cmd[1:1] = ["-x", proxy]
         try:
-            r = subprocess.run(cmd, input=json.dumps(payload), capture_output=True, text=True, timeout=timeout + 5)
+            r = subprocess.run(cmd, input=conf, capture_output=True, text=True, timeout=timeout + 5)
             d = json.loads(r.stdout or "null")
         except (subprocess.TimeoutExpired, ValueError, OSError):
             continue

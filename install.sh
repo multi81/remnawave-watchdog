@@ -14,7 +14,10 @@
 #     и его ссылка подписки;
 #   - токен Telegram-бота и номер чата, куда писать.
 # Входящих портов сторож не открывает: сам ходит наружу, файрвол трогать не нужно.
-# Повторный запуск безопасен: обновляет скрипты и службы, состояние и настройки не трогает.
+# Повторный запуск безопасен: обновляет скрипты и службы, состояние и настройки не трогает; Xray заменяет, только если
+# в источнике (контейнер remnanode) версия новее, а с --xray ПУТЬ — всегда.
+# Службы работают в песочнице systemd: писать можно только в /etc/channel-watch, /var/lib/channel-watch, /var/log и
+# папки пульса из heartbeat.path / heartbeat-full.path. Путь пульса поменяли — снова bash install.sh.
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 ETC=/etc/channel-watch
@@ -135,7 +138,8 @@ case "${ID:-}:${VERSION_ID:-}" in
   ubuntu:24.04|ubuntu:26.04) ;;
   *) echo "внимание: рассчитано на Ubuntu 24.04 / 26.04, здесь ${PRETTY_NAME:-неизвестная система}" ;;
 esac
-for f in probe.py nodewatch.py blockwatch.py netprobe.py rucheck.py build_channels.py; do
+# vantage_client.py — TLS к точкам проверки с закреплённым отпечатком (blockwatch.agent_get для точек с "sha256")
+for f in probe.py nodewatch.py blockwatch.py netprobe.py rucheck.py build_channels.py vantage_client.py; do
   [ -s "$SRC/$f" ] || { echo "рядом со скриптом нет $f"; exit 1; }
 done
 missing=""
@@ -146,7 +150,8 @@ if [ -n "$missing" ]; then
   apt-get install -y -qq python3 curl iputils-ping traceroute
 fi
 python3 -c 'import ast, sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' \
-  "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py"
+  "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py" \
+  "$SRC/vantage_client.py"
 
 # --- ссылка подписки служебного пользователя ---
 install -d -m 700 "$ETC"
@@ -187,17 +192,34 @@ install -d -m 755 /opt/channel-watch /var/lib/channel-watch
 # кнопки щита (shieldbot, из install_ddos.sh) шлют в Telegram через probe.py: новый probe.py — перезапустить их
 probe_changed=0; cmp -s "$SRC/probe.py" /opt/channel-watch/probe.py || probe_changed=1
 install -m 755 "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py" /opt/channel-watch/
+install -m 644 "$SRC/vantage_client.py" /opt/channel-watch/
+# байт-код заранее: в песочнице /opt только для чтения, без него каждый запуск компилировал бы заново
+python3 -m compileall -q /opt/channel-watch >/dev/null 2>&1 || true
 
 if [ "$probe_changed" -eq 1 ]; then systemctl try-restart channel-watch-shieldbot.service 2>/dev/null || true; fi
 
-# клиент Xray: тот же бинарник, что у ноды (ничего не скачиваем), либо указанный файл
+# клиент Xray: тот же бинарник, что у ноды (ничего не скачиваем), либо указанный файл. Уже стоит — заменяется, только
+# если в контейнере версия новее; --xray ПУТЬ — всегда (файл указан явно). Замена через mv: работающий Xray не мешает.
+xver() { "$1" version 2>/dev/null | awk 'NR==1{print $2}'; }
+newer() { [ -n "$1" ] && [ "$1" != "$2" ] && [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | tail -n 1)" = "$1" ]; }
+xray_new=0 cand="" tmpx=""
 if [ -n "$xray_src" ]; then
-  install -m 755 "$xray_src" /opt/channel-watch/xray
-elif [ ! -x /opt/channel-watch/xray ]; then
-  docker cp remnanode:/usr/local/bin/xray /opt/channel-watch/xray 2>/dev/null \
-    || { echo "не нашёл Xray: контейнера remnanode нет. Укажите бинарник: bash install.sh --xray /путь/к/xray"; exit 1; }
-  chmod 755 /opt/channel-watch/xray
+  cand="$xray_src"
+else
+  tmpx="$(mktemp /opt/channel-watch/.xray-XXXXXX)"
+  if docker cp remnanode:/usr/local/bin/xray "$tmpx" 2>/dev/null; then chmod 755 "$tmpx"; cand="$tmpx"; fi
 fi
+if [ -z "$cand" ]; then
+  rm -f "$tmpx"
+  [ -x /opt/channel-watch/xray ] || { echo "не нашёл Xray: контейнера remnanode нет. Укажите бинарник: bash install.sh --xray /путь/к/xray"; exit 1; }
+  echo "xray: контейнера remnanode нет — оставлен прежний"
+elif [ -n "$xray_src" ] || [ ! -x /opt/channel-watch/xray ] || newer "$(xver "$cand")" "$(xver /opt/channel-watch/xray)"; then
+  [ ! -x /opt/channel-watch/xray ] || echo "xray: $(xver /opt/channel-watch/xray) → $(xver "$cand")"
+  install -m 755 "$cand" /opt/channel-watch/.xray.new
+  mv -f /opt/channel-watch/.xray.new /opt/channel-watch/xray
+  xray_new=1
+fi
+rm -f "$tmpx"
 echo "xray: $(/opt/channel-watch/xray version | head -n 1)"
 
 # --- каналы из подписки ---
@@ -206,14 +228,71 @@ rc=0; python3 /opt/channel-watch/build_channels.py || rc=$?
 /opt/channel-watch/xray run -test -c "$ETC/xray.json" | tail -n 1
 
 # --- службы ---
-cat > /etc/systemd/system/channel-watch-xray.service <<'UNIT'
+# Песочница Python-служб (дописывается в конец [Service]). Они остаются от root: читают sub.url и guard.env (600 root),
+# ходят в docker (rucheck: docker exec remnanode), трассируют TCP SYN (traceroute -T, нужен raw-сокет), а их файлы
+# в /etc и /var/lib/channel-watch делят со службами DDoS-части, которые тоже от root. Зато писать можно только в свои
+# папки, /var/log (журнал и его ротация) и папки пульса; /home и /root только для чтения (свой docker context).
+hb_rw=""
+for f in "$ETC/heartbeat.path" "$ETC/heartbeat-full.path"; do
+  [ -s "$f" ] || continue
+  d="$(dirname "$(head -n 1 "$f")")"
+  case "$d" in
+    *[[:space:]]*|*%*|*\"*|*\'*|*'\'*|[!/]*) echo "внимание: путь пульса в $f не абсолютный или с пробелом, %, кавычкой, \\ — песочница запись туда не пустит" ;;
+    *) hb_rw="$hb_rw -$d" ;;
+  esac
+done
+py_sandbox() {   # $1 — дополнительные папки для записи
+  cat <<EOF
+NoNewPrivileges=yes
+ProtectSystem=strict
+ReadWritePaths=/etc/channel-watch /var/lib/channel-watch /var/log${1:-}
+ProtectHome=read-only
+PrivateTmp=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+EOF
+}
+xray_unit_was="$(cat /etc/systemd/system/channel-watch-xray.service 2>/dev/null || true)"
+# Xray — от временного пользователя (DynamicUser) без полномочий: xray.json (600 root) ему отдаёт systemd копией
+# (LoadCredential). systemd старше 250 (не Ubuntu 24.04+) — по-старому, от root, но с той же песочницей.
+if [ "$(systemctl --version | awk 'NR==1{print $2+0}')" -ge 250 ]; then
+  xexec='/opt/channel-watch/xray run -c ${CREDENTIALS_DIRECTORY}/xray.json'
+  xuser='LoadCredential=xray.json:/etc/channel-watch/xray.json
+DynamicUser=yes
+CapabilityBoundingSet=
+AmbientCapabilities='
+else
+  xexec='/opt/channel-watch/xray run -c /etc/channel-watch/xray.json'
+  xuser='CapabilityBoundingSet='
+fi
+cat > /etc/systemd/system/channel-watch-xray.service <<UNIT
 [Unit]
 Description=channel-watch: клиент Xray для проверки каналов (SOCKS 127.0.0.1:21000-21099)
 After=network-online.target
 Wants=network-online.target
 
 [Service]
-ExecStart=/opt/channel-watch/xray run -c /etc/channel-watch/xray.json
+ExecStart=$xexec
+$xuser
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 Restart=always
 RestartSec=5
 Nice=10
@@ -222,6 +301,10 @@ MemoryMax=96M
 [Install]
 WantedBy=multi-user.target
 UNIT
+# sockopt.mark (SO_MARK) требует CAP_NET_ADMIN — у Xray в песочнице его нет, такой канал не соединится
+if grep -q '"mark"' "$ETC/xray.json" 2>/dev/null; then
+  echo "внимание: в $ETC/xray.json есть sockopt.mark — Xray в песочнице его поставить не сможет, канал будет недоступен"
+fi
 
 cat > /etc/systemd/system/channel-watch.service <<'UNIT'
 [Unit]
@@ -235,6 +318,7 @@ ExecStart=/usr/bin/python3 /opt/channel-watch/probe.py
 Nice=10
 TimeoutStartSec=110
 UNIT
+py_sandbox "$hb_rw" >> /etc/systemd/system/channel-watch.service
 
 cat > /etc/systemd/system/channel-watch.timer <<'UNIT'
 [Unit]
@@ -257,6 +341,7 @@ Description=channel-watch: пересборка списка каналов из
 Type=oneshot
 ExecStart=/bin/sh -c 'rc=0; /usr/bin/python3 /opt/channel-watch/build_channels.py || rc=$?; [ "$rc" -eq 10 ] && systemctl restart channel-watch-xray.service; [ "$rc" -eq 0 ] || [ "$rc" -eq 10 ]'
 UNIT
+py_sandbox >> /etc/systemd/system/channel-watch-build.service
 
 cat > /etc/systemd/system/channel-watch-build.timer <<'UNIT'
 [Unit]
@@ -282,6 +367,7 @@ ExecStart=/usr/bin/python3 /opt/channel-watch/probe.py --speed
 Nice=10
 TimeoutStartSec=600
 UNIT
+py_sandbox >> /etc/systemd/system/channel-watch-speed.service
 
 cat > /etc/systemd/system/channel-watch-speed.timer <<'UNIT'
 [Unit]
@@ -307,6 +393,7 @@ Nice=15
 MemoryMax=256M
 TimeoutStartSec=900
 UNIT
+py_sandbox >> /etc/systemd/system/channel-watch-lists.service
 
 cat > /etc/systemd/system/channel-watch-lists.timer <<'UNIT'
 [Unit]
@@ -332,6 +419,7 @@ Nice=15
 MemoryMax=128M
 TimeoutStartSec=600
 UNIT
+py_sandbox >> /etc/systemd/system/channel-watch-loss.service
 
 cat > /etc/systemd/system/channel-watch-loss.timer <<'UNIT'
 [Unit]
@@ -357,6 +445,7 @@ Nice=15
 MemoryMax=256M
 TimeoutStartSec=1200
 UNIT
+py_sandbox >> /etc/systemd/system/channel-watch-side.service
 
 cat > /etc/systemd/system/channel-watch-side.timer <<'UNIT'
 [Unit]
@@ -381,6 +470,10 @@ cat > /etc/logrotate.d/channel-watch <<'ROT'
 ROT
 
 systemctl daemon-reload
+# новый бинарник или юнит Xray (песочница) — перезапустить работающий; остальные службы — oneshot, новое со следующего запуска
+if [ "$xray_new" -eq 1 ] || [ "$xray_unit_was" != "$(cat /etc/systemd/system/channel-watch-xray.service)" ]; then
+  systemctl try-restart channel-watch-xray.service 2>/dev/null || true
+fi
 if [ "$start" -eq 0 ]; then
   echo "== поставлено без запуска. Включить: systemctl enable --now channel-watch-xray.service channel-watch.timer channel-watch-build.timer channel-watch-speed.timer channel-watch-lists.timer channel-watch-loss.timer channel-watch-side.timer"
   exit 0

@@ -32,7 +32,8 @@
     сбои сайтов, что изменилось. Берётся из почасовой истории (HISTORY), которая пишется раз в час.
 Токен — из /etc/bridge-watch/guard.env.
 Пульс для внешнего сторожа (guard.py на другом сервере): после каждого запуска — файл, путь к которому
-записан в /etc/channel-watch/heartbeat.path; нет этого файла — пульс не пишется.
+записан в /etc/channel-watch/heartbeat.path; нет этого файла — пульс не пишется. Полный пульс с нодами и сайтами
+(для сверки со вторым сторожем) — только если путь записан в /etc/channel-watch/heartbeat-full.path.
 Вручную: probe.py --show — напечатать отчёт; probe.py --report — напечатать и отправить (статистика не сбрасывается);
 probe.py --week — напечатать сводку за неделю; probe.py --week-report — напечатать и отправить;
 probe.py --blocks — проверить блокировки сейчас (списки, DNS, вход каждой ноды со всех точек) и напечатать;
@@ -44,11 +45,13 @@ import html
 import http.client
 import json
 import os
+import re
 import socket
 import ssl
 import statistics
 import subprocess
 import sys
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -81,6 +84,7 @@ DEEP_BYTES = 512 * 1024
 DEEP_URL = f"https://speed.cloudflare.com/__down?bytes={DEEP_BYTES}"
 EXIT_URL = "https://api.ipify.org"
 HEARTBEAT = os.path.join(ETC, "heartbeat.path")  # в файле — куда писать пульс для внешнего сторожа
+HEARTBEAT_FULL = os.path.join(ETC, "heartbeat-full.path")  # куда писать полный пульс (с нодами) для второго сторожа; нет — не пишем
 DEEP_EVERY = 600          # секунд между плановыми закачками и проверками сайтов
 SERVICES_EVERY = 1800     # секунд между проверками сервисов через канал
 SUB_EVERY = 1800          # секунд между загрузками подписки сторожа (проверка страницы подписки)
@@ -472,6 +476,118 @@ def cert_info(host, port=443, sni=None):
         return {"err": NO_LINK}
 
 
+# Подмена DNS. Наши имена (сайты, ноды) открытым UDP к публичным резолверам не спрашиваем: такие вопросы видят
+# все по пути и сами резолверы, а это готовый перечень нод. Наше имя сверяем так: системный резолвер rf1 и точек
+# проверки (DNS оператора — им пользуются клиенты) против защищённого DNS (DoH). Публичные резолверы по UDP
+# спрашиваем только о чужих именах: подменяют ли их ответы по пути от rf1. Новый blockwatch.dns_check делает это сам;
+# со старым blockwatch (обновили только probe.py) — своя проверка того же вида.
+DNS_NEUTRAL = getattr(blockwatch, "DNS_REF_NAMES", ("rutracker.org", "www.facebook.com", "www.example.org"))
+AGENT_DNS_CAP = getattr(blockwatch, "AGENT_DNS_CAP", "dns_udp0")  # точка умеет /dns?udp=0 (пишет в /health, "caps")
+
+
+def dns_check(names, socks_port, agents=()):
+    """Проверка подмены DNS: {имя: {"truth", "odd", "asked", "system"[, "path"]}}."""
+    if hasattr(blockwatch, "DNS_REF_NAMES"):
+        return blockwatch.dns_check(names, socks_port, agents)
+    return dns_check_own(names, socks_port, agents)
+
+
+def dns_truth_own(name, socks_port):
+    """Чему верим для нашего имени: DoH через зарубежный канал; канала нет или не ответил — DoH напрямую
+    (он зашифрован, на пути имени не видно). None — спросить не удалось."""
+    found = blockwatch.doh(name, socks_port) if socks_port else None
+    return found if found is not None else blockwatch.doh(name)
+
+
+def dns_observe_own(name, agents=()):
+    """Что отвечает обычный DNS на наше имя: {кто: (итог, [адреса])} — системный резолвер rf1 и точек проверки,
+    которые умеют /dns без публичных резолверов (старая точка спросила бы их о нашем имени — ей имя не отдаём)."""
+    seen = {"rf1: системный": blockwatch.netprobe.resolve_system(name)}
+    for a in agents:
+        if not a.get(AGENT_DNS_CAP):
+            continue
+        data = blockwatch.agent_get(a, "/dns?name=" + urllib.parse.quote(name) + "&udp=0", 12)
+        if not data:
+            continue
+        seen[f"{a['name']}: системный"] = tuple(data.get("system") or ("err", []))
+        for who, res in (data.get("udp") or {}).items():
+            seen[f"{a['name']}: {who}"] = tuple(res)
+    return seen
+
+
+def dns_path_own(socks_port, names=DNS_NEUTRAL):
+    """Подменяют ли по пути от rf1 ответы публичных DNS по UDP — на чужих именах: [[кто, имя, что ответил]], если
+    хоть на одном имени разошлись не меньше DNS_MIN резолверов; иначе []."""
+    out = []
+    for name in names:
+        truth = blockwatch.dns_truth(name, socks_port)
+        if not truth:
+            continue
+        seen = {f"rf1: {who}": blockwatch.netprobe.dns_udp(name, ip) for who, ip in blockwatch.RESOLVERS}
+        odd = blockwatch.dns_judge(truth, seen)
+        if len(odd) >= blockwatch.DNS_MIN:
+            out += [[who, name, what] for who, what in odd]
+    return out
+
+
+def agent_cap(agent):
+    """Умеет ли точка /dns?udp=0: так она пишет в /health, в списке "caps"."""
+    caps = (blockwatch.agent_get(agent, "/health", 8) or {}).get("caps")
+    return isinstance(caps, list) and AGENT_DNS_CAP in caps
+
+
+def agents_caps(agents):
+    """[умеет ли /dns?udp=0] по всем точкам — /health разом: недоступная точка не добавляет по 8 с к шагу DNS."""
+    if not agents:
+        return []
+    with concurrent.futures.ThreadPoolExecutor(max_workers=min(8, len(agents))) as ex:
+        return list(ex.map(agent_cap, agents))
+
+
+def dns_check_own(names, socks_port, agents=()):
+    """Как новый blockwatch.dns_check — для старого blockwatch, который спрашивает наши имена открытым UDP."""
+    agents = list(agents)
+    agents = [dict(a, **{AGENT_DNS_CAP: cap}) for a, cap in zip(agents, agents_caps(agents))]
+
+    def one(name):
+        truth = dns_truth_own(name, socks_port)
+        if truth is None:
+            return name, None
+        seen = dns_observe_own(name, agents)
+        system = {who.split(": ")[0]: st for who, (st, _) in seen.items() if who.endswith(": системный")}
+        return name, {"truth": sorted(truth), "odd": [list(x) for x in blockwatch.dns_judge(truth, seen)],
+                      "asked": sum(1 for s, _ in seen.values() if s != "err"), "system": system}
+
+    out = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=8) as ex:
+        f_path = ex.submit(dns_path_own, socks_port)
+        for name, res in ex.map(one, names):
+            if res is not None:
+                out[name] = res
+        path = f_path.result()
+    if path:
+        for res in out.values():
+            res["path"] = path
+    return out
+
+
+def dns_need(res):
+    """Сколько ответов должны разойтись с защищённым DNS, чтобы считать подменой: всегда DNS_MIN независимых.
+    Порог прежний и не снижается, когда ответивших меньше (см. dns_level)."""
+    return blockwatch.DNS_MIN
+
+
+def dns_level(res):
+    """Уровень имени для тревоги «Подмена DNS»: 'bad' — разошлись не меньше DNS_MIN независимых ответов; 'ok' —
+    расхождений меньше порога; None — ответивших меньше DNS_MIN, а расхождение есть: одного ответа (например,
+    только системный DNS rf1, пока точки проверки не умеют /dns?udp=0) для вывода мало — расхождение пишется в
+    журнал и в state, тревога не поднимается и прежний уровень не меняется."""
+    odd = len(res.get("odd") or [])
+    if res.get("asked", 0) < blockwatch.DNS_MIN and odd:
+        return None
+    return "bad" if odd >= dns_need(res) else "ok"
+
+
 def cert_targets(chans):
     """Чьи сертификаты проверять: сайты владельца и ноды, у которых прикрытием служит собственный домен."""
     targets = {h.split(".")[0]: (h, 443, h) for h in SITE_HOSTS}
@@ -747,26 +863,98 @@ def tg_routes():
     return routes + [TG_FALLBACK_PROXY]
 
 
+TG_API = "https://api.telegram.org"  # адрес API бота (в тестах — свой сервер)
+TG_HEAD = "🛰 <b>Сторож каналов (rf1)</b>\n\n"  # заголовок пачки оповещений
+TG_LIMIT = 4000  # длина сообщения у Telegram — до 4096 знаков UTF-16; берём с запасом
+TG_TAGS = re.compile(r"</?(?:b|i|u|s|code|pre|a)(?:\s[^>]*)?>")
+
+
+def curl_quote(value):
+    """Строка для конфига curl (-K): в кавычках, с экранированием, без переводов строки."""
+    value = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + value.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + '"'
+
+
+def tg_len(text):
+    return len(text.encode("utf-16-le")) // 2
+
+
+def tg_split(text, limit=TG_LIMIT):
+    """Длинное сообщение — на куски не длиннее limit: режем между строками (лучше — на пустой строке между
+    тревогами), строку длиннее limit — посередине."""
+    if tg_len(text) <= limit:
+        return [text]
+    lines = []
+    for line in text.split("\n"):
+        while tg_len(line) > limit:
+            cut = limit
+            while tg_len(line[:cut]) > limit:
+                cut -= 1
+            lines.append(line[:cut])
+            line = line[cut:]
+        lines.append(line)
+    out, cur = [], []
+    for line in lines:
+        while cur and tg_len("\n".join(cur + [line])) > limit:
+            gap = max((i for i, x in enumerate(cur) if not x.strip()), default=0)
+            if gap:  # кусок кончается на пустой строке — тревога не рвётся пополам
+                out.append("\n".join(cur[:gap]))
+                cur = cur[gap + 1:]
+            else:
+                out.append("\n".join(cur))
+                cur = []
+        cur.append(line)
+    out.append("\n".join(cur))
+    return [x.strip("\n") for x in out if x.strip()]
+
+
+def tg_plain(text):
+    """Текст без разметки HTML — на случай, если Telegram её не принял."""
+    return html.unescape(TG_TAGS.sub("", text))
+
+
+def tg_post(token, chat, text, proxy=None, markup=True):
+    """Один запрос sendMessage через curl: код ответа ('' — нет связи). Токен и текст — в конфиге на stdin (-K -),
+    а не в аргументах: аргументы любого процесса видны всем пользователям сервера (ps, /proc/*/cmdline)."""
+    cfg = [f"url = {curl_quote(f'{TG_API}/bot{token}/sendMessage')}",
+           f"data-urlencode = {curl_quote(f'chat_id={chat}')}",
+           f"data-urlencode = {curl_quote(f'text={text}')}",
+           'data = "disable_web_page_preview=true"']
+    if markup:
+        cfg.append('data = "parse_mode=HTML"')
+    cmd = ["curl", "-s", "-m", "10", "-o", os.devnull, "-w", "%{http_code}", "-K", "-"]
+    if proxy:
+        cmd[1:1] = ["-x", proxy]
+    try:
+        return subprocess.run(cmd, input="\n".join(cfg) + "\n", capture_output=True, text=True, encoding="utf-8",
+                              timeout=15).stdout.strip()
+    except (subprocess.TimeoutExpired, OSError):
+        return ""
+
+
 def tg_send(text):
-    """'ok' — доставлено; 'bad' — Telegram отверг само сообщение (повторять бесполезно); 'fail' — нет связи."""
+    """'ok' — доставлено; 'bad' — Telegram отверг само сообщение (повторять бесполезно); 'fail' — нет связи.
+    Длинное — несколькими сообщениями; отвергнутое с разметкой — ещё раз простым текстом.
+    Нет связи посреди длинного — 'fail', и при повторе уже ушедшие куски придут ещё раз."""
     token, chat = tg_env()
     if not token or not chat:
         return "fail"
-    url = f"https://api.telegram.org/bot{token}/sendMessage"
-    result = "fail"
-    for proxy in tg_routes():
-        cmd = ["curl", "-s", "-m", "10", "-o", "/dev/null", "-w", "%{http_code}", "-X", "POST", url,
-               "--data-urlencode", f"chat_id={chat}", "--data-urlencode", f"text={text}",
-               "-d", "parse_mode=HTML", "-d", "disable_web_page_preview=true"]
-        if proxy:
-            cmd[1:1] = ["-x", proxy]
-        try:
-            code = subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout.strip()
-        except subprocess.TimeoutExpired:
-            continue
-        if code == "200":
-            return "ok"
-        if code == "400":
+    result = "ok"
+    for chunk in tg_split(text):
+        got = "fail"
+        for proxy in tg_routes():
+            code = tg_post(token, chat, chunk, proxy)
+            if code == "400":
+                code = tg_post(token, chat, tg_plain(chunk), proxy, markup=False)
+            if code == "200":
+                got = "ok"
+                break
+            if code == "400":
+                got = "bad"
+                break
+        if got == "fail":
+            return "fail"
+        if got == "bad":
             result = "bad"
     return result
 
@@ -1045,7 +1233,7 @@ def main():
         f_beacons = {n["name"]: ex.submit(nodewatch.fetch_beacon, n["beacon"]) for n in node_cfg if n.get("beacon")} if due else {}
         f_certs = {k: ex.submit(cert_info, *v) for k, v in cert_targets(chans).items()} if do_slow else {}
         f_domains = {d: ex.submit(domain_expiry, d) for d in DOMAINS} if do_slow else {}
-        f_dns = ex.submit(blockwatch.dns_check, dns_names, ok_port, agents) if do_dns else None
+        f_dns = ex.submit(dns_check, dns_names, ok_port, agents) if do_dns else None
         f_van = ex.submit(blockwatch.agents_health, agents) if do_slow and agents else None
         results = [f.result() for f in f_chans]
         site_codes = {name: f.result() for name, f in f_sites.items()}
@@ -1115,16 +1303,32 @@ def main():
     # подмена DNS: обычный DNS отвечает не то, что защищённый, — после CONFIRM проверок подряд
     if f_dns is not None:
         dns = f_dns.result()
+        path = next((r["path"] for r in dns.values() if r.get("path")), [])
         st["dns_last"] = now
-        st["dns"] = {"ts": now, "names": len(dns)}
+        st["dns"] = {"ts": now, "names": len(dns), "path": sorted({name for _, name, _ in path})}
         st["dns_lvl"] = {k: v for k, v in st["dns_lvl"].items() if k in dns_names}
+        if path:
+            log("DNS по пути: публичные резолверы по UDP подменяют чужие имена: "
+                + "; ".join(f"{who} — {name}: {what}" for who, name, what in path))
+        weak = {}
         for name, res in sorted(dns.items()):
-            lvl = "bad" if len(res["odd"]) >= blockwatch.DNS_MIN else "ok"
+            lvl = dns_level(res)
+            if lvl is None:
+                # ответивших меньше DNS_MIN: вывода нет — уровень прежний, начатая перепроверка сбрасывается
+                weak[name] = [list(x) for x in res["odd"]]
+                lvl = st["dns_lvl"].get(name, {}).get("lvl", "ok")
             if level_step(st["dns_lvl"], name, lvl, CONFIRM):
-                alerts.append(blockwatch.dns_alert(name, res, lvl))
+                text = blockwatch.dns_alert(name, res, lvl)
+                if lvl == "bad" and path and not hasattr(blockwatch, "dns_path_text"):  # старый blockwatch не пишет сам
+                    text += ("\n<b>По пути:</b> публичные DNS по UDP отвечают не то и на чужие имена ("
+                             + html.escape(", ".join(st["dns"]["path"])) + ") — 8.8.8.8 и 1.1.1.1 у клиентов не спасут.")
+                alerts.append(text)
             if res["odd"]:
                 log(f"DNS {name}: по защищённому {', '.join(res['truth'])}; расходятся: "
-                    + "; ".join(f"{who} — {what}" for who, what in res["odd"]))
+                    + "; ".join(f"{who} — {what}" for who, what in res["odd"])
+                    + (f" (ответили {res.get('asked', 0)} из нужных {blockwatch.DNS_MIN} — для тревоги мало)"
+                       if name in weak else ""))
+        st["dns"]["weak"] = weak  # расхождения, по которым тревоги нет: ответивших меньше DNS_MIN
         # свой DNS точки не находит наши имена (SERVFAIL, пусто) — событие точки, а не подмена отдельного имени
         for point, (failed, total) in blockwatch.dns_points(dns, agents).items():
             plvl = "bad" if failed >= max(2, (total + 1) // 2) else "ok"
@@ -1381,23 +1585,42 @@ def main():
     # очередь: если Telegram сейчас недоступен, оповещение не теряется, а уходит при следующей проверке
     alerts = [a for a in alerts if a]  # сообщения, влитые в общее, пустые
     queue = st.setdefault("unsent", [])
+    # пачка — список тревог (раньше — готовая строка; такие из старой очереди шлются как есть)
     for i in range(0, len(alerts), 4):
-        queue.append("🛰 <b>Сторож каналов (rf1)</b>\n\n" + "\n\n".join(alerts[i:i + 4]))
+        queue.append(alerts[i:i + 4])
     del queue[:-20]
     while queue:
-        sent = tg_send(queue[0])
+        item = queue[0]
+        text = TG_HEAD + "\n\n".join(item) if isinstance(item, list) else str(item)
+        if isinstance(item, list) and len(item) > 1 and tg_len(text) > TG_LIMIT:
+            # пачка не влезает в одно сообщение — сразу по одной тревоге: иначе tg_send режет её на куски, и при
+            # отказе одного куска пачка разбилась бы на одиночные уже после того, как другие куски дошли (дубли)
+            queue[0:1] = [[a] for a in item]
+            continue
+        sent = tg_send(text)
         if sent == "fail":
             log(f"оповещение НЕ ушло в Telegram (нет связи), в очереди {len(queue)} — повторю при следующей проверке")
             break
+        if sent == "bad" and isinstance(item, list) and len(item) > 1:
+            queue[0:1] = [[a] for a in item]  # пачку отвергли — шлём по одной, чтобы пропала только плохая
+            log(f"Telegram отверг пачку из {len(item)} оповещений — шлю по одной")
+            continue
         queue.pop(0)
-        log("оповещение отправлено в Telegram" if sent == "ok" else "Telegram отверг оповещение — пропускаю")
+        log("оповещение отправлено в Telegram" if sent == "ok" else
+            "Telegram отверг оповещение — пропускаю: " + tg_plain(text).replace("\n", " ")[:300])
 
     # полный отчёт — в часы из SUMMARY_HOURS_UTC, один раз на каждый час из списка
     utc = dt.datetime.now(dt.timezone.utc)
     slot = max((h for h in SUMMARY_HOURS_UTC if utc.hour >= h), default=None)
     key = f"{utc:%Y-%m-%d} {slot:02d}" if slot is not None else None
-    if key and st["last_summary"] != key:
-        if tg_send(report_text(st, now, read_json("sub_status.json", {}), read_json("sub_changes.json", []))) == "ok":
+    if key and st["last_summary"] != key and st.get("summary_bad") != key:
+        sent = tg_send(report_text(st, now, read_json("sub_status.json", {}), read_json("sub_changes.json", [])))
+        if sent == "bad":
+            # отверг и простым текстом — не повторяем каждые 2 минуты; last_summary не трогаем: внешний сторож
+            # увидит, что отчёт не ушёл
+            st["summary_bad"] = key
+            log(f"Telegram отверг полный отчёт за {key} UTC — не повторяю до следующего часа отчёта")
+        if sent == "ok":
             log("полный отчёт отправлен в Telegram")
             st["last_summary"] = key
             st["summary_since"], st["offline_sec"] = now, 0
@@ -1415,9 +1638,11 @@ def main():
     first = min(SUMMARY_HOURS_UTC, default=None)
     if first is not None and st["last_weekly"] != week_key(now) and (day.weekday(), day.hour) >= (WEEKLY_WEEKDAY, first):
         text = weekly_text(st, load_history(), now)
-        if text is None or tg_send(text) == "ok":
+        sent = "ok" if text is None else tg_send(text)
+        if sent != "fail":  # отвергнутую тоже не повторяем каждые 2 минуты до конца недели
             st["last_weekly"] = week_key(now)
-            log("сводка за неделю отправлена в Telegram" if text else "сводка за неделю: истории ещё нет")
+            log("сводка за неделю: истории ещё нет" if text is None else "сводка за неделю отправлена в Telegram"
+                if sent == "ok" else "Telegram отверг сводку за неделю — пропускаю")
 
     st["last_run"] = now
     save_state(st)
@@ -1741,26 +1966,54 @@ def node_states(st):
     return out
 
 
-def beat():
-    """Пульс для внешних сторожей: когда был последний запуск, ушёл ли отчёт, не копятся ли неотправленные оповещения,
-    и что сторож думает о каждой ноде и сайте (по этому второй сторож решает, слать ли своё сообщение).
-    Пишется после каждого запуска, который дошёл до конца."""
+def write_pulse(path, data):
+    """Файл пульса для веб-сервера (0644). Временный файл — свой, с неугадываемым именем (mkstemp, O_EXCL),
+    права ставятся на открытый файл: подложенная в папку сайта ссылка не заставит root писать в чужой файл
+    или открыть его всем. os.replace заменяет саму ссылку на месте пульса, а не файл, на который она указывает."""
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path) or ".", prefix=".hb-", suffix=".tmp")
     try:
-        path = open(HEARTBEAT, encoding="utf-8").read().strip()
-    except OSError:
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            if hasattr(os, "fchmod"):
+                os.fchmod(f.fileno(), 0o644)
+            json.dump(data, f)
+        if not hasattr(os, "fchmod"):  # Windows (тесты)
+            os.chmod(tmp, 0o644)
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
+
+
+def beat():
+    """Пульс для внешних сторожей, пишется после каждого запуска, который дошёл до конца.
+    heartbeat.path — короткий пульс для guard.py: когда был последний запуск, ушёл ли отчёт, не копятся ли
+    неотправленные оповещения, есть ли у сервера интернет. Перечня нод и сайтов в нём нет: файл лежит в папке сайта.
+    heartbeat-full.path (по желанию) — полный пульс для сверки со вторым сторожем: то же плюс что сторож думает
+    о каждой ноде и сайте. Тот же путь, что в heartbeat.path, — один полный файл, как было до разделения."""
+    def target(name):
+        try:
+            return open(name, encoding="utf-8").read().strip()
+        except OSError:
+            return ""
+    path, full = target(HEARTBEAT), target(HEARTBEAT_FULL)
+    if not path and not full:
         return
     st = load_state()
     data = {"ts": int(time.time()), "summary": st.get("last_summary", ""), "hours": list(SUMMARY_HOURS_UTC),
-            "unsent": len(st.get("unsent", [])), "offline": "offline_since" in st,
-            "nodes": node_states(st), "sites": {SITE_KEYS[n]: v.get("status", "OK") for n, v in st.get("sites", {}).items()
-                                                if n in SITE_KEYS and v.get("ts")}}
-    try:
-        with open(path + ".tmp", "w", encoding="utf-8") as f:
-            json.dump(data, f)
-        os.chmod(path + ".tmp", 0o644)
-        os.replace(path + ".tmp", path)
-    except OSError as e:
-        log(f"пульс не записан: {e}")
+            "unsent": len(st.get("unsent", [])), "offline": "offline_since" in st}
+    files = {path: data} if path else {}
+    if full:
+        files[full] = dict(data, nodes=node_states(st),
+                           sites={SITE_KEYS[n]: v.get("status", "OK") for n, v in st.get("sites", {}).items()
+                                  if n in SITE_KEYS and v.get("ts")})
+    for dest, body in files.items():
+        try:
+            write_pulse(dest, body)
+        except OSError as e:
+            log(f"пульс не записан ({os.path.basename(dest)}): {e}")
 
 
 if __name__ == "__main__":

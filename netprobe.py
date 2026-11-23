@@ -3,12 +3,13 @@
 1. dns_udp — вопрос обычному DNS-серверу по UDP (для сравнения с ответом по защищённому DNS: так ищут подмену).
 2. direct_probe — прямая проверка сервера: порт, TLS с нужным именем, и набирается ли по одному соединению NEED байт.
    Сайты-прикрытия маленькие, поэтому объём набирается повторными запросами страницы по одному соединению:
-   обрыв «после 16–20 КБ» режет соединение, а не файл.
+   обрыв «после 16–20 КБ» режет соединение, а не файл. С verify — ещё сверка сертификата (чужой сертификат ≠ «нет связи»).
 3. tcp_trace — трассировка TCP SYN до порта (системный traceroute -T): дошли ли пакеты и где оборвались.
 """
 import http.client
 import os
 import random
+import select
 import shutil
 import socket
 import ssl
@@ -25,6 +26,13 @@ STALL = 5            # секунд без единого байта — сое�
 MAX_REQS = 80        # больше запросов по одному соединению не делаем
 SMALL_PAGE = 600     # страница меньше (чужой сайт-прикрытие отвечает переадресацией) — объём не набрать, не судим
 SMALL_AFTER = 6      # по стольким ответам решаем, что страница мала
+PULL_CHUNK = 16 * 1024  # тело ответа читаем кусками не больше этого
+# Срок pull вышел, объём не набран, а соединение перед этим молчало дольше STALL * DEADLINE_IDLE_PART — это «встало»,
+# а не «не уложились». Буквально «молчало дольше STALL» к сроку почти не бывает: ожидание у срока урезается до остатка
+# (меньше STALL), поэтому порог — половина STALL; молчание дольше STALL им тоже покрыто. Поток, который просто
+# медленный, приносит данные чаще и остаётся «deadline».
+DEADLINE_IDLE_PART = 0.5  # доля STALL
+CERT_BUDGET = 4      # секунд на сверку сертификата (verify) всего: соединение и рукопожатие вместе
 
 
 # ---------- DNS по UDP ----------
@@ -129,6 +137,13 @@ def pull(sock, hostname, need=NEED, deadline=12):
     conn = http.client.HTTPConnection(hostname)
     conn.sock, conn.auto_open = sock, 0  # соединение уже открыто нами; заново (и без TLS) не открывать
     got, t_end = 0, time.time() + deadline
+    t_last = time.time()  # когда последний раз что-то пришло (заголовки ответа или кусок тела)
+
+    def at_deadline():
+        # срок вышел, объём не набран: если перед этим соединение молчало дольше STALL * DEADLINE_IDLE_PART — встало
+        # («timeout», probe_class — «stall»), а не просто не уложилось; так и старый probe_class поймёт верно
+        return got, "timeout" if got < need and time.time() - t_last > STALL * DEADLINE_IDLE_PART else "deadline"
+
     for n in range(MAX_REQS):
         if got >= need:
             return got, "ok"
@@ -136,22 +151,141 @@ def pull(sock, hostname, need=NEED, deadline=12):
             return got, "small"
         left = t_end - time.time()
         if left <= 0:
-            return got, "deadline"
+            return at_deadline()
         try:
             sock.settimeout(min(STALL, left))
             conn.request("GET", "/", headers={"User-Agent": UA, "Accept-Encoding": "identity", "Connection": "keep-alive"})
             r = conn.getresponse()
-            got += len(r.read()) + 200  # 200 — примерно заголовки ответа
+            got += 200  # примерно заголовки ответа
+            t_last = time.time()
+            # тело кусками, не больше need - got за раз и без накопления в памяти; срок — на каждом куске
+            while got < need:
+                left = t_end - time.time()
+                if left <= 0:
+                    return at_deadline()
+                sock.settimeout(min(STALL, left))
+                chunk = r.read1(min(PULL_CHUNK, need - got))
+                if not chunk:
+                    break  # ответ кончился — следующий запрос по тому же соединению
+                got += len(chunk)
+                t_last = time.time()
         except (socket.timeout, TimeoutError):
-            return got, "timeout"
+            # ожидание урезано сроком — «не уложились» (или «встало», если молчало долго — см. at_deadline)
+            return at_deadline() if time.time() >= t_end - 0.05 else (got, "timeout")
         except (http.client.HTTPException, OSError):
             return got, "closed"
     return (got, "ok") if got >= need else (got, "small")
 
 
-def direct_probe(host, port=443, sni=None, need=NEED, tls=True, deadline=12):
+CERT_BAD = ("name", "chain", "expired")   # сертификат не тот: другое имя, не заверен, просрочен
+CERT_CAFILE = None                         # свои корневые сертификаты вместо системных (тесты)
+
+
+def _der_len(der, pos):
+    """Длина DER по позиции pos: (длина, где начинается значение)."""
+    n = der[pos]
+    if n < 0x80:
+        return n, pos + 1
+    k = n & 0x7F
+    return int.from_bytes(der[pos + 1:pos + 1 + k], "big"), pos + 1 + k
+
+
+def cert_cn(der):
+    """На чьё имя сертификат (DER, без проверки): первое имя из SAN, нет SAN — последнее CN (первое — издателя).
+    Только для текста сообщения; None — не нашлось."""
+    try:
+        pos = der.index(b"\x06\x03\x55\x1d\x11") + 5   # subjectAltName
+        if der[pos] == 0x01:                            # отметка «критичное»
+            pos += 3
+        if der[pos] == 0x04:
+            _, pos = _der_len(der, pos + 1)
+            if der[pos] == 0x30:
+                size, pos = _der_len(der, pos + 1)
+                end = pos + size
+                while pos < end:
+                    tag = der[pos]
+                    n, pos = _der_len(der, pos + 1)
+                    if tag == 0x82:                     # dNSName
+                        return der[pos:pos + n].decode("ascii", "replace")
+                    pos += n
+    except (ValueError, IndexError, TypeError):
+        pass
+    oid, found, pos = b"\x06\x03\x55\x04\x03", None, 0
+    try:
+        while True:
+            pos = der.index(oid, pos) + len(oid)
+            tag, n = der[pos], der[pos + 1]
+            if tag in (0x0C, 0x13, 0x16, 0x14) and n < 0x80:  # UTF8String, PrintableString, IA5String, T61String
+                found = der[pos + 2:pos + 2 + n].decode("utf-8", "replace")
+    except (ValueError, IndexError, TypeError):
+        pass
+    return found
+
+
+def _cert_verdict(e):
+    code = getattr(e, "verify_code", None)
+    return "name" if code == 62 else "expired" if code == 10 else "chain"  # 62 — HOSTNAME_MISMATCH
+
+
+def cert_check(addr, port, name, timeout=6, budget=None):
+    """Рукопожатие TLS с проверкой цепочки и имени name: 'ok' | 'name' (выдан на другое имя) | 'expired' |
+    'chain' (не заверен доверенным центром) | None — второе соединение не вышло или не уложилось, судить не о чем.
+    budget — не дольше стольких секунд всего (соединение и рукопожатие вместе, строго: сервер, присылающий
+    рукопожатие по байту, срок не растянет); без него — как раньше: соединение до 5 с, рукопожатие до timeout."""
+    end = time.time() + budget if budget is not None else None
+    try:
+        sock = socket.create_connection((addr, port), timeout=5 if end is None else max(0.1, min(5, budget)))
+    except OSError:
+        return None
+    try:
+        ctx = ssl.create_default_context(cafile=CERT_CAFILE)
+        if end is None:
+            sock.settimeout(timeout)
+            try:
+                sock = ctx.wrap_socket(sock, server_hostname=name)
+                return "ok"
+            except ssl.SSLCertVerificationError as e:
+                return _cert_verdict(e)
+            except (ssl.SSLError, OSError, ValueError):
+                return None
+        sock.setblocking(False)
+        try:
+            sock = ctx.wrap_socket(sock, server_hostname=name, do_handshake_on_connect=False)
+        except (ssl.SSLError, OSError, ValueError):
+            return None
+        while True:
+            try:
+                sock.do_handshake()
+                return "ok"
+            except ssl.SSLWantReadError:
+                want = ([sock], [])
+            except ssl.SSLWantWriteError:
+                want = ([], [sock])
+            except ssl.SSLCertVerificationError as e:
+                return _cert_verdict(e)
+            except (ssl.SSLError, OSError, ValueError):
+                return None
+            left = end - time.time()
+            if left <= 0:
+                return None  # не уложились в бюджет — не судим
+            try:
+                ready = select.select(want[0], want[1], [], left)
+            except (OSError, ValueError):
+                return None
+            if not (ready[0] or ready[1]):
+                return None
+    finally:
+        try:
+            sock.close()
+        except OSError:
+            pass
+
+
+def direct_probe(host, port=443, sni=None, need=NEED, tls=True, deadline=12, verify=False):
     """Прямая проверка host:port: адрес, порт, TLS с именем sni, объём по одному соединению.
-    {"addr", "tcp": open|refused|timeout|error|dns, "tcp_ms", "tls": True|False|None, "bytes", "need", "end"}"""
+    {"addr", "tcp": open|refused|timeout|error|dns, "tcp_ms", "tls": True|False|None, "bytes", "need", "end"}.
+    verify — после проверки ещё рукопожатие со сверкой сертификата (для каналов с обычным TLS, не Reality):
+    "cert": ok|name|chain|expired|None (см. cert_check), "cert_cn" — на чьё имя сертификат, который отдали."""
     res = {"host": host, "addr": None, "tcp": "error", "tcp_ms": None, "tls": None, "bytes": None, "need": need, "end": None}
     res["addr"], res["dns"] = resolve(host, port)
     if not res["addr"]:
@@ -183,12 +317,24 @@ def direct_probe(host, port=443, sni=None, need=NEED, tls=True, deadline=12):
             except (ssl.SSLError, OSError, ValueError):
                 res["tls"] = False
                 return res
+            if verify:
+                try:
+                    res["cert_cn"] = cert_cn(sock.getpeercert(binary_form=True) or b"")
+                except (ssl.SSLError, OSError, ValueError):
+                    res["cert_cn"] = None
         res["bytes"], res["end"] = pull(sock, sni or host, need, deadline)
     finally:
         try:
             sock.close()
         except OSError:
             pass
+    if verify and res["tls"]:
+        # отдельным соединением и после замера объёма: сверка не мешает пробе, а чужой сертификат отличим от «нет связи».
+        # Бюджет — не больше CERT_BUDGET и только остаток худшего случая пробы без сверки (соединение 5 + TLS 6 +
+        # pull deadline): с verify /probe точки не дольше, чем без него, и укладывается в ожидание blockwatch (25 с).
+        # Не осталось и секунды (медленный путь съел всё) — сверку пропускаем: None, «не судим».
+        left = min(CERT_BUDGET, t0 + 5 + 6 + deadline - time.time())
+        res["cert"] = cert_check(res["addr"], port, sni or host, budget=left) if left >= 1 else None
     return res
 
 
@@ -504,7 +650,8 @@ def socks_load(port, url=VPN_URL, need=VPN_NEED, timeout=25):
 
 
 def probe_class(r):
-    """Итог прямой проверки одним словом: ok | stall (встало, не набрав объём) | tls | tcp | dns | none (не проверялось)."""
+    """Итог прямой проверки одним словом: ok | cert (TLS отвечает, но сертификат не тот) | stall (встало, не набрав
+    объём) | tls | tcp | dns | none (не проверялось). «cert» — только если проба шла со сверкой (verify)."""
     if not r:
         return "none"
     if r["tcp"] == "dns":
@@ -513,6 +660,8 @@ def probe_class(r):
         return "tcp"
     if r["tls"] is False:
         return "tls"
+    if r.get("cert") in CERT_BAD:
+        return "cert"
     if r["end"] == "timeout" and (r["bytes"] or 0) < r["need"]:
         return "stall"
     return "ok"

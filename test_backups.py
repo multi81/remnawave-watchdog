@@ -1,9 +1,18 @@
 """Тесты слежки за бэкапами (ddos_collect.backups + ddoswatch.backup_*), без сети: python test_backups.py"""
+import calendar
 import json
 import os
 import sys
 import tempfile
 import time
+
+# Журналы бэкапов пишутся по местному времени серверов (МСК), а сообщения — по МСК: часовой пояс машины, где идут
+# тесты, не должен влиять. Местное время в тесте — МСК (UTC+3, без перехода на летнее с 2014 г.): на Linux — через TZ,
+# а time.mktime подменяем всегда (на Windows TZ на лету не сменить).
+os.environ["TZ"] = "MSK-3"
+if hasattr(time, "tzset"):
+    time.tzset()
+time.mktime = lambda t: calendar.timegm(t) - 3 * 3600
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import ddos_collect as col  # noqa: E402

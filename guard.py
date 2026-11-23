@@ -8,7 +8,9 @@
   - сторож работает, но у rf1 нет выхода в интернет — каналы не проверяются;
   - сторож работает, но не может отправить сообщения: копится очередь либо не ушёл отчёт.
 Смена состояния — после CONFIRM проверок подряд; напоминание раз в REMIND_EVERY; возврат в норму — с длительностью.
-Настройки — /etc/channel-watch-guard/guard.env: HEARTBEAT_URL, TG_TOKEN, TG_CHAT, по желанию GUARD_NAME.
+Пульс не читается, а контрольный узел (api.telegram.org:443) тоже недоступен — сбой своей сети: состояние не меняется.
+Настройки — /etc/channel-watch-guard/guard.env: HEARTBEAT_URL, TG_TOKEN, TG_CHAT, по желанию GUARD_NAME
+и GUARD_CONTROL (контрольный узел, «хост:порт»).
 Вручную: guard.py --show — что видно сейчас; guard.py --test — то же и пробное сообщение в Telegram.
 """
 import datetime as dt
@@ -32,6 +34,7 @@ CONFIRM = 2               # сколько проверок подряд нуж�
 REMIND_EVERY = 3 * 3600   # напоминать, пока сторож не в порядке
 MSK = dt.timezone(dt.timedelta(hours=3))
 UA = "channel-watch-guard"
+CONTROL = "api.telegram.org:443"  # контрольный узел: недоступен он — не видно и rf1, это сбой своей сети
 
 TITLES = {"UNREACH": "🔴 <b>rf1 не отвечает — сторож каналов недоступен</b>",
           "STALE": "🟠 <b>Сторож каналов на rf1 не работает</b>",
@@ -64,8 +67,13 @@ def fetch(url):
             req = urllib.request.Request(url, headers={"User-Agent": UA, "Cache-Control": "no-cache"})
             with urllib.request.urlopen(req, timeout=15) as r:
                 raw = r.read(65536)
-        except urllib.error.HTTPError:
-            return "nofile", None
+        except urllib.error.HTTPError as e:
+            if e.code < 500:
+                return "nofile", None
+            # 5xx — сайт на rf1 сломан, а не «файла нет»: как сбой связи (порт открыт — так и скажем)
+            if attempt == 1:
+                time.sleep(5)
+            continue
         except (OSError, http.client.HTTPException):
             if attempt == 1:
                 time.sleep(5)
@@ -88,6 +96,18 @@ def port_open(url):
         return False
 
 
+def control_ok(env):
+    """Доступен ли контрольный узел (TCP) — отличает «rf1 недоступен» от «у этого сервера нет сети»."""
+    host, _, port = (env.get("GUARD_CONTROL") or CONTROL).rpartition(":")
+    if not host.strip("[]"):
+        return False
+    try:
+        socket.create_connection((host.strip("[]"), int(port)), timeout=6).close()
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def hm(ts):
     return dt.datetime.fromtimestamp(ts, MSK).strftime("%H:%M")
 
@@ -105,7 +125,8 @@ def dur(seconds):
 
 def overdue_report(hb, now):
     """Час отчёта (UTC), который уже должен был уйти, но не ушёл; None — отчёты идут вовремя."""
-    hours = [h for h in hb.get("hours", []) if isinstance(h, int)]
+    hours = hb.get("hours") if isinstance(hb.get("hours"), list) else []
+    hours = [h for h in hours if isinstance(h, int) and not isinstance(h, bool) and 0 <= h <= 23]  # чужой час — мимо
     if not hours:
         return None
     limit = dt.datetime.fromtimestamp(now - REPORT_GRACE, dt.timezone.utc)
@@ -188,6 +209,8 @@ def save_state(st):
 
 def look(env, now):
     kind, hb = fetch(env.get("HEARTBEAT_URL", ""))
+    if kind == "unreach" and not control_ok(env):
+        return "SELF", "пульс не читается, но недоступен и контрольный узел — сбой сети этого сервера, а не rf1"
     return observe(kind, hb, now, kind == "unreach" and port_open(env.get("HEARTBEAT_URL", "")))
 
 
@@ -197,7 +220,9 @@ def main():
     s = load_state(now)
     obs, detail = look(env, now)
     alerts = []
-    if obs == s["status"]:
+    if obs == "SELF":
+        pass  # своя сеть не работает — о rf1 ничего не известно, состояние и счёт подтверждений не трогаем
+    elif obs == s["status"]:
         s["cand"], s["streak"], s["detail"] = obs, 0, detail
     else:
         if s["cand"] == obs:
