@@ -109,7 +109,8 @@ def dns_flags(x):
 
 
 def tune_flags(t):
-    """Сетевой профиль слетел (node_tune.sh: bbr, fq или cake, таблица соединений ≥ 65536, MPTCP выключен) — короткие пометки."""
+    """Сетевой профиль слетел (node_tune.sh: bbr, fq или cake, таблица соединений ≥ 65536, MPTCP выключен и слушателей
+    MPTCP нет ни в сети хоста, ни в контейнерах со своей сетью) — короткие пометки."""
     if not isinstance(t, dict):
         return []   # старый маячок без профиля — молчим
     out = []
@@ -119,6 +120,15 @@ def tune_flags(t):
         out.append(f"очередь {t['qdisc']}, не fq")
     if t.get("mptcp") == 1:
         out.append("MPTCP включён")
+    n = t.get("mptcp_listeners")   # sysctl 0 не гасит уже открытые слушатели; старый маячок без поля — молчим
+    if isinstance(n, int) and not isinstance(n, bool) and n > 0:
+        out.append(f"MPTCP-слушателей {n} (нужен перезапуск служб)")
+    ct = t.get("mptcp_listeners_ct")   # контейнеры со своей сетью: там свой net.mptcp.enabled; None — не узнать
+    if isinstance(ct, dict):
+        for name, k in sorted(ct.items(), key=lambda x: str(x[0])):
+            if isinstance(k, int) and not isinstance(k, bool) and k > 0:
+                out.append(f"MPTCP в контейнере {str(name)[:64]}: {k} "
+                           "(перезапустить контейнер или net.mptcp.enabled=0 в sysctls)")
     if isinstance(t.get("conntrack_max"), int) and t["conntrack_max"] < 65536:
         out.append(f"таблица соединений {t['conntrack_max']}")
     return out

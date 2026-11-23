@@ -1,17 +1,27 @@
 #!/usr/bin/env python3
-"""channel-watch: единый список сканеров (в первую очередь сканеров РКН) для щита на всех серверах.
+"""channel-watch: единый список сканеров для щита на всех серверах. Владелец 22.10: «защита от сканеров … единую,
+в первую очередь от сканеров ркн»; «все три списка, скачивание списков разрешаю» (с 05.11 списков пять).
 
-Раз в сутки (таймер channel-watch-scanlists) на rf1:
-  1. скачивает списки shadow-netlab/traffic-guard-lists: antiscanner, government_networks, skipa (те же, что у traffic-guard);
-  2. проверяет каждый: разобрался, не пустой, не уменьшился больше чем на SHRINK_MAX против прошлой удачной копии —
-     иначе берётся прошлая копия (и приходит сообщение);
-  3. добавляет свои сети (/etc/channel-watch/scanners-extra.txt), вырезает исключения (scanners-exclude.txt), ваши
-     адреса (owner.txt) и все серверы из ddos.json;
+Раз в сутки (таймер channel-watch-scanlists) на сервере сторожа:
+  1. скачивает 5 списков (LISTS): antiscanner, government_networks, skipa из shadow-netlab/traffic-guard-lists, госорганы
+     C24Be и AntiScanner sngvy; плюс свой список «по поведению» (behavscan.py пишет behavior.list рядом);
+  2. проверяет каждый: разобрался, не пустой, не уменьшился больше чем на SHRINK_MAX и не вырос больше чем в GROW_MAX
+     раза (по числу сетей или адресов) против прошлой удачной копии — иначе берётся прошлая копия (и приходит сообщение);
+     сети шире MIN_PREFIX отбрасываются;
+  3. добавляет свои сети (/etc/channel-watch/scanners-extra.txt), вырезает исключения (scanners-exclude.txt), ваши адреса
+     (owner.txt), все наши серверы и NEVER_LIST (Telegram, Cloudflare, GitHub, ip-api, публичные DNS); склеенное шире
+     MIN_PREFIX дробит обратно (щит шире не принимает); итог больше ADDR4_MAX адресов IPv4, ADDR6_MAX сетей /32 IPv6
+     или ADDR6_NETS_MAX сетей IPv6 (behavior.list — по /64 на адрес) не рассылает;
   4. рассылает итог на все серверы щита (ключ щита, команда scanners-load) и спрашивает, кто из наших клиентов попал в
      список (scan-clients) — это строка в отчёте сторожа, решение за вами;
   5. пишет итог в /var/lib/channel-watch/scanners/summary.json (для отчёта 3 раза в день).
-Сообщение — только когда что-то не так (список не скачался или резко уменьшился, сервер не принял) или в
-списке появились новые наши клиенты. Запуск: scanlists.py [--dry] [--only ИМЯ]   (--dry — скачать и проверить, никуда не слать; --only — один сервер)
+Сообщение — только когда что-то не так (список не скачался, резко уменьшился или вырос, сервер не принял или
+отверг часть сетей) или в списке появились новые наши клиенты.
+Если итог не рассылается (больше ADDR4_MAX, ADDR6_MAX или ADDR6_NETS_MAX, пустой), summary.json всё равно пишется с заметкой и вам
+уходит сообщение; щиты остаются на прошлом списке, копии списков «прошлыми» не сохраняются.
+Запуск: scanlists.py [--dry] [--only ИМЯ] [--accept СПИСОК]
+  --dry — скачать и проверить, никуда не слать; --only — один сервер; --accept — принять новую копию списка вопреки
+  «резко вырос» или «резко уменьшился» (можно несколько раз).
 """
 import datetime as dt
 import html
@@ -19,17 +29,19 @@ import ipaddress
 import json
 import os
 import re
+import socket
 import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 
 ETC = "/etc/channel-watch"
 DIR = "/var/lib/channel-watch/scanners"
 BASE = "https://raw.githubusercontent.com/shadow-netlab/traffic-guard-lists/refs/heads/main/public/"
 LISTS = {"antiscanner": "сканеры", "government_networks": "государственные сети", "skipa": "СКИПА (РКН)",
          "c24be_gov": "госорганы РФ (C24Be)", "antiscanner_sngvy": "сканеры и парсеры подписок (AntiScanner)"}
-# списки не из shadow-netlab — свой адрес (C24Be/AS_Network_List, BSD-2, обновляется ежедневно; IPv4 и IPv6)
+# списки не из shadow-netlab — свой адрес (C24Be/AS_Network_List, BSD-2, обновляется ежедневно; IPv4 и IPv6).
 URLS = {"c24be_gov": "https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist.txt",
         # sngvy/AntiScanner: ГРЧЦ/CyberOK, ЕСПД, Censys, Shodan, Netlas, «парсеры подписок» и др. (точечные сети)
         "antiscanner_sngvy": "https://gist.githubusercontent.com/sngvy/07cee7ac810c9d222fbebddff8c1d1b8/raw/blacklist.txt"}
@@ -43,7 +55,48 @@ LOCAL_NAMES = {BEHAVIOR: "по поведению на наших сервера
 def list_url(name):
     return URLS.get(name) or BASE + name + ".list"
 SHRINK_MAX = 0.3
-MIN_PREFIX = {4: 16, 6: 28}
+GROW_MAX = 1.5         # вырос больше чем в 1,5 раза (сетей или адресов) — подозрительно, берём прошлую копию
+GROW_ADD = {4: 65536, 6: 2 ** 96}   # рост по адресам считаем, только если прибавилось больше /16 IPv4 или /32 IPv6
+MIN_PREFIX = {4: 16, 6: 32}   # IPv6 шире /32 — это уже выделение целого оператора
+ADDR4_MAX = 2000000    # предел адресов IPv4 в итоге: 22.11 по пяти спискам ~691 тыс., предел с запасом в ~3 раза
+ADDR6_MAX = 40         # предел IPv6 в итоге, в сетях /32: 23.11 по пяти спискам ~14 /32 (250 сетей), запас ~3 раза
+ADDR6_NETS_MAX = 10000   # предел числа сетей IPv6 в итоге: behavior.list даёт по /64 на адрес — охват мал, а записей
+#                          в наборе щита много (23.11 по пяти спискам ~250 сетей IPv6)
+ACCEPT = "python3 /opt/channel-watch/scanlists.py --accept %s"   # как принять «резко вырос» или «резко уменьшился»
+# никогда не вносить: при «отбрасывать» иначе отрежем себе Telegram, Cloudflare, GitHub, ip-api и DNS
+NEVER_LIST = [
+    # Telegram
+    "149.154.160.0/20", "91.108.4.0/22", "91.108.8.0/22", "91.108.12.0/22", "91.108.16.0/22", "91.108.20.0/22",
+    "91.108.56.0/22", "95.161.64.0/20", "185.76.151.0/24",
+    # Cloudflare (официальные диапазоны IPv4)
+    "173.245.48.0/20", "103.21.244.0/22", "103.22.200.0/22", "103.31.4.0/22", "141.101.64.0/18", "108.162.192.0/18",
+    "190.93.240.0/20", "188.114.96.0/20", "197.234.240.0/22", "198.41.128.0/17", "162.158.0.0/15", "104.16.0.0/13",
+    "104.24.0.0/14", "172.64.0.0/13", "131.0.72.0/22",
+    # GitHub
+    "140.82.112.0/20", "185.199.108.0/22", "192.30.252.0/22", "143.55.64.0/20",
+    # Telegram (ещё одна сеть из официального cidr.txt)
+    "91.105.192.0/23",
+    # ip-api
+    "208.95.112.0/24",
+    # публичные DNS
+    "1.1.1.1/32", "1.0.0.1/32", "8.8.8.8/32", "8.8.4.4/32", "9.9.9.9/32", "149.112.112.112/32", "77.88.8.8/32",
+    "77.88.8.1/32", "208.67.222.222/32", "208.67.220.220/32",
+    # IPv6: Telegram
+    "2001:67c:4e8::/48", "2001:b28:f23c::/48", "2001:b28:f23d::/48", "2001:b28:f23f::/48", "2a0a:f280::/32",
+    # IPv6: Cloudflare (официальные диапазоны)
+    "2400:cb00::/32", "2606:4700::/32", "2803:f800::/32", "2405:b500::/32", "2405:8100::/32", "2a06:98c0::/29",
+    "2c0f:f248::/32",
+    # IPv6: GitHub (2606:50c0::/32 — raw.githubusercontent.com, откуда качаются списки)
+    "2a0a:a440::/29", "2606:50c0::/32",
+    # IPv6: публичные DNS (Google, Cloudflare, Quad9, Яндекс, OpenDNS)
+    "2001:4860:4860::8888/128", "2001:4860:4860::8844/128", "2606:4700:4700::1111/128", "2606:4700:4700::1001/128",
+    "2620:fe::fe/128", "2620:fe::9/128", "2a02:6b8::feed:0ff/128", "2a02:6b8:0:1::feed:0ff/128", "2620:119:35::35/128",
+    "2620:119:53::53/128",
+]
+
+
+def never_networks():
+    return [ipaddress.ip_network(x) for x in NEVER_LIST]
 
 
 def owner_addrs():
@@ -56,8 +109,8 @@ def owner_addrs():
     return [x for x in (ln.split("#")[0].strip() for ln in lines) if x]
 
 
-def parse(text):
-    """-> (список сетей, число мусорных строк). Слишком широкие — в мусор."""
+def parse(text, wide=False):
+    """-> (список сетей, число мусорных строк). Слишком широкие — в мусор; wide=True — любой ширины (исключения)."""
     nets, bad = [], 0
     for ln in text.splitlines():
         x = ln.split("#")[0].strip()
@@ -68,7 +121,7 @@ def parse(text):
         except ValueError:
             bad += 1
             continue
-        if n.prefixlen < MIN_PREFIX[n.version]:
+        if not wide and n.prefixlen < MIN_PREFIX[n.version]:
             bad += 1
             continue
         nets.append(n)
@@ -90,37 +143,115 @@ def fetch(name, routes=(None,)):
     return None
 
 
-def choose(name, text, prev_text):
-    """Новая копия или прошлая. -> (текст, сети, заметка или '')."""
+def choose(name, text, prev_text, accept=False):
+    """Новая копия или прошлая. -> (текст, сети, заметка или ''). accept=True (--accept) — ни рост, ни уменьшение не
+    проверять (вы посмотрели и приняли копию)."""
     prev_nets = parse(prev_text)[0] if prev_text else []
     if text is None:
         return prev_text or "", prev_nets, "%s: не скачался — взята прошлая копия" % name if prev_text else "%s: не скачался, прошлой копии нет" % name
     nets, bad = parse(text)
     if not nets:
         return prev_text or "", prev_nets, "%s: пустой или не разобрался — взята прошлая копия" % name
-    if prev_nets and len(nets) < (1 - SHRINK_MAX) * len(prev_nets):
-        return prev_text, prev_nets, "%s: резко уменьшился (%d → %d сетей) — взята прошлая копия" % (name, len(prev_nets), len(nets))
+    if prev_nets and not accept and len(nets) < (1 - SHRINK_MAX) * len(prev_nets):
+        return prev_text, prev_nets, ("%s: резко уменьшился (%d → %d сетей) — взята прошлая копия; если уменьшение законное,"
+                                      " принять: %s") % (name, len(prev_nets), len(nets), ACCEPT % name)
+    if prev_nets and not accept:
+        grew = len(nets) > GROW_MAX * len(prev_nets)
+        for v in (4, 6):   # охват — по семействам, иначе IPv6 заслонит IPv4; мелкая добавка к маленькому списку —
+            pv, nv = volume(prev_nets, v), volume(nets, v)   # не рост; семейства не было, а стало много — рост
+            grew = grew or (nv - pv > GROW_ADD[v] and nv > GROW_MAX * pv)
+        if grew:
+            return prev_text, prev_nets, ("%s: резко вырос (%d → %d сетей, %d → %d адресов IPv4, %s → %s сетей /32 IPv6)"
+                                          " — взята прошлая копия; если рост законный, принять: %s") % (
+                name, len(prev_nets), len(nets), volume(prev_nets, 4), volume(nets, 4), v6_32(prev_nets), v6_32(nets),
+                ACCEPT % name)
     return text, nets, ""
 
 
-def own_networks(hosts):
+def volume(nets, v=4):
+    """Сколько адресов в сетях семейства v (пересечения не вычитаются)."""
+    return sum(n.num_addresses for n in nets if n.version == v)
+
+
+def v6_32(nets):
+    """Охват IPv6 в сетях /32 (для заметок и предела ADDR6_MAX), округлён до сотых."""
+    return round(volume(nets, 6) / 2 ** 96, 2)
+
+
+def _load_json(etc, name):
+    try:
+        return json.load(open(os.path.join(etc, name), encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+
+
+def host_names(etc=None, load=None):
+    """Хосты nodes.json (host) и vantage.json (хост из url) — адреса и имена как есть."""
+    etc = etc or ETC
+    load = load or (lambda name: _load_json(etc, name))
+    names = []
+    nodes, vantage = load("nodes.json"), load("vantage.json")
+    for n in nodes if isinstance(nodes, list) else []:
+        if isinstance(n, dict) and n.get("host"):
+            names.append(str(n["host"]))
+    for a in vantage if isinstance(vantage, list) else []:
+        if isinstance(a, dict) and a.get("url"):
+            try:
+                h = urllib.parse.urlparse(str(a["url"])).hostname
+            except ValueError:
+                h = None
+            if h:
+                names.append(h)
+    return names
+
+
+def resolve_names(names, resolve=None, failed=None):
+    """Адреса и имена -> сети (/32, /128 или как записано). Имена разрешаются в адреса (v4 и v6); что не разрешилось —
+    молча пропускаем, имя добавляется в failed (счётчик в summary)."""
+    resolve = resolve or socket.getaddrinfo
     out = []
-    for x in owner_addrs() + [h.get("host", "") for h in hosts]:
+    for h in dict.fromkeys(x for x in names if x):
         try:
-            out.append(ipaddress.ip_network(x, strict=False))
+            out.append(ipaddress.ip_network(h, strict=False))
+            continue
         except ValueError:
             pass
-    return out
+        got = []
+        try:
+            for info in resolve(h, None):
+                try:
+                    got.append(ipaddress.ip_network(info[4][0].split("%")[0]))
+                except (ValueError, IndexError, TypeError):
+                    pass
+        except (OSError, UnicodeError, ValueError):
+            pass
+        if not got and failed is not None:
+            failed.append(h)
+        out += got
+    return list(dict.fromkeys(out))
+
+
+def own_hosts(etc=None, resolve=None, load=None, failed=None):
+    """Хосты nodes.json и vantage.json как сети (имена разрешены). Только чтение файлов и getaddrinfo."""
+    return resolve_names(host_names(etc, load), resolve, failed)
+
+
+def own_networks(hosts, etc=None, resolve=None, load=None, failed=None):
+    """Свои: ваши адреса (owner.txt), серверы ddos.json, хосты nodes.json и vantage.json. Имена разрешаются в адреса,
+    а не теряются; неразрешённые — в failed."""
+    names = owner_addrs() + [str(h.get("host") or "") for h in hosts if isinstance(h, dict)] + host_names(etc, load)
+    return resolve_names(names, resolve, failed)
 
 
 def combine(per_list, extra, exclude, own):
-    """-> (итоговые сети, сколько вырезано своих/исключений). Пересечения со своими вырезаются из сетей списка."""
+    """-> (итоговые сети, сколько вырезано своих/исключений/NEVER_LIST). Пересечения со своими вырезаются из сетей списка.
+    Склеенное шире MIN_PREFIX дробится обратно: щит шире не принимает."""
     nets = [n for ns in per_list.values() for n in ns] + extra
     cut = 0
     out = []
     for v in (4, 6):
         res = list(ipaddress.collapse_addresses([n for n in nets if n.version == v]))
-        for a in [x for x in own + exclude if x.version == v]:
+        for a in [x for x in own + exclude + never_networks() if x.version == v]:
             nxt = []
             for n in res:
                 if n.overlaps(a):
@@ -130,7 +261,8 @@ def combine(per_list, extra, exclude, own):
                 else:
                     nxt.append(n)
             res = nxt
-        out += list(ipaddress.collapse_addresses(res))
+        for n in ipaddress.collapse_addresses(res):
+            out += list(n.subnets(new_prefix=MIN_PREFIX[v])) if n.prefixlen < MIN_PREFIX[v] else [n]
     return out, cut
 
 
@@ -223,31 +355,66 @@ def write(path, text):
     os.replace(path + ".tmp", path)
 
 
-def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=DIR, users=None):
+def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=DIR, users=None, resolve=None):
     """Один проход. -> итог (dict). Все внешние вызовы подставляются (тесты)."""
     now = now or time.time()
     dry = "--dry" in argv
-    notes, per_list = [], {}
+    accept = {argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--accept"}
+    notes, per_list, fresh = [], {}, {}
     for name in LISTS:
         prev = read(os.path.join(base, name + ".list"))
-        text, nets, note = choose(name, fetcher(name), prev)
+        text, nets, note = choose(name, fetcher(name), prev, accept=name in accept)
         if note:
             notes.append(note)
-        if text and not note and not dry:
-            write(os.path.join(base, name + ".list"), text)
+        if text and not note:
+            fresh[name] = text   # «прошлой» копией станет, только если итог разослан
         per_list[name] = nets
+    for name in sorted(accept - set(LISTS)):
+        notes.append("--accept %s: такого списка нет (есть: %s)" % (name, ", ".join(LISTS)))
     behav = parse(read(os.path.join(base, BEHAVIOR + ".list")))[0]
     if behav:
         per_list[BEHAVIOR] = behav
     extra = parse(read(os.path.join(ETC, "scanners-extra.txt")))[0]
-    exclude = parse(read(os.path.join(ETC, "scanners-exclude.txt")))[0]
-    final, cut = combine(per_list, extra, exclude, own_networks(hosts.values()))
-    summary = {"ts": int(now), "nets": len(final), "per_list": {k: len(v) for k, v in per_list.items()},
-               "extra": len(extra), "cut": cut, "notes": notes, "hosts": {}, "clients": {}}
-    if dry or not final:
-        if not final:
-            notes.append("итоговый список пуст — не рассылаю")
+    exclude = parse(read(os.path.join(ETC, "scanners-exclude.txt")), wide=True)[0]
+    unresolved = []
+    final, cut = combine(per_list, extra, exclude, own_networks(hosts.values(), resolve=resolve, failed=unresolved))
+    addrs4, addrs6 = volume(final, 4), v6_32(final)
+    nets6 = sum(1 for n in final if n.version == 6)
+    summary = {"ts": int(now), "nets": len(final), "addrs4": addrs4, "addrs6_32": addrs6,
+               "per_list": {k: len(v) for k, v in per_list.items()}, "extra": len(extra), "cut": cut,
+               "unresolved": len(unresolved), "notes": notes, "hosts": {}, "clients": {}}
+    hold = []
+    if addrs4 > ADDR4_MAX:
+        hold.append("в итоге %d адресов IPv4, больше предела %d — не рассылаю" % (addrs4, ADDR4_MAX))
+    if addrs6 > ADDR6_MAX:
+        hold.append("в итоге IPv6 на %s сетей /32, больше предела %d — не рассылаю" % (addrs6, ADDR6_MAX))
+    if nets6 > ADDR6_NETS_MAX:
+        hold.append("в итоге %d сетей IPv6, больше предела %d — не рассылаю" % (nets6, ADDR6_NETS_MAX))
+    if not final:
+        hold.append("итоговый список пуст — не рассылаю")
+    notes += hold
+    if dry:
         return summary
+    try:
+        prev = json.loads(read(os.path.join(base, "summary.json"), "{}") or "{}")
+    except ValueError:
+        prev = {}
+    prev = prev if isinstance(prev, dict) else {}
+    names = dict(LISTS, **LOCAL_NAMES)
+    head = html.escape("Сетей в списке: %d (%s, свои %d)" % (len(final), ", ".join(
+        "%s %d" % (names.get(k, k), len(v)) for k, v in per_list.items()), len(extra)))
+    unres_line = ("⚠️ Имён наших серверов не разрешилось: %d — их адреса из списка не вырезаны" % len(unresolved)
+                  if unresolved else "")
+    if hold:   # не рассылаем, но вы должны узнать: сводка для отчёта и сообщение
+        summary["sent"] = False
+        summary["clients"] = prev.get("clients") or {}   # щиты остались на прошлом списке — и клиенты в нём те же
+        write(os.path.join(base, "summary.json"), json.dumps(summary, ensure_ascii=False))
+        if send:
+            send("\n".join(["🔎 <b>Сканеры: список не разослан</b>", head] + ["⚠️ " + html.escape(n) for n in notes]
+                           + ([unres_line] if unres_line else []) + ["Щиты работают на прошлом списке."]))
+        return summary
+    for name, text in fresh.items():
+        write(os.path.join(base, name + ".list"), text)
     body = "".join("%s\n" % n for n in final)
     res, th = {}, []
     for h in hosts:
@@ -257,7 +424,13 @@ def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=
     for t in th:
         t.join(180)
     for h, r in res.items():
-        summary["hosts"][h] = "ok" if (r or {}).get("ok") else "ошибка: %s" % str((r or {}).get("error"))[:80]
+        r = r or {}
+        if not r.get("ok"):
+            summary["hosts"][h] = "ошибка: %s" % str(r.get("error"))[:80]
+        elif r.get("refused_total"):   # принял, но часть сетей отверг (например, шире /16) — видно в сводке
+            summary["hosts"][h] = "ok, отвергнуто %s" % r["refused_total"]
+        else:
+            summary["hosts"][h] = "ok"
     for h in hosts:
         r = run_ctl(h, ["scan-clients"])
         for a, v in ((r or {}).get("clients") or {}).items() if (r or {}).get("ok") else []:
@@ -269,18 +442,22 @@ def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=
         for v in summary["clients"].values():
             if v.get("user") in info:
                 v["info"] = info[v["user"]]
-    prev = json.loads(read(os.path.join(base, "summary.json"), "{}") or "{}")
     new_clients = [a for a in summary["clients"] if a not in (prev.get("clients") or {})]
-    failed = [h for h, s in summary["hosts"].items() if s != "ok"]
+    failed = [h for h, s in summary["hosts"].items() if not s.startswith("ok")]
+    partial = [h for h, s in summary["hosts"].items() if s.startswith("ok") and s != "ok"]
     write(os.path.join(base, "summary.json"), json.dumps(summary, ensure_ascii=False))
-    if send and (notes or failed or new_clients):
-        lines = ["🔎 <b>Сканеры: список обновлён с замечаниями</b>" if notes or failed else "🔎 <b>Сканеры: в списке наши клиенты</b>",
-                 "Сетей в списке: %d (сканеры %d, гос. сети %d, СКИПА %d, свои %d)" % (
-                     len(final), len(per_list.get("antiscanner", [])), len(per_list.get("government_networks", [])),
-                     len(per_list.get("skipa", [])), len(extra))]
-        lines += ["⚠️ " + n for n in notes]
+    if send and (notes or failed or partial or new_clients):
+        lines = ["🔎 <b>Сканеры: список обновлён с замечаниями</b>" if notes or failed or partial
+                 else "🔎 <b>Сканеры: в списке наши клиенты</b>", head]
+        lines += ["⚠️ " + html.escape(n) for n in notes]
+        if unres_line:
+            lines.append(unres_line)
         if failed:
-            lines.append("⚠️ Не приняли список: " + ", ".join("%s (%s)" % (h, summary["hosts"][h]) for h in failed))
+            lines.append("⚠️ Не приняли список: " + ", ".join(
+                "%s (%s)" % (html.escape(h), html.escape(summary["hosts"][h])) for h in failed))
+        if partial:
+            lines.append("⚠️ Приняли не всё: " + ", ".join(
+                "%s (%s)" % (html.escape(h), html.escape(summary["hosts"][h])) for h in partial))
         if new_clients:
             lines.append("Новые наши клиенты в списке (%d) — они будут отрезаны, когда сканеры переведут в «отбрасывать»:" % len(new_clients))
             for a in new_clients[:10]:
@@ -305,7 +482,7 @@ def main(argv):
     print("наших клиентов в списке:", len(s["clients"]))
     if "--dry" not in argv:
         probe.log("scanlists: сетей %d, серверов ok %d из %d, замечаний %d, клиентов в списке %d" % (
-            s["nets"], sum(1 for v in s["hosts"].values() if v == "ok"), len(s["hosts"]), len(s["notes"]), len(s["clients"])))
+            s["nets"], sum(1 for v in s["hosts"].values() if v.startswith("ok")), len(s["hosts"]), len(s["notes"]), len(s["clients"])))
     return 0
 
 

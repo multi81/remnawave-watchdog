@@ -962,9 +962,14 @@ def scan_lines(hosts, summary_path=None):
     total = sum(int(x.get("packets") or 0) for _, x in sc)
     srcs = sum(int(x.get("sources") or 0) for _, x in sc)
     top = sorted(((n, int(x.get("packets") or 0)) for n, x in sc), key=lambda t: -t[1])[:3]
-    line = "<b>Сканеры (РКН и др.):</b> список %s%s · %s · за сутки стучались %s с %s" % (
-        plural(sm.get("nets") or max([int(x.get("nets") or 0) for _, x in sc] or [0]), "сеть", "сети", "сетей"),
-        (" от " + msk(sm["ts"]).strftime("%d.%m %H:%M")) if sm.get("ts") else "",
+    if sm.get("sent") is False:   # scanlists не разослал итог (предел, пустой) — щиты на прошлом, число сетей не их
+        what = "новый список не разослан, на щитах прошлый"
+    else:
+        what = "список %s%s" % (
+            plural(sm.get("nets") or max([int(x.get("nets") or 0) for _, x in sc] or [0]), "сеть", "сети", "сетей"),
+            (" от " + msk(sm["ts"]).strftime("%d.%m %H:%M")) if sm.get("ts") else "")
+    line = "<b>Сканеры (РКН и др.):</b> %s · %s · за сутки стучались %s с %s" % (
+        what,
         ("отбрасываем на: " + ", ".join(html.escape(n) for n in drop)) if drop else "пока только считаем",
         plural(total, "раз", "раза", "раз"), plural(srcs, "адреса", "адресов", "адресов"))
     if total and top:
@@ -972,9 +977,14 @@ def scan_lines(hosts, summary_path=None):
     info.append(line)
     if sm.get("notes"):
         issues.append("🔎 <b>Список сканеров:</b> " + html.escape("; ".join(sm["notes"])))
-    bad = [h for h, v in (sm.get("hosts") or {}).items() if v != "ok"]
+    hs = sm.get("hosts") or {}
+    bad = [h for h, v in hs.items() if not str(v).startswith("ok")]   # «ok, отвергнуто N» — принят, но не весь
+    part = [h for h, v in hs.items() if str(v).startswith("ok") and str(v) != "ok"]
     if bad:
         issues.append("🔎 <b>Список сканеров не приняли:</b> " + ", ".join(html.escape(h) for h in bad))
+    if part:
+        issues.append("🔎 <b>Список сканеров приняли не всё:</b> " + ", ".join(
+            "%s (%s)" % (html.escape(h), html.escape(str(hs[h]))) for h in part))
     cl = sm.get("clients") or {}
     if cl:
         import scanlists
