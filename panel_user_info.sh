@@ -5,7 +5,12 @@
 # Имена пользователей или номера (id — так клиент записан в журнале Xray) — в команде ssh через пробел (SSH_ORIGINAL_COMMAND), не больше 20, только [A-Za-z0-9_.@-].
 # Печатает одну строку JSON: {"users": [{id, username, status, expire, created, tg, desc, tag, online, node, traffic_gb,
 #   devices, ua}]}; время — секунды UTC. Ничего не пишет.
+# Рекомендация: вместо postgres — отдельная роль базы только на чтение, например
+#   create role watch_ro login; grant select on users, user_traffic, nodes, hwid_user_devices,
+#   user_subscription_request_history to watch_ro;   и ниже psql -U watch_ro
+# (транзакция и так только на чтение, но роль без прав на запись — второй замок).
 set -euo pipefail
+set -f   # SSH_ORIGINAL_COMMAND режется на слова без раскрытия шаблонов (* не превращается в имена файлов)
 names=()
 for n in ${SSH_ORIGINAL_COMMAND:-}; do
   [[ "$n" =~ ^[A-Za-z0-9_.@-]{1,64}$ ]] || { echo '{"error": "bad name"}'; exit 1; }

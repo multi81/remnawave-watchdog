@@ -2,6 +2,7 @@
 import datetime as dt
 import json
 import os
+import re
 import sys
 import tempfile
 
@@ -26,10 +27,98 @@ C = dict(s.DEFAULTS, allow=["93.184.89.45", "93.187.140.234"])
 # --- таблица
 t = s.render(C, "eth0")
 check("наборы сканеров и учёт источников", "set scanners4" in t and "set scanners6" in t and "set scan_seen4" in t)
-check("сканеры — в raw_pre, после своих и блокировок", t.index("ip saddr @allow4 return") < t.index("@scanners4") and
-      t.index("@blocked4") < t.index("@scanners4") and t.index("@scanners4") < t.index("chain pre {"))
+RAW, PRE = t.split("chain raw_pre {")[1].split("chain scan {")[0], t.split("chain pre {")[1].split("chain pre_clients {")[0]
+check("сканеры — не в raw_pre (до conntrack), а в pre: после ct state, своих и клиентов, до порогов",
+      "@scanners" not in RAW and "@blocked4" in RAW and PRE.index("ct state != new return") < PRE.index("ip saddr @allow4 return")
+      < PRE.index("ip saddr @clients4 goto pre_clients") < PRE.index("ip saddr @scanners4 update") < PRE.index("add @flood4")
+      and PRE.index("ip6 saddr & ffff:ffff:ffff:ffff:: @clients6 goto pre_clients") < PRE.index("ip6 saddr @scanners6 update"))
+check("jump scan (не goto): в count сканер проходит и проверку порогов", "jump scan" in PRE and "goto scan" not in t)
+check("клиент из списка сканеров — свой счётчик scan_clients, раньше goto pre_clients",
+      "counter scan_clients { }" in t and PRE.index("ip saddr @clients4 ip saddr @scanners4 counter name scan_clients")
+      < PRE.index("ip saddr @clients4 goto pre_clients"))
 check("по умолчанию только считаем", "chain scan {\n\t\tcounter name scan_hits\n\t}" in t)
 check("режим drop — отбрасываем", "counter name scan_dropped drop" in s.render(C, "eth0", "watch", "drop").split("chain scan")[1])
+
+
+
+# --- проход пакета IPv4 по цепочкам (упрощённо, по тексту render)
+def run_chain(tab, name, pkt, cnt):
+    body = tab.split("\tchain %s {\n" % name)[1].split("\n\t}")[0]
+    for ln in body.splitlines():
+        ln = ln.strip()
+        if not ln or ln.startswith(("type ", "iifname", "meta l4proto")) or "ip6 " in ln:   # только IPv4
+            continue
+        conds = [pkt.get("ct", "new") != "new"] if "ct state != new" in ln else []
+        conds += [pkt.get("ct", "new") == "invalid"] if "ct state invalid" in ln else []
+        conds += [pkt.get(key, False) != ("!= " + tok in ln) for tok, key in (
+            ("@allow4", "allow"), ("@clients4", "client"), ("@scanners4", "scanner"), ("@blocked4", "blocked")) if tok in ln]
+        conds += [False] if "@gate_" in ln else []
+        conds += [pkt.get("flood", False)] if any(x in ln for x in ("add @flood4", "add @conns4", "add @flood_c4", "add @conns_c4")) else []
+        if not all(conds):
+            continue
+        cnt += re.findall(r"counter name (\w+)", ln)
+        if ln == "drop" or ln.endswith(" drop"):
+            return "drop"
+        m = re.search(r"(jump|goto) (\w+)$", ln)
+        if m:
+            if run_chain(tab, m.group(2), pkt, cnt) == "drop":
+                return "drop"
+            if m.group(1) == "goto":
+                return "end"
+            continue
+        if ln.endswith("return"):
+            return "end"
+    return "end"
+
+
+def walk(pkt, mode="watch", scan="drop"):
+    tab, cnt = s.render(C, "eth0", mode, scan), []
+    for ch in ("raw_pre", "pre"):
+        if run_chain(tab, ch, pkt, cnt) == "drop":
+            return "drop", cnt
+    return "accept", cnt
+
+
+check("drop: ответ сканера на наше исходящее соединение (established) проходит и не считается",
+      walk({"scanner": True, "ct": "established"}) == ("accept", []))
+check("drop: related (ICMP об ошибке на наше соединение) тоже проходит", walk({"scanner": True, "ct": "related"})[0] == "accept")
+check("drop: новое входящее от сканера — отброшено со счётчиками", walk({"scanner": True}) == ("drop", ["scan_hits", "scan_dropped"]))
+check("count: новое от сканера — счёт и пропуск", walk({"scanner": True}, scan="count") == ("accept", ["scan_hits"]))
+check("drop: наш клиент из списка сканеров — не режется, не попадание, только scan_clients",
+      walk({"scanner": True, "client": True}) == ("accept", ["scan_clients"]))
+check("count: клиент из списка — тоже не попадание", walk({"scanner": True, "client": True}, scan="count") == ("accept", ["scan_clients"]))
+check("свои (allow) из списка — мимо всего", walk({"scanner": True, "allow": True}) == ("accept", []))
+check("count + щит on: сканер сверх порога режется щитом (jump scan вернулся к порогам)",
+      walk({"scanner": True, "flood": True}, mode="on", scan="count") == ("drop", ["scan_hits", "over_rate", "dropped_shield"]))
+check("щит on: сверх порога режутся только новые, установленные соединения — нет",
+      walk({"flood": True}, mode="on")[0] == "drop" and walk({"flood": True, "ct": "established"}, mode="on") == ("accept", []))
+check("заблокированный по кнопке режется целиком, и ответы тоже (до conntrack)",
+      walk({"blocked": True, "ct": "established"}) == ("drop", ["dropped_blocked"]))
+check("обычный адрес — проходит", walk({}) == ("accept", []))
+
+# --- ct invalid от сканеров (FIN/NULL/XMAS, непрошеный SYN-ACK): режутся в drop, считаются в count
+INV4 = "ct state invalid ip saddr @scanners4 ip saddr != @allow4 ip saddr != @clients4 update @scan_seen4 { ip saddr counter } jump scan"
+INV6 = ("ct state invalid ip6 saddr @scanners6 ip6 saddr != @allow6 ip6 saddr & ffff:ffff:ffff:ffff:: != @clients6 "
+        "update @scan_seen6 { ip6 saddr counter } jump scan")
+for sm_ in ("count", "drop"):
+    P_ = s.render(C, "eth0", "watch", sm_).split("chain pre {")[1].split("chain pre_clients {")[0]
+    check("invalid (%s): отдельные правила v4/v6 в pre, до `ct state != new return`, после iifname" % sm_,
+          INV4 in P_ and INV6 in P_ and P_.index('iifname != "eth0" return') < P_.index(INV4) < P_.index(INV6)
+          < P_.index("ct state != new return") < P_.index("ip saddr @scanners4 update"))
+    check("invalid (%s): правило только про invalid — established/related в pre нигде не перечислены" % sm_,
+          [ln.strip() for ln in P_.splitlines() if "ct state" in ln] == [INV4, INV6, "ct state != new return"]
+          and "established" not in P_ and "related" not in P_)
+check("invalid: режим берётся из цепочки scan (её же меняет scan-mode) — pre одинаковая в count и drop",
+      s.render(C, "eth0", "watch", "count").split("chain pre {")[1] == s.render(C, "eth0", "watch", "drop").split("chain pre {")[1])
+check("drop: invalid от сканера отброшен, считается в scan_dropped (и scan_hits)",
+      walk({"scanner": True, "ct": "invalid"}) == ("drop", ["scan_hits", "scan_dropped"]))
+check("count: invalid от сканера — только scan_hits, проходит", walk({"scanner": True, "ct": "invalid"}, scan="count")
+      == ("accept", ["scan_hits"]))
+check("drop: established и related от сканера по-прежнему проходят и не считаются",
+      walk({"scanner": True, "ct": "established"}) == ("accept", []) and walk({"scanner": True, "ct": "related"}) == ("accept", []))
+check("drop: invalid от нашего клиента из списка сканеров — не трогаем", walk({"scanner": True, "client": True, "ct": "invalid"})
+      == ("accept", []))
+check("drop: invalid не от сканера — не наше дело, проходит", walk({"ct": "invalid"}) == ("accept", []))
 
 # --- разбор списка на сервере
 txt = "# комментарий\n1.2.3.0/24\n1.2.3.0/25\n10.0.0.0/8\n5.0.0.0/8\nмусор\n93.184.89.0/24\n2a00:1::/32\n2a00::/16\n"
@@ -77,6 +166,24 @@ with tempfile.TemporaryDirectory() as tmp:
     r = s.cmd_scan_clients()
     check("scan-clients: наши клиенты, попавшие в список", set(r["clients"]) == {"1.2.3.77", "2a00:1:5:6::"}
           and r["clients"]["1.2.3.77"]["user"] == "user_gov")
+    # --- обновление на бою — state и файлы прежней версии (1.3.0) читаются, всё восстанавливается в новой таблице
+    json.dump({"mode": "watch", "until": 0, "blocks": {"9.9.9.9": s.now() + 3000, "2a03:1:2:3::": s.now() + 600,
+                                                        "7.7.7.7": s.now() - 5}, "scan_mode": "drop"}, open(s.STATE_FILE, "w"))
+    open(s.SCANNERS_FILE, "w").write("1.2.3.0/24\n2a00:1::/32\n")
+    calls.clear()
+    st_old = json.load(open(s.STATE_FILE))
+    r = s.cmd_load(dict(C, iface="eth0"), st_old)
+    tab = calls[0][1]
+    st_new = json.load(open(s.STATE_FILE))
+    check("load со state прежней версии: таблица новая (сканеры в pre), режим сканеров drop сохранён",
+          r["ok"] and "jump scan" in tab and "counter name scan_dropped drop" in tab.split("chain scan {")[1].split("}")[0]
+          and st_new["scan_mode"] == "drop")
+    check("load: живые блоки вернулись в ядро, истёкший убран", any(a[:4] == ["add", "element", s.TABLE, "blocked4"]
+          and "9.9.9.9 timeout" in a[4] for a, _ in calls) and any("2a03:1:2:3:: timeout" in a[-1] for a, _ in calls if a[0] == "add")
+          and set(st_new["blocks"]) == {"9.9.9.9", "2a03:1:2:3::"})
+    check("load: список сканеров и клиенты загружены из файлов", any(i and "scanners4 { 1.2.3.0/24 }" in i for _, i in calls)
+          and any(i and "clients4 { 1.2.3.77, 8.8.8.8 }" in i or i and "clients4 { 8.8.8.8, 1.2.3.77 }" in i for _, i in calls)
+          and r["clients"] == 3)
     check("ssh: команды сканеров разрешены", s.ssh_argv("scanners-load") == ["scanners-load"] and s.ssh_argv("scan-mode drop")
           and s.ssh_argv("scan-clients"))
 

@@ -6,7 +6,8 @@
 #   bash install.sh --yes       без вопросов (ссылка подписки и настройки Telegram уже лежат на местах)
 #   bash install.sh --xray ПУТЬ взять бинарник Xray из файла (по умолчанию копируется из контейнера remnanode)
 #   bash install.sh --no-start  всё поставить, но таймеры не включать и первую проверку не запускать
-#   bash install.sh --uninstall убрать сторож
+#   bash install.sh --uninstall убрать сторож (сначала DDoS-часть и щиты серверов — в наблюдение; если не все
+#                               щиты ответили, ключ щита остаётся; --uninstall --force — удалить и его)
 #
 # Что нужно заранее:
 #   - служебный пользователь в панели Remnawave (создать в веб-интерфейсе: все сквады, без срока и лимита трафика)
@@ -18,22 +19,99 @@ set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 ETC=/etc/channel-watch
 TG_ENV=/etc/bridge-watch/guard.env   # отсюда сторож читает BW_TG_TOKEN и BW_TG_CHAT
-yes=0 start=1 xray_src="" uninstall=0
+yes=0 start=1 xray_src="" uninstall=0 force=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes) yes=1; shift ;;
     --no-start) start=0; shift ;;
     --xray) xray_src="${2:?после --xray нужен путь к бинарнику}"; shift 2 ;;
     --uninstall) uninstall=1; shift ;;
+    --force) force=1; shift ;;
     *) echo "не понимаю параметр: $1"; exit 2 ;;
   esac
 done
 [ "$(id -u)" -eq 0 ] || { echo "нужны права root"; exit 1; }
 
 if [ "$uninstall" -eq 1 ]; then
+  # 1) DDoS-часть первой: без /opt и /etc/channel-watch её таймеры и кнопки начали бы падать
+  if ls /etc/systemd/system/channel-watch-{ddos,shieldbot,scanlists,behavscan}.* >/dev/null 2>&1; then
+    if [ -s "$SRC/install_ddos.sh" ]; then
+      bash "$SRC/install_ddos.sh" --uninstall
+    else
+      systemctl disable --now channel-watch-ddos.timer channel-watch-shieldbot.service channel-watch-scanlists.timer \
+        channel-watch-behavscan.timer 2>/dev/null || true
+      rm -f /etc/systemd/system/channel-watch-ddos.{service,timer} /etc/systemd/system/channel-watch-shieldbot.service \
+            /etc/systemd/system/channel-watch-scanlists.{service,timer} /etc/systemd/system/channel-watch-behavscan.{service,timer}
+      systemctl daemon-reload
+    fi
+  fi
+  # 2) щитам на серверах из ddos.json — наблюдение (scan-mode count, mode watch), пока есть чем: потом ключа щита не
+  #    будет и переключать их станет нечем. Не все ответили — ключ щита и ddos.json остаются (без --force).
+  keep_shield=0
+  if [ -s "$ETC/shield_ed25519" ] && [ -s "$ETC/ddos.json" ]; then
+    echo "== щиты на серверах → наблюдение:"
+    if ! python3 - "$ETC" <<'PY'
+import concurrent.futures, json, subprocess, sys
+etc = sys.argv[1]
+try:
+    hs = [h for h in json.load(open(etc + "/ddos.json", encoding="utf-8")).get("hosts", [])
+          if isinstance(h, dict) and h.get("name") and h.get("host")]
+except (OSError, ValueError, AttributeError) as e:
+    print("   ddos.json не читается: %s" % e)
+    sys.exit(1)
+
+
+def ctl(h, args):
+    """shield-ctl на сервере — та же команда, что у кнопок щита (shieldbot.run_ctl): ключ щита, свой known_hosts."""
+    cmd = ["ssh", "-i", etc + "/shield_ed25519", "-p", str(h.get("port", 22)), "-o", "BatchMode=yes",
+           "-o", "ConnectTimeout=12", "-o", "StrictHostKeyChecking=yes",
+           "-o", "UserKnownHostsFile=" + etc + "/shield_known_hosts", "root@" + str(h["host"])] + args
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        out = r.stdout.strip()
+        return json.loads(out.splitlines()[-1]) if out else {"ok": False, "error": "нет ответа (код %d)" % r.returncode}
+    except (subprocess.TimeoutExpired, ValueError, OSError, IndexError) as e:
+        return {"ok": False, "error": "сервер не ответил: %s" % str(e)[:100]}
+
+
+def calm(h):
+    s = ctl(h, ["scan-mode", "count"])
+    # щит старше 1.2 сканеров не знает — и резать по ним не может
+    s_ok = s.get("ok") or any(w in str(s.get("error", "")) for w in ("не разрешена", "не понимаю"))
+    m = ctl(h, ["mode", "watch"])
+    if s_ok and m.get("ok"):
+        return True, "наблюдение, сканеры — только счёт"
+    return False, "НЕ ПЕРЕКЛЮЧЁН: " + "; ".join(str(r.get("error", "?"))[:120] for r in (s, m) if not r.get("ok"))
+
+
+if not hs:
+    print("   серверов в ddos.json нет")
+    sys.exit(0)
+with concurrent.futures.ThreadPoolExecutor(8) as ex:
+    res = list(ex.map(calm, hs))
+for h, (ok, text) in zip(hs, res):
+    print("   %s: %s" % (h["name"], text))
+sys.exit(0 if all(ok for ok, _ in res) else 1)
+PY
+    then
+      if [ "$force" -eq 1 ]; then
+        echo "внимание: не все щиты переключены, ключ щита удаляю по --force — на этих серверах переключать вручную:"
+        echo "   shield-ctl mode watch; shield-ctl scan-mode count"
+      else
+        keep_shield=1
+      fi
+    fi
+  fi
+  # 3) сторож целиком
   systemctl disable --now channel-watch.timer channel-watch-build.timer channel-watch-speed.timer channel-watch-lists.timer \
     channel-watch-loss.timer channel-watch-side.timer channel-watch-xray.service 2>/dev/null || true
-  rm -rf /opt/channel-watch "$ETC" /var/lib/channel-watch /etc/logrotate.d/channel-watch /var/log/channel-watch.log*
+  rm -rf /opt/channel-watch /var/lib/channel-watch /etc/logrotate.d/channel-watch /var/log/channel-watch.log*
+  if [ "$keep_shield" -eq 1 ]; then
+    find "$ETC" -mindepth 1 -maxdepth 1 ! -name shield_ed25519 ! -name shield_ed25519.pub ! -name shield_known_hosts \
+      ! -name ddos.json -exec rm -rf {} +
+  else
+    rm -rf "$ETC"
+  fi
   rm -f /etc/systemd/system/channel-watch.service /etc/systemd/system/channel-watch.timer \
         /etc/systemd/system/channel-watch-build.service /etc/systemd/system/channel-watch-build.timer \
         /etc/systemd/system/channel-watch-speed.service /etc/systemd/system/channel-watch-speed.timer \
@@ -43,6 +121,12 @@ if [ "$uninstall" -eq 1 ]; then
         /etc/systemd/system/channel-watch-xray.service
   systemctl daemon-reload
   echo "сторож убран. Не тронуты: $TG_ENV (настройки Telegram) и служебный пользователь в панели — его удалить вручную."
+  if [ "$keep_shield" -eq 1 ]; then
+    echo "ВНИМАНИЕ: не все щиты переведены в наблюдение (см. выше). Ключ щита и список серверов оставлены в $ETC."
+    echo "   Когда серверы будут доступны — снова bash install.sh --uninstall; удалить и ключ — --uninstall --force"
+    echo "   (тогда переключать на самих серверах: shield-ctl mode watch; shield-ctl scan-mode count)."
+    exit 1
+  fi
   exit 0
 fi
 
@@ -75,19 +159,36 @@ fi
 chmod 600 "$ETC/sub.url"
 
 # --- Telegram ---
-if ! grep -qs '^BW_TG_TOKEN=' "$TG_ENV" || ! grep -qs '^BW_TG_CHAT=' "$TG_ENV"; then
+need_token=0 need_chat=0
+grep -qs '^BW_TG_TOKEN=' "$TG_ENV" || need_token=1
+grep -qs '^BW_TG_CHAT=' "$TG_ENV" || need_chat=1
+if [ "$need_token$need_chat" != 00 ]; then   # спрашивается и дописывается только недостающее
   [ "$yes" -eq 0 ] || { echo "в $TG_ENV нет BW_TG_TOKEN / BW_TG_CHAT — впишите или запустите без --yes"; exit 1; }
-  read -r -s -p "Токен Telegram-бота (не показывается): " token; echo
-  read -r -p "Номер чата Telegram, куда писать: " chat
-  [ -n "$token" ] && [ -n "$chat" ] || { echo "нужны и токен, и чат"; exit 1; }
+  token="" chat=""
+  if [ "$need_token" -eq 1 ]; then
+    read -r -s -p "Токен Telegram-бота (не показывается): " token; echo
+    [ -n "$token" ] || { echo "нужен токен"; exit 1; }
+  fi
+  if [ "$need_chat" -eq 1 ]; then
+    read -r -p "Номер чата Telegram, куда писать: " chat
+    [ -n "$chat" ] || { echo "нужен номер чата"; exit 1; }
+  fi
   install -d -m 700 "$(dirname "$TG_ENV")"
-  ( umask 077; printf 'BW_TG_TOKEN=%s\nBW_TG_CHAT=%s\n' "$token" "$chat" >> "$TG_ENV" )
+  ( umask 077
+    # файл без перевода строки в конце: новая строка иначе склеится с последней
+    [ ! -s "$TG_ENV" ] || [ -z "$(tail -c 1 "$TG_ENV")" ] || echo >> "$TG_ENV"
+    [ "$need_token" -eq 0 ] || printf 'BW_TG_TOKEN=%s\n' "$token" >> "$TG_ENV"
+    [ "$need_chat" -eq 0 ] || printf 'BW_TG_CHAT=%s\n' "$chat" >> "$TG_ENV" )
 fi
 chmod 600 "$TG_ENV"
 
 # --- файлы ---
 install -d -m 755 /opt/channel-watch /var/lib/channel-watch
+# кнопки щита (shieldbot, из install_ddos.sh) шлют в Telegram через probe.py: новый probe.py — перезапустить их
+probe_changed=0; cmp -s "$SRC/probe.py" /opt/channel-watch/probe.py || probe_changed=1
 install -m 755 "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py" /opt/channel-watch/
+
+if [ "$probe_changed" -eq 1 ]; then systemctl try-restart channel-watch-shieldbot.service 2>/dev/null || true; fi
 
 # клиент Xray: тот же бинарник, что у ноды (ничего не скачиваем), либо указанный файл
 if [ -n "$xray_src" ]; then

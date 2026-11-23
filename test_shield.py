@@ -11,6 +11,7 @@ import ddoswatch as d  # noqa: E402
 d.IPINFO_LOOKUP = lambda ips: {}   # без сети: сведения об адресах не запрашиваем
 d.SCAN_DIR = "/nonexistent"
 import shield_ctl as s  # noqa: E402
+NFT_REAL = s.nft   # настоящий вызов nft (ниже его подменяют)
 import shieldbot as b  # noqa: E402
 
 ok = 0
@@ -446,4 +447,401 @@ m_ = {"shield": {"proto_pps": {"udp": 85000, "tcp": 3000, "icmp": 0}, "ports": [
 pl = d.proto_line(m_)
 check("сообщение: чем бьют — протоколы и порты", "UDP 85 000 пак/с · TCP 3 000 пак/с" in pl and "udp/443 (51 000)" in pl and "ICMP" not in pl)
 check("без данных щита — строки нет", d.proto_line({}) == "")
+
+
+# ===== 1.4.0: =====
+class FakeNft:
+    """Подставной nft: помнит, режет ли enforce; table=False — таблицы нет (все вызовы падают)."""
+    def __init__(self, enforce=False, table=True, fail_flush=False):
+        self.enforce, self.table, self.fail_flush, self.calls, self.inputs = enforce, table, fail_flush, [], []
+
+    def __call__(self, args, inp=None):
+        self.calls.append(args)
+        self.inputs.append(inp)
+        if not self.table or (self.fail_flush and args[:1] == ["flush"]):
+            raise RuntimeError("nft %s: No such file or directory" % " ".join(args[:3]))
+        if args[:2] == ["flush", "chain"] and args[-1] == "enforce":
+            self.enforce = False
+        if args[:2] == ["add", "rule"] and args[3] == "enforce" and args[-1] == "drop":
+            self.enforce = True
+        if args[:3] == ["list", "chain", s.TABLE]:
+            return "table inet storozh_shield {\n\tchain enforce {\n%s\t}\n}\n" % (
+                "\t\tcounter name \"dropped_shield\" drop\n" if self.enforce else "")
+        if args[:3] == ["-j", "list", "counters"]:   # таблица текущей версии: с отметкой table_v_…
+            return json.dumps({"nftables": [{"counter": {"name": s.table_v_name(), "packets": 0}}]})
+        if args[:1] == ["-j"]:
+            return '{"nftables": []}'
+        return ""
+
+
+# --- allow через запятую и с запятой в конце не пропадает молча
+CA = dict(s.DEFAULTS, allow=["93.184.216.34,", "1.2.3.4, 5.6.7.8", "nl1.example.net"])
+check("allow «a,» и «a, b» — адреса свои, блокировать нельзя",
+      s.check_block(["93.184.216.34", "1.2.3.4", "5.6.7.8"], CA)[0] == [] and "93.184.216.34" in s.render(CA, "eth0"))
+check("мусор в allow виден (имя вместо адреса)", s.allow_bad(CA) == ["nl1.example.net"] and s.allow_bad(C) == [])
+
+# --- IPv6 — отказ, если своя сеть пересекается с блокируемой /64
+C6 = dict(s.DEFAULTS, allow=["2a01:4f8:1:2::5", "2a02:9:9::/48", "2a03:7:7:7:1::/80"])
+g6, b6 = s.check_block(["2a01:4f8:1:2::77", "2a01:4f8:1:2:aaaa::1", "2a01:4f8:1:3::1", "2a02:9:9:5::1", "2a03:7:7:7::9"], C6)
+check("соседний адрес в /64 своего (SLAAC) — отказ; своя /48 и /80 внутри /64 — отказ; другая /64 — можно",
+      g6 == ["2a01:4f8:1:3::"] and [x for x, why in b6 if why == "в списке своих"]
+      == ["2a01:4f8:1:2::77", "2a01:4f8:1:2:aaaa::1", "2a02:9:9:5::1", "2a03:7:7:7::9"])
+check("IPv4 — как раньше, по адресу", s.check_block(["93.184.89.46"], C)[0] == ["93.184.89.46"])
+
+real_nft, real_timer = s.nft, s.tick_timer_state
+with tempfile.TemporaryDirectory() as tmp:
+    s.STATE_FILE, s.LOG_FILE = os.path.join(tmp, "st.json"), os.path.join(tmp, "log")
+    s.CLIENTS_FILE, s.SCANNERS_FILE = os.path.join(tmp, "cl.json"), os.path.join(tmp, "sc.txt")
+    s.CONF_FILE = os.path.join(tmp, "config.json")
+
+    # --- истёкший on снимает любая команда, status говорит правду
+    s.nft, s.tick_timer_state = FakeNft(enforce=True), lambda: "inactive"
+    st = {"mode": "on", "until": s.now() - 30, "blocks": {}}
+    r = s.dispatch(["status"], C, st)
+    check("status: on истёк, таймер стоит — снят сейчас, режим watch, так и сказано",
+          r["mode"] == "watch" and not s.nft.enforce and r["tick"] == "inactive"
+          and "on истёк, таймер не работает — снят сейчас" in r["warn"]
+          and json.load(open(s.STATE_FILE))["mode"] == "watch" and ["flush", "chain", s.TABLE, "enforce"] in s.nft.calls)
+    s.nft = FakeNft(enforce=True)
+    st = {"mode": "on", "until": s.now() - 30}
+    s.dispatch(["clients", "8.8.8.8"], C, st)
+    check("clients: истёкший on тоже снимается", st["mode"] == "watch" and not s.nft.enforce)
+    s.nft = FakeNft(enforce=True)
+    st = {"mode": "on", "until": s.now() + 3600}
+    r = s.dispatch(["status"], C, st)
+    check("срок не вышел — режет дальше, предупреждение только про таймер", r["mode"] == "on" and s.nft.enforce
+          and r["warn"] == ["таймер tick не работает (inactive)"])
+    s.tick_timer_state = lambda: "active"
+    s.nft = FakeNft(enforce=True)
+    r = s.dispatch(["status"], C, {"mode": "watch", "until": 0})
+    check("ядро режет, а по state наблюдение — status показывает on и почему", r["mode"] == "on"
+          and r["warn"] == ["в ядре щит режет, а по state watch"])
+    s.nft = FakeNft(enforce=True, fail_flush=True)
+    st = {"mode": "on", "until": s.now() - 30}
+    r = s.dispatch(["status"], C, st)
+    check("снять не удалось — status не врёт: on и ошибка", r["mode"] == "on" and st["mode"] == "on"
+          and any("снять не удалось" in w for w in r["warn"]))
+    s.nft = FakeNft(table=False)
+    st = {"mode": "on", "until": s.now() - 30}
+    r = s.dispatch(["status"], C, st)
+    check("таблицы нет — в state правда (watch), status: не загружен", st["mode"] == "watch" and r["loaded"] is False)
+    s.nft = FakeNft(enforce=True)
+    st = {"mode": "on", "until": s.now() - 30}
+    check("tick снимает истёкший on, как раньше", s.cmd_tick(C, st)["changed"] and st["mode"] == "watch" and not s.nft.enforce)
+    s.nft = FakeNft()
+    st = {"mode": "on", "until": s.now() - 30}
+    r = s.cmd_load(dict(C, iface="eth0"), st)
+    check("load: истёкший on — таблица в наблюдении", r["mode"] == "watch" and st["mode"] == "watch"
+          and "chain enforce {\n\t}" in s.nft.inputs[0])
+    check("таймер спросить нельзя (не Linux) — unknown, без ложной тревоги", real_timer() in ("unknown", "active", "inactive")
+          and s.cmd_status(C, {}, False, "")["warn"] == [])
+    s.nft = FakeNft(enforce=True)
+    r = s.dispatch(["status"], CA, {"mode": "on", "until": s.now() + 600})
+    check("status: мусор в allow — в предупреждениях", any("nl1.example.net" in w for w in r["warn"]))
+
+    # --- unblock: в state нет, а в ядре есть; повтор адреса; в state есть, в ядре уже нет
+    s.nft = FakeNft()
+    st = {"blocks": {}}
+    r = s.cmd_unblock(C, st, ["9.9.9.9", "9.9.9.9"])
+    check("unblock: блок вне state снят в ядре, повтор — один delete", r["unblocked"] == ["9.9.9.9"]
+          and sum(1 for a in s.nft.calls if a[0] == "delete") == 1)
+
+    class NoElem(FakeNft):
+        def __call__(self, args, inp=None):
+            if args[0] == "delete":
+                raise RuntimeError("nft delete element: No such file or directory")
+            return FakeNft.__call__(self, args, inp)
+    s.nft = NoElem()
+    st = {"blocks": {"8.8.8.8": s.now() + 100}}
+    r = s.cmd_unblock(C, st, ["8.8.8.8", "7.7.7.7"])
+    check("unblock: в ядре элемента уже нет — из state убран, без ошибки; чужой адрес не выдуман",
+          r["unblocked"] == ["8.8.8.8"] and st["blocks"] == {})
+
+    # --- блокировка на всё время команды
+    held = set()
+
+    def flock(fd, op):
+        if op & 4 and "busy" in held:
+            raise BlockingIOError(11, "Resource temporarily unavailable")
+    lk = os.path.join(tmp, "lock", "shield.lock")
+    fd = s.lock(lk, wait=1, flock=flock)
+    check("блокировка взята, файл создан", isinstance(fd, int) and os.path.exists(lk))
+    os.close(fd)
+    held.add("busy")
+    t0 = s.time.monotonic()
+    try:
+        s.lock(lk, wait=0.5, flock=flock)
+        check("занято дольше срока — понятная ошибка", False)
+    except s.Busy as e:
+        check("занято дольше срока — понятная ошибка", "занят другой командой" in str(e) and s.time.monotonic() - t0 >= 0.5)
+    n = [0]
+
+    def flock2(fd, op):
+        n[0] += 1
+        if n[0] < 3:
+            raise BlockingIOError(11, "busy")
+    fd = s.lock(lk, wait=5, flock=flock2)
+    check("соседняя команда закончила — ждём и берём", isinstance(fd, int) and n[0] == 3)
+    os.close(fd)
+
+    def flock_bad(fd, op):
+        raise OSError(9, "Bad file descriptor")
+    try:
+        s.lock(lk, wait=5, flock=flock_bad)
+        check("другая ошибка flock — не ждём, сразу наружу", False)
+    except OSError as e:
+        check("другая ошибка flock — не ждём, сразу наружу", e.errno == 9 and not isinstance(e, s.Busy))
+
+    # main: state читается только после блокировки — запись соседа, сделанная пока ждали, не теряется
+    s.nft = FakeNft()
+    json.dump({"blocks": {}}, open(s.STATE_FILE, "w"))
+    order = []
+
+    def lock_wait(*a, **k):
+        order.append("lock")
+        json.dump({"blocks": {"9.9.9.9": s.now() + 3000}, "mode": "on", "until": s.now() + 3000}, open(s.STATE_FILE, "w"))
+        fd_ = os.open(os.path.join(tmp, "l2"), os.O_RDWR | os.O_CREAT)
+        order.append(fd_)
+        return fd_
+    real_lock = s.lock
+    s.lock = lock_wait
+    import contextlib
+    import io
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = s.main(["block", "3600", "8.8.8.8"])
+    stj = json.load(open(s.STATE_FILE))
+    check("main: блок соседа (записан, пока ждали) и режим on сохранены рядом с новым",
+          rc == 0 and set(stj["blocks"]) == {"9.9.9.9", "8.8.8.8"} and stj["mode"] == "on")
+    try:
+        os.fstat(order[1])
+        closed = False
+    except OSError:
+        closed = True
+    check("main: блокировка снята после команды", closed)
+
+    def lock_busy(*a, **k):
+        raise s.Busy("щит занят другой командой дольше 30 с — повторите позже")
+    s.lock = lock_busy
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = s.main(["block", "3600", "1.1.1.1"])
+    out = json.loads(buf.getvalue())
+    check("main: занято — ok false, понятная ошибка, state не тронут", rc == 1 and "занят" in out["error"]
+          and "1.1.1.1" not in json.load(open(s.STATE_FILE))["blocks"])
+    s.lock = real_lock
+    check("на Windows (нет fcntl) блокировка — пустая", s.fcntl is not None or s.lock(lk) is None)
+    if s.fcntl is not None:   # Linux: настоящий flock — второй вызов ждёт и получает Busy, после снятия — берёт
+        fd1 = s.lock(lk, wait=1)
+        try:
+            s.lock(lk, wait=0.3)
+            check("настоящий flock: занято — Busy", False)
+        except s.Busy:
+            check("настоящий flock: занято — Busy", True)
+        os.close(fd1)
+        fd2 = s.lock(lk, wait=1)
+        check("настоящий flock: снята — берётся", isinstance(fd2, int))
+        os.close(fd2)
+s.nft, s.tick_timer_state = real_nft, real_timer
+
+# ===== партия 2: stdin до блокировки, status без долгой блокировки, «таблицы нет» ≠ сбой nft, table_v =====
+import contextlib  # noqa: E402
+import io  # noqa: E402
+
+
+def run_main(argv):
+    buf = io.StringIO()
+    with contextlib.redirect_stdout(buf):
+        rc = s.main(argv)
+    return rc, json.loads(buf.getvalue())
+
+
+class Stdin:
+    """Подставной stdin: отмечает в order, когда его читали."""
+    def __init__(self, order, text):
+        self.order, self.text = order, text
+
+    def read(self, n=-1):
+        self.order.append(("stdin", n))
+        return self.text
+
+
+real_lock, real_unlock, real_stdin = s.lock, s.unlock, sys.stdin
+with tempfile.TemporaryDirectory() as tmp:
+    s.STATE_FILE, s.LOG_FILE = os.path.join(tmp, "st.json"), os.path.join(tmp, "log")
+    s.CLIENTS_FILE, s.SCANNERS_FILE = os.path.join(tmp, "cl.json"), os.path.join(tmp, "sc.txt")
+    s.tick_timer_state = lambda: "active"
+    order = []
+
+    def lock_rec(*a, **k):
+        order.append("lock")
+        return os.open(os.path.join(tmp, "lk"), os.O_RDWR | os.O_CREAT)
+
+    def unlock_rec(fd):
+        if fd is not None:
+            order.append("unlock")
+            os.close(fd)
+
+    class OrderNft(FakeNft):
+        def __call__(self, args, inp=None):
+            order.append(("nft",) + tuple(args[:3]))
+            return FakeNft.__call__(self, args, inp)
+    s.lock, s.unlock = lock_rec, unlock_rec
+
+    # 1) scanners-load: stdin читается ДО блокировки, под ней — разбор, nft и запись файла
+    s.nft = OrderNft()
+    sys.stdin = Stdin(order, "1.2.3.0/24\n2a00:1::/32\n")
+    rc, out = run_main(["scanners-load"])
+    nft_f = [i for i, x in enumerate(order) if x == ("nft", "-f", "-")]
+    check("scanners-load: stdin прочитан до блокировки, с пределом размера; nft под блокировкой; файл записан",
+          rc == 0 and out["v4"] == 1 and order[0] == ("stdin", s.STDIN_MAX) and order.index("lock") == 1
+          and nft_f and order.index("lock") < nft_f[0] < order.index("unlock")
+          and open(s.SCANNERS_FILE, encoding="utf-8").read() == "1.2.3.0/24\n2a00:1::/32\n")
+    order.clear()
+    os.environ["SSH_ORIGINAL_COMMAND"] = "scanners-load"
+    rc, out = run_main(["--ssh"])
+    check("scanners-load по SSH: тоже stdin до блокировки", rc == 0 and order[0] == ("stdin", s.STDIN_MAX)
+          and order.index("lock") == 1)
+    del os.environ["SSH_ORIGINAL_COMMAND"]
+    order.clear()
+    rc, out = run_main(["block", "3600", "8.8.8.8"])
+    check("прочие команды stdin не читают", rc == 0 and not any(isinstance(x, tuple) and x[0] == "stdin" for x in order))
+    try:
+        s.dispatch(["scanners-load"], C, {})
+        check("dispatch scanners-load без списка — отказ, stdin под блокировкой не читается", False)
+    except ValueError as e:
+        check("dispatch scanners-load без списка — отказ, stdin под блокировкой не читается", "не передан" in str(e))
+    sys.stdin = Stdin(order, "")   # status и прочие не должны его трогать
+
+    # 2) status: под блокировкой только снятие истёкшего on (и запись state), nft list и сбор сведений — без неё
+    json.dump({"mode": "on", "until": s.now() - 30, "blocks": {}}, open(s.STATE_FILE, "w"))
+    s.nft = OrderNft(enforce=True)
+    order.clear()
+    rc, out = run_main(["status"])
+    un = order.index("unlock")
+    flush = order.index(("nft", "flush", "chain", s.TABLE))
+    lists = [i for i, x in enumerate(order) if isinstance(x, tuple) and x[0] == "nft" and "list" in x]
+    check("status: истёкший on снят под блокировкой, state записан",
+          rc == 0 and order[0] == "lock" and flush < un and out["mode"] == "watch"
+          and json.load(open(s.STATE_FILE))["mode"] == "watch" and "on истёк — снят сейчас" in out["warn"])
+    check("status: все nft list — после снятия блокировки", lists and min(lists) > un and order.count("unlock") == 1)
+    order.clear()
+    rc, out = run_main(["status"])
+    check("status: on не истёк — блокировка только на чтение state, nft под ней не зовётся",
+          rc == 0 and order[:2] == ["lock", "unlock"] and all(x not in ("lock", "unlock") for x in order[2:])
+          and not any(isinstance(x, tuple) and x[0] == "stdin" for x in order))
+    order.clear()
+    rc, out = run_main(["mode", "on", "1"])
+    check("прочие команды (mode) держат блокировку всё время: nft — между lock и unlock",
+          rc == 0 and order[0] == "lock" and order[-1] == "unlock"
+          and all(isinstance(x, tuple) for x in order[1:-1]) and len(order) > 2)
+
+    # 4) expire_on: «таблицы нет» отличается от прочих сбоев nft
+    s.lock, s.unlock = real_lock, real_unlock
+    calls_ts = []
+
+    def nft_ts(err):
+        def f(args, inp=None):
+            calls_ts.append(args)
+            if err:
+                raise RuntimeError(err)
+            return ""
+        return f
+    s.nft = nft_ts(None)
+    check("table_state: есть — True, спрашивает nft -t list table (без элементов наборов)",
+          s.table_state() is True and calls_ts[-1] == ["-t", "list", "table", s.TABLE])
+    s.nft = nft_ts("nft -t list table: Error: No such file or directory; did you mean table ‘x’ in family ip?")
+    check("table_state: «No such file or directory» — таблицы нет", s.table_state() is False)
+    s.nft = nft_ts("nft -t list table: нет ответа 30 с")
+    check("table_state: иной сбой nft — неизвестно (None)", s.table_state() is None)
+
+    class Flaky(FakeNft):
+        """Таблица есть, но nft сбоит: снять не вышло, и list table — не «No such file»."""
+        def __call__(self, args, inp=None):
+            self.calls.append(args)
+            if args[:1] in (["flush"], ["-t"]):
+                raise RuntimeError("nft %s: нет ответа 30 с" % " ".join(args[:3]))
+            return FakeNft.__call__(self, args, inp)
+    s.nft = Flaky(enforce=True)
+    json.dump({"mode": "on", "until": s.now() - 30}, open(s.STATE_FILE, "w"))
+    st = {"mode": "on", "until": s.now() - 30}
+    r = s.dispatch(["status"], C, st)
+    check("expire_on: прочий сбой nft — state не тронут (on), ошибка в status.warn",
+          st["mode"] == "on" and json.load(open(s.STATE_FILE))["mode"] == "on" and r["mode"] == "on"
+          and any("снять не удалось" in w and "нет ответа" in w for w in r["warn"])
+          and ["-t", "list", "table", s.TABLE] in s.nft.calls)
+    class Flaky2(Flaky):
+        """Сбоит и nft list chain (раньше по нему решали, что таблицы нет)."""
+        def __call__(self, args, inp=None):
+            if args[:2] == ["list", "chain"]:
+                raise RuntimeError("nft list chain inet: нет ответа 30 с")
+            return Flaky.__call__(self, args, inp)
+    s.nft = Flaky2(enforce=True)
+    json.dump({"mode": "on", "until": s.now() - 30}, open(s.STATE_FILE, "w"))
+    st = {"mode": "on", "until": s.now() - 30}
+    r = s.dispatch(["status"], C, st)
+    check("expire_on: сбоит и list chain — всё равно не «таблицы нет»: state on, ошибка в warn",
+          st["mode"] == "on" and json.load(open(s.STATE_FILE))["mode"] == "on"
+          and any("снять не удалось" in w for w in r["warn"]))
+    s.nft = FakeNft(table=False)
+    st = {"mode": "on", "until": s.now() - 30}
+    s.dispatch(["clients", "8.8.8.8"], C, st)
+    check("expire_on: таблицы нет (No such file or directory) — state watch, как раньше",
+          st["mode"] == "watch" and json.load(open(s.STATE_FILE))["mode"] == "watch")
+    real_run = s.subprocess.run
+
+    def run_timeout(*a, **k):
+        raise s.subprocess.TimeoutExpired(a[0], 30)
+    s.subprocess.run = run_timeout
+    try:
+        NFT_REAL(["list", "chain", s.TABLE, "enforce"])
+        check("nft: таймаут — RuntimeError (обычный сбой nft, команда не падает мимо обработчиков)", False)
+    except RuntimeError as e:
+        check("nft: таймаут — RuntimeError (обычный сбой nft, команда не падает мимо обработчиков)", "нет ответа" in str(e))
+    finally:
+        s.subprocess.run = real_run
+
+    # 5) table_v: версия таблицы в ядре по счётчику-отметке
+    t5 = s.render(C, "eth0")
+    check("render: счётчик-отметка версии таблицы", "counter %s { }" % s.table_v_name() in t5
+          and s.table_v_name() == "table_v_" + s.VERSION.replace(".", "_"))
+    s.nft = FakeNft()
+    r = s.cmd_status(C, {}, False, "")
+    check("status: table_v — версия таблицы в ядре, совпадает с кодом; отметки нет среди счётчиков; без предупреждения",
+          r["table_v"] == s.VERSION and r["v"] == s.VERSION and not any(k.startswith("table_v_") for k in r["counters"])
+          and r["warn"] == [])
+
+    class OldTable(FakeNft):
+        def __call__(self, args, inp=None):
+            if args[:3] == ["-j", "list", "counters"]:   # таблица прежней версии: отметки нет
+                return json.dumps({"nftables": [{"counter": {"name": "scan_hits", "packets": 7}}]})
+            return FakeNft.__call__(self, args, inp)
+    s.nft = OldTable()
+    r = s.cmd_status(C, {}, False, "")
+    check("status: таблица старой версии (без отметки) — table_v пусто и предупреждение «не пересоздана»",
+          r["table_v"] == "" and r["counters"] == {"scan_hits": 7}
+          and any("не пересоздана" in w and "без отметки версии" in w for w in r["warn"]))
+
+    class NewerTable(FakeNft):
+        def __call__(self, args, inp=None):
+            if args[:3] == ["-j", "list", "counters"]:
+                return json.dumps({"nftables": [{"counter": {"name": s.table_v_name("1.3.9"), "packets": 0}}]})
+            return FakeNft.__call__(self, args, inp)
+    s.nft = NewerTable()
+    r = s.cmd_status(C, {}, False, "")
+    check("status: таблица другой версии — table_v её номер и предупреждение", r["table_v"] == "1.3.9"
+          and any("таблица в ядре 1.3.9" in w for w in r["warn"]))
+
+    class NoCounters(FakeNft):
+        def __call__(self, args, inp=None):
+            if args[:3] == ["-j", "list", "counters"]:
+                raise RuntimeError("nft -j list counters: нет ответа 30 с")
+            return FakeNft.__call__(self, args, inp)
+    s.nft = NoCounters()
+    r = s.cmd_status(C, {}, False, "")
+    check("status: счётчики не прочитались — table_v неизвестна (None), ложной тревоги нет",
+          r["table_v"] is None and r["warn"] == [])
+sys.stdin = real_stdin
+s.lock, s.unlock = real_lock, real_unlock
+s.nft, s.tick_timer_state = real_nft, real_timer
 print("щит: тестов пройдено %d" % ok)

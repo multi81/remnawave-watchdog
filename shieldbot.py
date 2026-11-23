@@ -261,14 +261,14 @@ def result_text(host, act, res, now):
         word = "адрес" if n % 10 == 1 and n % 100 != 11 else "адреса" if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14 else "адресов"
         what = what.replace("заблокированы", "заблокирован") if word == "адрес" else what
         lines = ["✅ <b>Щит, %s:</b> %d %s %s, до %s МСК" % (html.escape(host), n, word, what,
-                                                                  msk(res.get("until", now)).strftime("%d.%m %H:%M"))]
+                                                                  msk(res.get("until") or now).strftime("%d.%m %H:%M"))]
         if res.get("refused"):
             lines.append("Не тронуты: " + ", ".join("%s (%s)" % (html.escape(a), html.escape(w)) for a, w in res["refused"]))
         lines.append("Снять раньше — /unblock")
         return "\n".join(lines)
     if act == "on2":
         return ("✅ <b>Щит, %s:</b> %s — до %s МСК режется всё сверх порога с одного адреса; потом сам вернётся в "
-                "наблюдение. Выключить раньше — /unblock" % (html.escape(host), what, msk(res.get("until", now)).strftime("%H:%M")))
+                "наблюдение. Выключить раньше — /unblock" % (html.escape(host), what, msk(res.get("until") or now).strftime("%H:%M")))
     if act == "ua":
         return "✅ <b>Щит, %s:</b> %s (%d), щит в режиме наблюдения" % (html.escape(host), what, len(res.get("unblocked") or []))
     return "Щит, %s: %s" % (html.escape(host), what)
@@ -325,6 +325,24 @@ def execute(offer, act, run=run_ctl):
 
 
 # ---------- обработка обновлений ----------
+def mode_text(s):
+    """Режим щита словами. until=0 при on — срока нет (ядро режет, а state об этом не знает): не «до 03:00»."""
+    if s.get("mode") != "on":
+        return "наблюдение"
+    until = int(s.get("until") or 0)
+    return "включён до %s" % msk(until).strftime("%H:%M") if until > 0 else "включён, срок неизвестен"
+
+
+def warn_lines(s):
+    """Предупреждения щита (status.warn) и таймер tick, если он не active. -> строки под строкой сервера."""
+    warn = [str(w) for w in (s.get("warn") if isinstance(s.get("warn"), list) else [])]
+    out = ["   ⚠️ " + html.escape(w[:200]) for w in warn[:5]]
+    tick = s.get("tick")
+    if tick and tick != "active" and not any("таймер" in w for w in warn):
+        out.append("   ⚠️ таймер снятия режима (tick): " + html.escape(str(tick)[:20]))
+    return out
+
+
 def status_text(statuses, now):
     lines = ["🛡 <b>Щит: состояние</b> (%s МСК)" % msk(now).strftime("%d.%m %H:%M")]
     for host, s in sorted(statuses.items()):
@@ -332,14 +350,14 @@ def status_text(statuses, now):
             lines.append("• %s — %s" % (html.escape(host), "щит не стоит" if s.get("loaded") is False else
                                         "не ответил: " + html.escape(str(s.get("error"))[:80])))
             continue
-        mode = "включён до %s" % msk(s["until"]).strftime("%H:%M") if s.get("mode") == "on" else "наблюдение"
-        part = "• <b>%s</b> — %s" % (html.escape(host), mode)
+        part = "• <b>%s</b> — %s" % (html.escape(host), mode_text(s))
         if s.get("blocked"):
             part += " · заблокировано %d" % len(s["blocked"])
         if s.get("suspects"):
             part += " · подозрительных %d (больше всех %s — %s лишних)" % (
                 s.get("suspects_total", len(s["suspects"])), html.escape(s["suspects"][0][0]), cnt(s["suspects"][0][1]))
         lines.append(part)
+        lines += warn_lines(s)
     return "\n".join(lines)
 
 

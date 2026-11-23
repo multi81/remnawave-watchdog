@@ -99,6 +99,12 @@ DOCKER_FORGET = 3 * 86400   # пропавший контейнер забыва
 SHIELD_OFFER_MIN = 1000     # лишних соединений за 10 минут у самого «громкого» адреса — предложить и без атаки
 SHIELD_OFFER_EVERY = 3600   # не чаще раза в час на сервер (атака — своё предложение сразу)
 SHIELD_OFFER_IPS = 10
+SHIELD_ALARM_CONFIRM = 2    # опросов щита подряд (раз в минуту) с той же бедой, прежде чем тревожить
+SHIELD_ALARM_RU = {"tick": "таймер снятия режима (tick) не работает — истёкший «щит включён» снимается только при "
+                           "опросе щита сборщиком",
+                   "kernel": "в ядре щит режет, а по его записям — наблюдение: режется без срока и без нажатия кнопки. "
+                             "Снять — /unblock"}
+SHIELD_ALARM_OK_RU = {"tick": "таймер tick работает", "kernel": "ядро и записи щита снова совпадают"}
 HOST_INFO = {}              # {имя сервера: (адрес, пометка)} — из ddos.json, для строки «Сервер» в сообщениях
 IPINFO_CACHE = "/var/lib/channel-watch/ipinfo.json"   # сведения об адресах-источниках: {адрес: {"ts", ...}}
 IPINFO_TTL = 7 * 86400
@@ -890,19 +896,89 @@ def shield_offer_text(name, sh, ts, attack=None, clients=None):
     return "\n".join(lines)
 
 
+def shield_alarm_keys(sh):
+    """Беды щита, о которых тревожить: tick — таймер снятия режима не работает; kernel — ядро режет, а по state watch."""
+    warn = [str(w) for w in (sh.get("warn") if isinstance(sh.get("warn"), list) else [])]
+    keys = set()
+    tick = sh.get("tick")
+    if (tick and tick not in ("active", "unknown")) or any(
+            w.startswith("таймер tick не работает") or "таймер не работает" in w for w in warn):
+        keys.add("tick")
+    if any(w.startswith("в ядре щит режет") for w in warn):
+        keys.add("kernel")
+    return keys
+
+
+def shield_warn_text(name, title, keys, warn, ts):
+    lines = [title, "🖥 <b>Сервер:</b> %s · 🕒 %s МСК" % (server_label(name), msk(ts).strftime("%d.%m %H:%M")), ""]
+    lines += ["• " + SHIELD_ALARM_RU[k] for k in keys]
+    if warn:
+        lines.append("Щит сообщает: " + html.escape("; ".join(warn)))
+    return "\n".join(lines)
+
+
+def shield_warn_pass(e, name, sh, ts, c):
+    """Предупреждения щита (warn, tick) из среза: запомнить для отчёта; тревога — если «таймер tick не работает» или
+    «ядро режет, а по state watch» держится SHIELD_ALARM_CONFIRM опросов щита подряд. Срезы раз в 10 с несут один и
+    тот же опрос (раз в минуту, поле at) — считаются опросы, а не срезы. Ядро режет — сразу в любое время (могут
+    резаться клиенты), таймер — в рабочие часы, ночью в отчёт. -> список сообщений."""
+    es = e.setdefault("shield", {})
+    warn = [str(w)[:200] for w in (sh.get("warn") if isinstance(sh.get("warn"), list) else [])][:5]
+    es.update({"warn": warn, "tick": sh.get("tick"), "v": sh.get("v"), "table_v": sh.get("table_v")})
+    at = int(num(sh.get("at"))) or int(ts)
+    if at == es.get("warn_at"):
+        return []
+    es["warn_at"] = at
+    keys = shield_alarm_keys(sh)
+    run = es.setdefault("alarm_run", {})
+    for k in keys:
+        run[k] = run.get(k, 0) + 1
+    for k in list(run):
+        if k not in keys:
+            del run[k]
+    active = es.setdefault("alarm", [])
+    newly = [k for k in sorted(keys) if run[k] >= SHIELD_ALARM_CONFIRM and k not in active]
+    gone = [k for k in active if k not in keys]
+    es["alarm"] = [k for k in active if k in keys] + newly
+    work, msgs = in_work(c, ts), []
+    if newly:
+        if work or "kernel" in newly:
+            msgs.append(shield_warn_text(name, "⚠️ <b>Щит, %s: неладно</b>" % html.escape(name), newly, warn, ts))
+        else:
+            e.setdefault("deferred", []).append({"ts": ts, "state": "shield", "reasons": [
+                "щит: " + SHIELD_ALARM_RU[k] for k in newly]})
+    if gone and (work or "kernel" in gone):
+        msgs.append("🟢 <b>Щит, %s: снова в порядке</b> — %s" % (
+            html.escape(name), "; ".join(SHIELD_ALARM_OK_RU[k] for k in gone)))
+    return msgs
+
+
+def shield_warn_lines(hosts):
+    """Строки-предупреждения щита для отчёта: по серверу, если щит в последнем опросе что-то сообщил (warn)."""
+    out = []
+    for n, e in sorted(hosts.items()):
+        es = e.get("shield") or {}
+        if es.get("warn") and e.get("verdict") != "offline":
+            out.append("🛡 <b>Щит, %s:</b> %s" % (html.escape(n), html.escape("; ".join(es["warn"]))))
+    return out
+
+
 def shield_pass(e, name, s, c, state):
     """Последний срез: предложение кнопок в state["shield_pending"] (отправляет main через shieldbot) и сообщение,
     когда щит сам вернулся в наблюдение. -> список обычных сообщений."""
     sh = s.get("shield")
     if not isinstance(sh, dict) or not sh.get("loaded"):
+        if isinstance(e.get("shield"), dict):   # щита нет или не загружен — его прежние предупреждения уже не о чем
+            e["shield"].update({"warn": [], "alarm_run": {}, "alarm": []})
         return []
     ts, msgs = s["ts"], []
     es = e.setdefault("shield", {})
-    if es.get("mode") == "on" and sh.get("mode") == "watch":
+    if es.get("mode") == "on" and sh.get("mode") == "watch" and es.get("until"):   # on без срока — о нём своя тревога
         msgs.append("🛡 <b>Щит, %s:</b> время вышло — снова режим наблюдения, ничего не режется." % html.escape(name))
     es.update({"mode": sh.get("mode"), "until": sh.get("until", 0), "blocked": sh.get("blocked", 0),
                "suspects": sh.get("suspects_total", 0), "top": (sh.get("suspects") or [[None, 0]])[0],
                "scan": sh.get("scan") or {}})
+    msgs += shield_warn_pass(e, name, sh, ts, c)
     sus = sh.get("suspects") or []
     if not sus:
         return msgs
@@ -1116,6 +1192,7 @@ def report_lines(since, now, state=None, c=None, db=None):
                 out.append("%s %s: %s%s" % (icon, label, ", ".join(html.escape(n) for n, _ in bad),
                                             (" — " + html.escape("; ".join(reasons))) if reasons else ""))
         out += [x for x in (docker_issue(n, e) for n, e in hosts.items()) if x]
+        out += shield_warn_lines(hosts)
         night =[(n, d) for n, e in hosts.items() for d in e.get("deferred", []) if d["ts"] >= since]
         if night:
             out.append("ночью без сообщений: " + "; ".join("%s %s — %s" % (html.escape(n), msk(d["ts"]).strftime("%H:%M"),
@@ -1227,6 +1304,7 @@ def report_sections(since, now, state=None, c=None, db=None):
         si = shield_info(hosts)
         if si:
             info.append(si)
+        issues += shield_warn_lines(hosts)
         b_iss, b_inf = backup_lines(hosts, now)
         issues += b_iss
         info += b_inf

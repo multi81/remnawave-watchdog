@@ -30,7 +30,7 @@ import sys
 import time
 import urllib.parse
 
-VERSION = "1.7.0"   # 1.7.0: бэкапы по журналам (backups.json); 1.6.0: метка compose и --rm у контейнеров; 1.5.0 (27.10): переполнение буфера карты и сбросы ядра; 1.4.0 (25.10): протоколы и порты из щита
+VERSION = "1.8.0"   # 1.8.0: предупреждения щита (warn, tick) в срезе, клиент — только accepted сразу после адреса; 1.7.0: бэкапы по журналам (backups.json); 1.6.0: метка compose и --rm у контейнеров; 1.5.0 (27.10): переполнение буфера карты и сбросы ядра; 1.4.0 (25.10): протоколы и порты из щита
 SHIELD_CTL = "/usr/local/sbin/shield-ctl"
 SHIELD_TOP = 10
 XRAY_LOG = "/var/log/remnanode/access.log"
@@ -200,8 +200,15 @@ def containers(sock=DOCKER_SOCK, get=None, timeout=10):
     return True, out
 
 
-def shield(ctl=SHIELD_CTL, run=None):
-    """-> {mode, until, blocked, suspects: [[адрес, пакетов сверх порога]], over, dropped} или None (щита нет)."""
+SHIELD_WARN_MAX = 5      # предупреждений щита в срезе — не больше стольких, каждое не длиннее SHIELD_WARN_LEN
+SHIELD_WARN_LEN = 200
+
+
+def shield(ctl=SHIELD_CTL, run=None, now=None):
+    """-> {mode, until, blocked, suspects: [[адрес, пакетов сверх порога]], over, dropped, warn, tick, v, table_v, at}
+    или None (щита нет). warn — что щит сам считает неладным (таймер tick встал, ядро режет при watch и т. п.),
+    tick — состояние таймера, v — версия shield-ctl, table_v — версия таблицы в ядре (если щит её сообщает),
+    at — время опроса: срезы раз в 10 с несут один и тот же опрос, сторож считает подряд именно опросы."""
     if run is None:
         if not os.path.exists(ctl):
             return None
@@ -222,7 +229,12 @@ def shield(ctl=SHIELD_CTL, run=None):
             "over": int(cn.get("over_rate", 0)) + int(cn.get("over_conns", 0)),
             "dropped": int(cn.get("dropped_blocked", 0)) + int(cn.get("dropped_shield", 0)),
             "scan": {k: (d.get("scan") or {}).get(k) for k in ("mode", "nets", "updated", "sources", "packets")},
-            "proto": d.get("proto") or {}, "ports": [x for x in (d.get("ports") or [])[:5] if isinstance(x, list)]}
+            "proto": d.get("proto") or {}, "ports": [x for x in (d.get("ports") or [])[:5] if isinstance(x, list)],
+            "warn": [str(w)[:SHIELD_WARN_LEN] for w in (d.get("warn") if isinstance(d.get("warn"), list) else [])[:SHIELD_WARN_MAX]],
+            "tick": str(d["tick"])[:20] if d.get("tick") else None,
+            "v": str(d["v"])[:16] if d.get("v") else None,
+            "table_v": str(d["table_v"])[:16] if d.get("table_v") else None,
+            "at": int(now or time.time())}
 
 
 def proto_rates(sh, prev, now):
@@ -252,16 +264,21 @@ def client_key(addr):
 
 
 def parse_access(line):
-    """Строка журнала Xray -> (ts, ключ адреса, пользователь) или None. Только accepted с email (прошёл проверку)."""
-    if " accepted " not in line or " email: " not in line:
-        return None
+    """Строка журнала Xray -> (ts, ключ адреса, пользователь) или None. Только accepted с email (прошёл проверку).
+    accepted должно стоять словом сразу после «from адрес:порт»: у строки rejected в тексте причины бывают
+    и « accepted », и « email: » — такая строка не клиент, и email из неё не берётся."""
     try:
         head, rest = line.split(" from ", 1)
-        src = rest.split(" ", 1)[0]
+        src, _, tail = rest.partition(" ")
+        if not tail.startswith("accepted "):
+            return None
+        tail = " " + tail[len("accepted "):]
+        if " email: " not in tail:
+            return None
         if src.startswith(("tcp:", "udp:")):
             src = src[4:]
         host = src.rsplit(":", 1)[0]
-        user = line.rsplit(" email: ", 1)[1].split()[0]
+        user = tail.rsplit(" email: ", 1)[1].split()[0]
         ts = calendar.timegm(time.strptime(head[:19], "%Y/%m/%d %H:%M:%S"))   # время журнала Xray — UTC
     except (ValueError, IndexError):
         return None
@@ -436,7 +453,7 @@ def main():
                         cl.push()
                 except OSError:
                     pass
-            failed, docker, sh, bk, failed_at = failed_units(), containers(), shield(), backups(), t0
+            failed, docker, sh, bk, failed_at = failed_units(), containers(), shield(now=t0), backups(), t0
             if sh is not None and cl:
                 sh["clients"] = len(cl.map)
             if sh is not None and sh.get("loaded"):

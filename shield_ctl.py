@@ -5,9 +5,11 @@
 на rf1 по кнопке владельца в Telegram (ключ rf1 с command="shield-ctl --ssh").
 
 Таблица не трогает ufw, crowdsec, fail2ban и чужие таблицы nft; снимается одной командой: shield-ctl unload (nft delete table …).
-  raw_pre  (prerouting -300) — заблокированные адреса: drop до conntrack;
-  pre      (prerouting -150) — новые соединения с внешнего интерфейса: сверх rate/с или больше conns одновременно —
-            в «подозрительные» (со счётчиком) и в цепочку enforce: в режиме watch она пустая, в режиме on — drop.
+  raw_pre  (prerouting -300) — заблокированные адреса (по кнопке): drop до conntrack, режется всё;
+  pre      (prerouting -150, после conntrack) — только новые соединения (ct state new) с внешнего интерфейса:
+            свои (allow) — мимо всего; наши клиенты — в pre_clients; адреса из списка сканеров — scan;
+            сверх rate/с или больше conns одновременно — в «подозрительные» (со счётчиком) и в цепочку enforce:
+            в режиме watch она пустая, в режиме on — drop. Ответы на наши исходящие соединения сюда не попадают.
 Порог по адресу IPv4 и по сети /64 IPv6. Свои адреса (allow: владелец, наши серверы) и частные сети не считаются никогда.
 Prerouting — потому что у панели, sub и бота порты проброшены Docker (их трафик идёт мимо input).
 Наши клиенты (1.1.0): сборщик ddos-collect
@@ -22,6 +24,12 @@ Prerouting — потому что у панели, sub и бота порты �
 (списки shadow-netlab antiscanner, government_networks, skipa + свои добавки; собирает rf1 раз в сутки, присылает
 командой scanners-load, файл /etc/storozh-shield/scanners.txt). raw_pre: попадание — счётчик и учёт источника
 (scan_seen, сутки); в режиме scan drop — отбрасывание. Режим по умолчанию count (только считать), drop — включается командой, когда убедились, что ваших клиентов в списке нет.
+1.4.0: сканеры — в цепочке pre после conntrack: режутся только новые входящие соединения, ответы на наши
+исходящие (Telegram, GitHub, сайты для клиентов) и наши клиенты (clients4/6, счётчик scan_clients) — никогда; в scan drop
+режутся и пакеты ct invalid от сканеров (FIN/NULL/XMAS, непрошеный SYN-ACK), кроме своих и клиентов; каждая команда
+держит блокировку (flock), список scanners-load читается до неё, status держит её только на снятие истёкшего on;
+IPv6: отказ блокировать /64, если она пересекается со своими; режим on с вышедшим сроком снимает любая команда, status
+показывает, режет ли ядро, жив ли таймер tick и версию таблицы в ядре (table_v); allow «a, b» и «a,» разбираются.
 
 Команды: load | unload | tick | status | block СЕК [--clients] АДРЕС… | unblock all|АДРЕС… | mode watch |
          mode on ЧАСОВ | clients АДРЕС… (кто из них наш клиент) | scanners-load (список сетей на stdin) |
@@ -30,6 +38,7 @@ Prerouting — потому что у панели, sub и бота порты �
 Настройки /etc/storozh-shield/config.json, состояние /var/lib/storozh-shield/state.json (блокировки и режим
 переживают перезагрузку). Без внешних зависимостей.
 """
+import errno
 import ipaddress
 import json
 import os
@@ -37,13 +46,23 @@ import subprocess
 import sys
 import time
 
-VERSION = "1.3.0"
+try:
+    import fcntl
+except ImportError:   # Windows (тесты) — без блокировки
+    fcntl = None
+
+VERSION = "1.4.0"
 TABLE = "inet storozh_shield"
 CONF_FILE = "/etc/storozh-shield/config.json"
 STATE_FILE = "/var/lib/storozh-shield/state.json"
 LOG_FILE = "/var/log/storozh-shield.log"
 CLIENTS_FILE = "/run/storozh-shield/clients.json"
 SCANNERS_FILE = "/etc/storozh-shield/scanners.txt"
+LOCK_FILE = "/var/lib/storozh-shield/shield-ctl.lock"   # отдельный файл: state.json заменяется через os.replace
+LOCK_WAIT = 30
+STDIN_MAX = 20 * 2 ** 20   # scanners-load: больше не читаем
+TABLE_V = "table_v_"       # счётчик table_v_1_4_0: версия, которой собрана таблица в ядре
+TICK_TIMER = "storozh-shield-tick.timer"
 SCAN_MIN_PREFIX = {4: 16, 6: 28}   # шире — не принимаем (ошибка в списке не должна отрезать полмира)
 SCAN_MAX = 100000
 DEFAULTS = {"iface": "", "rate": 200, "burst": 400, "conns": 5000, "allow": [], "allow_private": True, "max_block": 50,
@@ -103,9 +122,27 @@ def default_iface():
 
 
 # ---------- адреса ----------
+def allow_items(c):
+    """Свои из config.json по одному: «a, b» и «a,» (запятые, пробелы) разбиваются, а не пропадают молча."""
+    out = []
+    for x in c.get("allow") or []:
+        out += str(x).replace(",", " ").split()
+    return out
+
+
+def allow_bad(c):
+    """Записи allow, которые не сеть и не адрес: щит их не знает — показать в status и в журнале."""
+    bad = []
+    for x in allow_items(c):
+        try:
+            ipaddress.ip_network(x, strict=False)
+        except ValueError:
+            bad.append(x[:60])
+    return bad
+
+
 def allow_list(c):
-    own = list(c.get("allow") or [])
-    return own + (ALWAYS_ALLOW if c.get("allow_private", True) else ["127.0.0.0/8", "::1/128"])
+    return allow_items(c) + (ALWAYS_ALLOW if c.get("allow_private", True) else ["127.0.0.0/8", "::1/128"])
 
 
 def networks(items):
@@ -149,7 +186,10 @@ def check_block(addrs, c, clients=None, with_clients=False):
             continue
         if (a.is_private and c.get("allow_private", True)) or a.is_loopback or a.is_multicast or a.is_reserved or a.is_unspecified or a.is_link_local:
             bad.append((x, "частный или служебный"))
-        elif any(a in n for n in (allow4 if a.version == 4 else allow6)):
+        elif a.version == 4 and any(a in n for n in allow4):
+            bad.append((x, "в списке своих"))
+        elif a.version == 6 and any(n.overlaps(ipaddress.ip_network("%s/64" % k)) for n in allow6):
+            # блокируется вся /64: отказ, если в ней есть хоть один свой адрес (временные адреса SLAAC владельца — )
             bad.append((x, "в списке своих"))
         elif k in clients and not with_clients:
             bad.append((x, "наш клиент"))
@@ -163,7 +203,15 @@ def check_block(addrs, c, clients=None, with_clients=False):
 
 # ---------- таблица ----------
 def render(c, iface, mode="watch", scan_mode="count"):
-    """Текст для nft -f: таблица целиком (пересоздаётся). Блокировки добавляются отдельно (restore)."""
+    """Текст для nft -f: таблица целиком (пересоздаётся). Блокировки добавляются отдельно (restore).
+    Сканеры — в pre, после `ct state != new return`: до conntrack резались бы и ответы на наши исходящие
+    соединения. Свои (allow) и клиенты уходят раньше проверки сканеров: клиент из списка сканеров не режется и в
+    count не считается попаданием, а только в scan_clients. jump scan (не goto): в count после счёта адрес
+    сканера проходит и проверку порогов, как раньше.
+    Пакеты ct invalid от сканеров (FIN/NULL/XMAS, непрошеный SYN-ACK — conntrack их не принимает) уходят в scan
+    отдельным правилом до `ct state != new return`: в drop режутся, в count считаются. Ответы на наши соединения —
+    established/related, их это правило не видит; наши клиенты из списка не трогаются и здесь.
+    Счётчик table_v_<версия> — отметка, какой версией собрана таблица (status.table_v)."""
     allow4, allow6 = networks(allow_list(c))
     rate, burst, conns, k = int(c["rate"]), int(c["burst"]), int(c["conns"]), max(int(c.get("client_factor", 5)), 1)
     m6 = "ip6 saddr & ffff:ffff:ffff:ffff::"
@@ -203,6 +251,8 @@ table {TABLE} {{
 	set scan_seen6 {{ type ipv6_addr; flags dynamic,timeout; timeout 24h; size 65536; }}
 	counter scan_hits {{ }}
 	counter scan_dropped {{ }}
+	counter scan_clients {{ }}
+	counter {table_v_name()} {{ }}
 	counter in_tcp {{ }}
 	counter in_udp {{ }}
 	counter in_icmp {{ }}
@@ -226,8 +276,6 @@ table {TABLE} {{
 		udp dport @gate_udp ip6 saddr != @gate6 counter name gate_dropped drop
 		ip saddr @blocked4 counter name dropped_blocked drop
 		{m6} @blocked6 counter name dropped_blocked drop
-		ip saddr @scanners4 update @scan_seen4 {{ ip saddr counter }} goto scan
-		ip6 saddr @scanners6 update @scan_seen6 {{ ip6 saddr counter }} goto scan
 	}}
 	chain scan {{
 		counter name scan_hits
@@ -235,12 +283,18 @@ table {TABLE} {{
 	chain pre {{
 		type filter hook prerouting priority -150; policy accept;
 		iifname != "{iface}" return
+		ct state invalid ip saddr @scanners4 ip saddr != @allow4 ip saddr != @clients4 update @scan_seen4 {{ ip saddr counter }} jump scan
+		ct state invalid ip6 saddr @scanners6 ip6 saddr != @allow6 {m6} != @clients6 update @scan_seen6 {{ ip6 saddr counter }} jump scan
 		ct state != new return
 		meta l4proto {{ tcp, udp }} update @newports {{ meta l4proto . th dport counter }}
 		ip saddr @allow4 return
 		ip6 saddr @allow6 return
+		ip saddr @clients4 ip saddr @scanners4 counter name scan_clients
+		{m6} @clients6 ip6 saddr @scanners6 counter name scan_clients
 		ip saddr @clients4 goto pre_clients
 		{m6} @clients6 goto pre_clients
+		ip saddr @scanners4 update @scan_seen4 {{ ip saddr counter }} jump scan
+		ip6 saddr @scanners6 update @scan_seen6 {{ ip6 saddr counter }} jump scan
 		add @flood4 {{ ip saddr limit rate over {rate}/second burst {burst} packets }} update @suspects4 {{ ip saddr counter }} counter name over_rate jump enforce
 		add @flood6 {{ {m6} limit rate over {rate}/second burst {burst} packets }} update @suspects6 {{ {m6} counter }} counter name over_rate jump enforce
 		add @conns4 {{ ip saddr ct count over {conns} }} update @suspects4 {{ ip saddr counter }} counter name over_conns jump enforce
@@ -258,8 +312,18 @@ table {TABLE} {{
 """
 
 
+def table_v_name(v=None):
+    return TABLE_V + (v or VERSION).replace(".", "_")
+
+
 def nft(args, inp=None):
-    r = subprocess.run(["nft"] + args, input=inp, capture_output=True, text=True, timeout=30)
+    try:
+        # LC_ALL=C: table_state() узнаёт «таблицы нет» по английскому тексту ошибки
+        r = subprocess.run(["nft"] + args, input=inp, capture_output=True, text=True, timeout=30,
+                           env=dict(os.environ, LC_ALL="C"))
+    except subprocess.TimeoutExpired:
+        # сбой nft, как и прочие: не роняет команду мимо обработчиков RuntimeError
+        raise RuntimeError("nft %s: нет ответа 30 с" % " ".join(args[:3]))
     if r.returncode != 0:
         raise RuntimeError("nft %s: %s" % (" ".join(args[:3]), (r.stderr or "").strip()[:300]))
     return r.stdout
@@ -268,6 +332,49 @@ def nft(args, inp=None):
 def current_mode(st, t=None):
     t = t or now()
     return "on" if st.get("mode") == "on" and int(st.get("until") or 0) > t else "watch"
+
+
+def enforce_drops():
+    """Режет ли сейчас ядро сверх порога (в цепочке enforce есть drop). None — таблицы или цепочки нет."""
+    try:
+        out = nft(["list", "chain", TABLE, "enforce"])
+    except RuntimeError:
+        return None
+    return any(ln.strip().endswith("drop") for ln in (out or "").splitlines())
+
+
+def table_state():
+    """Есть ли таблица в ядре: True; False — nft ответил «No such file or directory»; None — nft сбоит иначе
+    (таймаут, нет nft, …): про таблицу ничего не известно. -t — без элементов наборов (их сотни тысяч)."""
+    try:
+        nft(["-t", "list", "table", TABLE])
+        return True
+    except RuntimeError as e:
+        return False if "No such file or directory" in str(e) else None
+
+
+def tick_timer_state():
+    """systemctl is-active таймера tick: active / inactive / failed / … ; unknown — спросить не удалось."""
+    try:
+        r = subprocess.run(["systemctl", "is-active", TICK_TIMER], capture_output=True, text=True, timeout=5)
+    except (OSError, subprocess.SubprocessError):
+        return "unknown"
+    return (r.stdout or "").strip()[:20] or "unknown"
+
+
+def expire_on(c, st):
+    """Режим on с вышедшим сроком — снять сейчас, не дожидаясь tick: таймер мог встать. -> True, если снят."""
+    if st.get("mode") != "on" or current_mode(st) == "on":
+        return False
+    try:
+        set_mode(c, st, "watch")
+    except RuntimeError:
+        if table_state() is not False:
+            raise   # таблица есть или nft сбоит иначе — ядро, может быть, ещё режет: state не трогаем, ошибка в ответе
+        st["mode"], st["until"] = "watch", 0        # таблицы точно нет — резать нечему, в state записать правду
+        save_state(st)
+    log("mode on истёк — снова наблюдение")
+    return True
 
 
 def live_blocks(st, t=None):
@@ -419,7 +526,11 @@ def cmd_load(c, st):
     st["blocks"] = live_blocks(st)
     mode = current_mode(st)
     if mode == "watch":
+        if st.get("mode") == "on":
+            log("load: mode on истёк — снова наблюдение")
         st["mode"], st["until"] = "watch", 0
+    if allow_bad(c):
+        log("allow: не адреса, щит их не знает: %s" % " ".join(allow_bad(c)[:10]))
     nft(["-f", "-"], render(c, iface, mode, scan_mode(st)))
     add_elements(st["blocks"])
     try:
@@ -445,12 +556,14 @@ def set_mode(c, st, mode, hours=0):
         hours = float(hours)
         if not 0 < hours <= float(c["max_on_hours"]):
             raise ValueError("часов — от 0 до %s" % c["max_on_hours"])
-        st["mode"], st["until"] = "on", now() + int(hours * 3600)
+        until = now() + int(hours * 3600)
         nft(["flush", "chain", TABLE, "enforce"])
         nft(["add", "rule", TABLE, "enforce", "counter", "name", "dropped_shield", "drop"])
+        st["mode"], st["until"] = "on", until
     else:
-        st["mode"], st["until"] = "watch", 0
         nft(["flush", "chain", TABLE, "enforce"])
+        # state меняем только после nft: при ошибке в state остаётся то, что на самом деле в ядре
+        st["mode"], st["until"] = "watch", 0
     save_state(st)
     log("mode %s %s" % (st["mode"], st["until"]))
     return {"ok": True, "mode": st["mode"], "until": st["until"]}
@@ -486,10 +599,17 @@ def cmd_unblock(c, st, addrs):
                 k = block_key(x)
             except ValueError:
                 continue
-            if k in blocks:
+            if k in keys:   # повтор адреса: второй delete в nft упал бы ошибкой
+                continue
+            # снимаем в ядре и то, чего нет в state (блок, записанный в обход state до блокировки команд, — );
+            # нет элемента в ядре (срок вышел секундой раньше) — не ошибка, из state всё равно убрать
+            try:
+                nft(["delete", "element", TABLE, "blocked%d" % ipaddress.ip_address(k).version, "{ %s }" % k])
+                gone = True
+            except RuntimeError:
+                gone = False
+            if gone or k in blocks:
                 keys.append(k)
-                fam = ipaddress.ip_address(k).version
-                nft(["delete", "element", TABLE, "blocked%d" % fam, "{ %s }" % k])
     for k in keys:
         blocks.pop(k, None)
     st["blocks"] = blocks
@@ -542,7 +662,8 @@ def parse_counters(js):
     return out
 
 
-def cmd_status(c, st):
+def cmd_status(c, st, expired=False, expire_err=""):
+    """Срез щита. Режим — как в ядре (есть ли drop в enforce), а не только по state; warn — что не так."""
     sus = []
     for fam in (4, 6):
         try:
@@ -552,7 +673,14 @@ def cmd_status(c, st):
     try:
         counters = parse_counters(json.loads(nft(["-j", "list", "counters", "table", TABLE])))
     except (RuntimeError, ValueError):
-        counters = {}
+        counters = None
+    table_v = None   # None — счётчики прочесть не удалось; "" — таблица без отметки версии (собрана кодом до неё)
+    if counters is not None:
+        marks = sorted(k for k in counters if k.startswith(TABLE_V))
+        table_v = marks[0][len(TABLE_V):].replace("_", ".") if marks else ""
+        for k in marks:
+            counters.pop(k)
+    counters = counters or {}
     sus.sort(key=lambda x: -x[1])
     seen = []
     for fam in (4, 6):
@@ -570,9 +698,27 @@ def cmd_status(c, st):
         scan_updated = int(os.path.getmtime(SCANNERS_FILE))
     except OSError:
         scan_nets, scan_updated = 0, 0
-    return {"ok": True, "loaded": True, "v": VERSION, "mode": current_mode(st), "until": int(st.get("until") or 0),
+    mode, warn, timer, enforce = current_mode(st), [], tick_timer_state(), enforce_drops()
+    timer_ok = timer in ("active", "unknown")
+    if expired:
+        warn.append("on истёк, таймер не работает — снят сейчас" if not timer_ok else "on истёк — снят сейчас")
+    elif not timer_ok:
+        warn.append("таймер tick не работает (%s)" % timer)
+    if expire_err:
+        warn.append("on истёк, снять не удалось: %s" % expire_err[:150])
+    if enforce is not None and enforce != (mode == "on"):
+        warn.append("в ядре щит %s, а по state %s" % ("режет" if enforce else "не режет", mode))
+        mode = "on" if enforce else "watch"
+    if allow_bad(c):
+        warn.append("в allow не адреса: %s" % " ".join(allow_bad(c)[:5]))
+    if table_v is not None and table_v != VERSION:
+        warn.append("таблица в ядре %s, код %s — не пересоздана (shield-ctl load)" % (
+            table_v or "без отметки версии", VERSION))
+    return {"ok": True, "loaded": True, "v": VERSION, "table_v": table_v, "mode": mode,
+            "until": int(st.get("until") or 0), "tick": timer, "warn": warn,
             "scan": {"mode": scan_mode(st), "nets": scan_nets, "updated": scan_updated, "sources": len(seen),
-                     "packets": sum(p for _, p in seen), "top": [list(x) for x in seen[:10]]},
+                     "packets": sum(p for _, p in seen), "top": [list(x) for x in seen[:10]],
+                     "clients": counters.get("scan_clients", 0)},
             "blocked": sorted(live_blocks(st).items()), "suspects": [list(x) for x in sus[:SUSPECT_TOP]],
             "suspects_total": len(sus), "counters": counters, "clients": len(load_clients()),
             "limits": {"rate": int(c["rate"]), "conns": int(c["conns"])},
@@ -583,11 +729,7 @@ def cmd_status(c, st):
 
 
 def cmd_tick(c, st):
-    changed = False
-    if st.get("mode") == "on" and current_mode(st) == "watch":
-        set_mode(c, st, "watch")
-        log("mode on истёк — снова наблюдение")
-        changed = True
+    changed = expire_on(c, st)
     blocks = live_blocks(st)
     if blocks != (st.get("blocks") or {}):
         st["blocks"] = blocks
@@ -599,10 +741,23 @@ def cmd_tick(c, st):
 SSH_ALLOWED = ("status", "block", "unblock", "mode", "clients", "scanners-load", "scan-mode", "scan-clients")
 
 
-def dispatch(argv, c, st):
+def expire_step(c, st):
+    """expire_on для обычной команды: сбой снятия не роняет её, а уходит в ответ. -> (снят ли, текст ошибки)."""
+    try:
+        return expire_on(c, st), ""
+    except RuntimeError as e:
+        log("mode on истёк, снять не удалось: %s" % str(e)[:200])
+        return False, str(e)
+
+
+def dispatch(argv, c, st, data=None):
+    """data — список сетей для scanners-load, прочитанный до блокировки (main)."""
     if not argv:
         raise ValueError("нет команды")
     cmd, a = argv[0], argv[1:]
+    expired, expire_err = False, ""
+    if cmd not in ("load", "unload", "tick"):   # load и tick снимают истёкшее сами
+        expired, expire_err = expire_step(c, st)
     if cmd == "load":
         return cmd_load(c, st)
     if cmd == "unload":
@@ -611,13 +766,15 @@ def dispatch(argv, c, st):
     if cmd == "tick":
         return cmd_tick(c, st)
     if cmd == "status":
-        return cmd_status(c, st)
+        return cmd_status(c, st, expired, expire_err)
     if cmd == "block" and len(a) >= 2:
         return cmd_block(c, st, a[0], a[1:])
     if cmd == "clients" and a:
         return cmd_clients(a)
     if cmd == "scanners-load" and not a:
-        return cmd_scanners_load(c, sys.stdin.read(20 * 2 ** 20))
+        if data is None:
+            raise ValueError("список сетей не передан")
+        return cmd_scanners_load(c, data)
     if cmd == "scan-mode" and len(a) == 1:
         return cmd_scan_mode(c, st, a[0])
     if cmd == "scan-clients" and not a:
@@ -641,15 +798,65 @@ def ssh_argv(original):
     return parts
 
 
+class Busy(RuntimeError):
+    pass
+
+
+def lock(path=None, wait=None, flock=None):
+    """Исключительная блокировка на всё время команды: tick, block, mode и прочие не перетирают state.json
+    друг друга. Ждём до wait секунд, потом Busy. -> дескриптор (закрыть — снять блокировку) или None (нет fcntl)."""
+    flock = flock or (fcntl.flock if fcntl else None)
+    if flock is None:
+        return None
+    path, wait = path or LOCK_FILE, LOCK_WAIT if wait is None else wait
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o600)
+    ex, nb = getattr(fcntl, "LOCK_EX", 2), getattr(fcntl, "LOCK_NB", 4)
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            flock(fd, ex | nb)
+            return fd
+        except OSError as e:
+            if e.errno not in (errno.EAGAIN, errno.EACCES, errno.EWOULDBLOCK):
+                os.close(fd)
+                raise
+        if time.monotonic() >= deadline:
+            os.close(fd)
+            raise Busy("щит занят другой командой дольше %d с — повторите позже" % wait)
+        time.sleep(0.2)
+
+
+def unlock(fd):
+    if fd is not None:
+        os.close(fd)
+
+
 def main(argv):
-    c, st = cfg(), load_json(STATE_FILE, {})
+    c, fd = cfg(), None
     try:
         if argv[:1] == ["--ssh"]:
             argv = ssh_argv(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
             log("ssh: " + " ".join(argv)[:300])
-        res = dispatch(argv, c, st)
+        # список сканеров — до блокировки: зависшая передача по SSH (обрыв без FIN, EOF не придёт) держит только эту
+        # команду, а tick, status и кнопки работают
+        data = sys.stdin.read(STDIN_MAX) if argv == ["scanners-load"] else None
+        fd = lock()
+        st = load_json(STATE_FILE, {})   # state — только под блокировкой: иначе перетрём то, что записал соседний вызов
+        st = st if isinstance(st, dict) else {}
+        if argv[:1] == ["status"]:
+            # status зовёт сборщик раз в минуту (под CPUQuota): под блокировкой только снятие истёкшего on с записью
+            # state, а nft list и сбор сведений — без неё, чтобы tick и кнопки его не ждали
+            expired, expire_err = expire_step(c, st)
+            unlock(fd)
+            fd = None
+            res = cmd_status(c, st, expired, expire_err)
+        else:
+            res = dispatch(argv, c, st, data)
     except (ValueError, RuntimeError, OSError, subprocess.SubprocessError) as e:
         res = {"ok": False, "error": str(e)[:300]}
+    finally:
+        unlock(fd)
     print(json.dumps(res, ensure_ascii=False))
     return 0 if res.get("ok") else 1
 
