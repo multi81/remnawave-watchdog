@@ -5,7 +5,9 @@
    (канал сторожа с выходом на другом сервере, которого нет ни в одном списке разрешённых адресов), а не с rf1:
    rf1 сама в списках SSH, с неё «закрытый» порт выглядит открытым.
 3. Закачка побольше перед отчётом (probe.py --speed) — скорость ближе к настоящей, чем на 512 КБ.
-Список нод и адреса маячков — /etc/channel-watch/nodes.json: [{"name", "host", "beacon"}].
+Список нод и адреса маячков — /etc/channel-watch/nodes.json: [{"name", "host", "beacon"[, "sha256"]}]. "sha256" —
+отпечаток сертификата маячка в режиме --serve (его печатает beacon_install.sh строкой BEACON-SHA256): с ним маячок
+забирается только по TLS с этим сертификатом; без него — по-старому, по HTTP.
 """
 import concurrent.futures
 import datetime as dt
@@ -14,10 +16,16 @@ import json
 import socket
 import ssl
 import statistics
-import struct
 import subprocess
 import time
 import urllib.request
+
+import netprobe
+
+# Через SOCKS-порты каналов сторожа (127.0.0.1:21000-21099) ходим с паролем из socks.auth: сокет — через
+# netprobe.socks_connect, curl — через netprobe.curl_socks (пароль на stdin, не в argv). Метка для
+# build_channels.py --socks-auth: этот модуль пароль умеет.
+SOCKS_AUTH_READY = True
 
 BEACON_STALE = 1800        # маячок старше — «не отдаёт состояние»
 DISK_WARN, DISK_BAD = 85, 93   # % занятого диска: предупредить / тревога
@@ -33,14 +41,116 @@ BIG_BYTES = 10 * 1024 * 1024
 BIG_URL = f"https://speed.cloudflare.com/__down?bytes={BIG_BYTES}"
 BIG_FRESH = 3 * 3600       # замер «большой» скорости старше — в отчёт не идёт
 DAYS_KEEP = 15
+NODES_FILE = "/etc/channel-watch/nodes.json"
 
 
-def fetch_beacon(url):
-    """Маячок ноды: словарь либо None, если не достучались или пришло не то."""
+def beacon_pin(url, nodes_file=None, derive=None):
+    """Отпечаток сертификата маячка из nodes.json (поле "sha256" у ноды с этим адресом маячка).
+    None — поля нет (ходим по-старому, HTTP); строка — поле есть: TLS только с этим сертификатом ('' — испорченное
+    поле, маячок тогда не читается, на HTTP не откатываемся). derive(адрес маячка) -> адрес, который сравнивается
+    с url: так blockwatch находит отпечаток для файла свидетеля (flows.json лежит рядом с маячком, порт тот же)."""
+    if not url:
+        return None
     try:
-        req = urllib.request.Request(url, headers={"User-Agent": "channel-watch", "Cache-Control": "no-cache"})
-        with urllib.request.urlopen(req, timeout=8) as r:
-            data = json.loads(r.read(65536).decode("utf-8"))
+        nodes = json.load(open(nodes_file or NODES_FILE, encoding="utf-8"))
+    except (OSError, ValueError):
+        return None
+    for n in nodes if isinstance(nodes, list) else []:
+        if not isinstance(n, dict) or not n.get("beacon") or "sha256" not in n:
+            continue
+        try:
+            same = (derive(n["beacon"]) if derive else n["beacon"]) == url
+        except Exception:  # испорченный адрес маячка у другой ноды — к этому адресу отношения не имеет
+            same = False
+        if same:
+            return str(n["sha256"] or "")
+    return None
+
+
+def _pin_wrap(raw, pin):
+    """TLS поверх готового сокета (SOCKS-канал сторожа) со сверкой отпечатка — те же настройки, что у
+    vantage_client.open_pinned. None — не тот сертификат или рукопожатие не прошло (сокет закрыт)."""
+    import hmac
+    import vantage_client
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE  # цепочку не проверяем: доверяем ровно одному сертификату — по отпечатку
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    try:
+        tls = ctx.wrap_socket(raw)
+    except (OSError, ValueError):
+        raw.close()
+        return None
+    if not hmac.compare_digest(vantage_client.fingerprint(tls.getpeercert(binary_form=True) or b""), pin):
+        tls.close()
+        return None
+    return tls
+
+
+def pinned_get(url, pin, timeout=8, limit=65536, socks_port=None):
+    """GET по TLS с закреплённым сертификатом (beacon_serve.py на ноде): тело ответа 200 или None.
+    Сертификат сверяется до отправки запроса — тем же способом, что у точек проверки (vantage_client.open_pinned).
+    socks_port — через SOCKS-канал сторожа (с паролем, netprobe.socks_connect); TLS и сверка те же, на HTTP не
+    откатываемся. Тело больше limit — None (как --max-filesize у curl). Общий код для маячка и свидетеля."""
+    import http.client
+    import urllib.parse
+    try:
+        import vantage_client
+    except ImportError:
+        return None
+    pin = vantage_client.norm_fp(pin)
+    if not pin:
+        return None
+    u = urllib.parse.urlsplit(url)
+    tls = conn = None
+    try:
+        if socks_port:
+            raw = socks_connect(socks_port, u.hostname, u.port or 80, timeout)
+            tls = _pin_wrap(raw, pin) if raw is not None else None
+        else:
+            tls = vantage_client.open_pinned({"url": url, "sha256": pin}, timeout)
+        if tls is None:
+            return None
+        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=timeout)
+        conn.sock = tls
+        conn.request("GET", u.path or "/", headers={"User-Agent": "channel-watch", "Cache-Control": "no-cache",
+                                                    "Connection": "close"})
+        r = conn.getresponse()
+        if r.status != 200:
+            return None
+        body = r.read(limit + 1)
+        return body if len(body) <= limit else None
+    except Exception:  # сеть, обрыв, не HTTP — «не читается»
+        return None
+    finally:
+        for c in (conn, tls):
+            if c is not None:
+                try:
+                    c.close()
+                except OSError:
+                    pass
+
+
+def fetch_beacon_tls(url, pin, timeout=8):
+    """Маячок по TLS с закреплённым сертификатом (beacon_serve.py на ноде): сырой ответ или None."""
+    return pinned_get(url, pin, timeout)
+
+
+def fetch_beacon(url, sha256=None):
+    """Маячок ноды: словарь либо None, если не достучались или пришло не то.
+    sha256 (или поле "sha256" у ноды в nodes.json, если sha256 не передан) — отпечаток сертификата маячка: тогда
+    только TLS с этим сертификатом, без отката на HTTP. Нет отпечатка — по-старому, по адресу как есть."""
+    pin = beacon_pin(url) if sha256 is None else str(sha256 or "")
+    try:
+        if pin is not None:
+            raw = fetch_beacon_tls(url, pin)
+            if raw is None:
+                return None
+        else:
+            req = urllib.request.Request(url, headers={"User-Agent": "channel-watch", "Cache-Control": "no-cache"})
+            with urllib.request.urlopen(req, timeout=8) as r:
+                raw = r.read(65536)
+        data = json.loads(raw.decode("utf-8"))
         return data if isinstance(data, dict) and isinstance(data.get("ts"), (int, float)) else None
     except Exception:  # сеть, сертификат, не JSON — для отчёта это одно и то же: «маячок не читается»
         return None
@@ -207,21 +317,11 @@ TLS_PORTS = (443,)  # здесь, если на простой запрос мо
 
 
 def socks_connect(socks_port, host, port, timeout):
-    """Соединение с host:port через SOCKS-порт канала сторожа; None — канал не принял."""
-    s = socket.create_connection(("127.0.0.1", socks_port), timeout=timeout)
-    try:
-        s.settimeout(timeout)
-        s.sendall(b"\x05\x01\x00")
-        name = host.encode()
-        if s.recv(2) == b"\x05\x00":
-            s.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + struct.pack(">H", port))
-            reply = s.recv(10)
-            if len(reply) >= 2 and reply[1] == 0:
-                return s
-    except (OSError, socket.timeout):
-        pass
-    s.close()
-    return None
+    """Соединение с host:port через SOCKS-порт канала сторожа; None — канал не принял.
+    Рукопожатие — netprobe.socks_connect: с паролем из socks.auth, если файл есть. Предлагаются оба способа входа,
+    выбирает Xray: старый xray.json без пароля выберет «без пароля», так что при поэтапной выкладке работают оба
+    сочетания."""
+    return netprobe.socks_connect(socks_port, host, port, timeout)
 
 
 def socks_open(socks_port, host, port, timeout=5, tls=False):
@@ -273,9 +373,11 @@ def socks_open(socks_port, host, port, timeout=5, tls=False):
 
 def site_title(socks_port, host):
     """Сайт-прикрытие глазами постороннего: (код ответа, заголовок страницы)."""
-    cmd = ["curl", "-s", "-m", "10", "-x", f"socks5h://127.0.0.1:{socks_port}", "-w", "\n%{http_code}", f"https://{host}/"]
+    proxy, cfg = netprobe.curl_socks(socks_port)  # пароль SOCKS — в конфиге на stdin (-K -), не в argv
+    cmd = ["curl", "-s", "-m", "10", *proxy, "-w", "\n%{http_code}", f"https://{host}/"]
     try:
-        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15).stdout
+        out = subprocess.run(cmd, capture_output=True, text=True, timeout=15,
+                             **({"input": cfg} if cfg else {})).stdout  # stdin — только когда есть пароль
     except subprocess.TimeoutExpired:
         return "000", ""
     body, _, code = out.rpartition("\n")
@@ -314,10 +416,12 @@ def tls_face(socks_port, host, version, timeout=8):
 
 def site_face(socks_port, host):
     """Заглушка глазами постороннего: {"r301", "tls12", "tls13", "hsts", "cert"} — True/False; None — канал подвёл."""
+    proxy, cfg = netprobe.curl_socks(socks_port)  # пароль SOCKS — в конфиге на stdin (-K -), не в argv
+
     def curl(*args):
         try:
-            return subprocess.run(["curl", "-s", "-m", "10", "-x", f"socks5h://127.0.0.1:{socks_port}", *args],
-                                  capture_output=True, text=True, timeout=15).stdout
+            return subprocess.run(["curl", "-s", "-m", "10", *proxy, *args], capture_output=True, text=True,
+                                  timeout=15, **({"input": cfg} if cfg else {})).stdout
         except subprocess.TimeoutExpired:
             return ""
     code, _, to = curl("-o", "/dev/null", "-w", "%{http_code} %{redirect_url}", f"http://{host}/").partition(" ")
@@ -404,11 +508,13 @@ def outside_line(outside, nodes_total):
 
 def big_speed(port, max_time=45):
     """Скорость закачки BIG_BYTES через канал, Мбит/с; None — не докачалось."""
-    cmd = ["curl", "-s", "-m", str(max_time), "-o", "/dev/null", "-x", f"socks5h://127.0.0.1:{port}",
+    proxy, cfg = netprobe.curl_socks(port)  # пароль SOCKS — в конфиге на stdin (-K -), не в argv
+    cmd = ["curl", "-s", "-m", str(max_time), "-o", "/dev/null", *proxy,
            "-w", "%{size_download} %{speed_download}", BIG_URL]
     try:
-        size, speed = subprocess.run(cmd, capture_output=True, text=True, timeout=max_time + 5).stdout.split()
-    except (ValueError, subprocess.TimeoutExpired):
+        size, speed = subprocess.run(cmd, capture_output=True, text=True, timeout=max_time + 5,
+                                     **({"input": cfg} if cfg else {})).stdout.split()
+    except (ValueError, OSError, subprocess.TimeoutExpired):
         return None
     return round(float(speed) * 8 / 1e6, 1) if int(float(size)) >= BIG_BYTES else None
 

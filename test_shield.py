@@ -449,7 +449,7 @@ check("сообщение: чем бьют — протоколы и порты"
 check("без данных щита — строки нет", d.proto_line({}) == "")
 
 
-# ===== 1.4.0: =====
+# ===== 1.4.0: allow через запятую, блокировка команд, IPv6 /64, истёкший on =====
 class FakeNft:
     """Подставной nft: помнит, режет ли enforce; table=False — таблицы нет (все вызовы падают)."""
     def __init__(self, enforce=False, table=True, fail_flush=False):
@@ -644,7 +644,7 @@ with tempfile.TemporaryDirectory() as tmp:
         os.close(fd2)
 s.nft, s.tick_timer_state = real_nft, real_timer
 
-# ===== партия 2: stdin до блокировки, status без долгой блокировки, «таблицы нет» ≠ сбой nft, table_v =====
+# ===== 1.4.0: stdin до блокировки, status без долгой блокировки, «таблицы нет» ≠ сбой nft, table_v =====
 import contextlib  # noqa: E402
 import io  # noqa: E402
 
@@ -844,4 +844,178 @@ with tempfile.TemporaryDirectory() as tmp:
 sys.stdin = real_stdin
 s.lock, s.unlock = real_lock, real_unlock
 s.nft, s.tick_timer_state = real_nft, real_timer
+
+# ===== allow-sync — свои от сторожа отдельным набором =====
+import scanlists as sl  # noqa: E402
+
+nets_, bad_ = s.parse_allow_sync("93.184.89.45\n1.2.3.4, 1.2.3.5  # свои\n2a01:4f8:1::/64\n203.0.113.0/24\n"
+                                 "0.0.0.0/0\n10.0.0.0/8\n::/0\n2a00::/31\nfe80::1%eth0\nмусор\n0.0.0.0\n224.0.0.1\n")
+check("AS1 allow-sync: адреса и сети приняты (склеены), шире /24 и /64, зона IPv6, мусор, служебные — отказ по строке",
+      nets_ == ["1.2.3.4/31", "93.184.89.45/32", "203.0.113.0/24", "2a01:4f8:1::/64"]
+      and dict(bad_) == {"0.0.0.0/0": "слишком широкая (шире /24)", "10.0.0.0/8": "слишком широкая (шире /24)",
+                         "::/0": "слишком широкая (шире /64)", "2a00::/31": "слишком широкая (шире /64)",
+                         "fe80::1%eth0": "зона IPv6", "мусор": "не адрес", "0.0.0.0": "служебный адрес",
+                         "224.0.0.1": "служебный адрес"})
+try:
+    s.parse_allow_sync("".join("8.%d.%d.%d\n" % (i // 65536, i // 256 % 256, i % 256) for i in range(0, 2 * s.ALLOW_SYNC_MAX + 4, 2)))
+    check("AS2 записей больше предела — отказ целиком", False)
+except ValueError as e:
+    check("AS2 записей больше предела — отказ целиком", "больше" in str(e))
+check("AS3 allow-sync разрешена по SSH, с аргументами — нет", s.ssh_argv("allow-sync") == ["allow-sync"]
+      and "allow-sync" in s.SSH_ALLOWED)
+real_lock, real_unlock, real_stdin = s.lock, s.unlock, sys.stdin
+real_sync_file, real_conf = s.ALLOW_SYNC_FILE, s.CONF_FILE
+with tempfile.TemporaryDirectory() as tmp:
+    s.STATE_FILE, s.LOG_FILE = os.path.join(tmp, "st.json"), os.path.join(tmp, "log")
+    s.CLIENTS_FILE, s.SCANNERS_FILE = os.path.join(tmp, "cl.json"), os.path.join(tmp, "sc.txt")
+    s.ALLOW_SYNC_FILE, s.CONF_FILE = os.path.join(tmp, "allow-sync.txt"), os.path.join(tmp, "config.json")
+    conf_text = json.dumps({"allow": ["93.187.140.234"]})
+    open(s.CONF_FILE, "w", encoding="utf-8").write(conf_text)
+    s.tick_timer_state = lambda: "active"
+    order = []
+
+    def lock_rec(*a, **k):
+        order.append("lock")
+        return os.open(os.path.join(tmp, "lk"), os.O_RDWR | os.O_CREAT)
+
+    def unlock_rec(fd):
+        if fd is not None:
+            order.append("unlock")
+            os.close(fd)
+
+    class OrderNft(FakeNft):
+        def __call__(self, args, inp=None):
+            order.append(("nft",) + tuple(args[:3]))
+            return FakeNft.__call__(self, args, inp)
+    s.lock, s.unlock = lock_rec, unlock_rec
+    s.nft = OrderNft()
+    sys.stdin = Stdin(order, "93.184.216.7\n2a01:4f8:1::/64\n0.0.0.0/0\n")
+    rc, out = run_main(["allow-sync"])
+    nft_f = [i for i, x in enumerate(order) if x == ("nft", "-f", "-")]
+    sync_inp = [i for i in s.nft.inputs if i and "allow4" in i]
+    check("AS4 allow-sync: stdin до блокировки с пределом+1, nft под блокировкой, файл записан, 0.0.0.0/0 отвергнут",
+          rc == 0 and out["ok"] and out["n"] == 2 and out["applied"] is True and out["refused_total"] == 1
+          and order[0] == ("stdin", s.ALLOW_STDIN_MAX + 1) and order.index("lock") == 1
+          and nft_f and order.index("lock") < nft_f[-1] < order.index("unlock")
+          and open(s.ALLOW_SYNC_FILE, encoding="utf-8").read() == "93.184.216.7/32\n2a01:4f8:1::/64\n")
+    check("AS5 в ядре allow4/6 заново одной транзакцией: свои от сторожа + allow установщика + частные; таблица не "
+          "пересоздаётся", len(sync_inp) == 1 and sync_inp[0].startswith("flush set %s allow4\nflush set %s allow6\n" % (s.TABLE, s.TABLE))
+          and "93.184.216.7/32" in sync_inp[0] and "93.187.140.234/32" in sync_inp[0] and "10.0.0.0/8" in sync_inp[0]
+          and "2a01:4f8:1::/64" in sync_inp[0] and "delete table" not in sync_inp[0])
+    check("AS6 config.json установщика не тронут", open(s.CONF_FILE, encoding="utf-8").read() == conf_text)
+    c2 = s.cfg()
+    check("AS7 свои от сторожа учитываются везде, где allow: отказ блокировать, таблица, вырезание из сканеров",
+          c2["allow"] == ["93.187.140.234"] and c2["allow_sync"] == ["93.184.216.7/32", "2a01:4f8:1::/64"]
+          and dict(s.check_block(["93.184.216.7", "2a01:4f8:1::9", "93.187.140.234"], c2)[1])
+          == {"93.184.216.7": "в списке своих", "2a01:4f8:1::9": "в списке своих", "93.187.140.234": "в списке своих"}
+          and "93.184.216.7" in s.render(c2, "eth0").split("set allow4")[1].split("}")[0]
+          and s.parse_scanners("93.184.216.7/32\n93.184.216.0/24\n", c2)[0] != []
+          and all("93.184.216.7" not in str(n) for n in s.parse_scanners("93.184.216.7/32\n93.184.216.0/24\n", c2)[0]
+                  if n.prefixlen == 32))
+    check("AS8 status: сколько своих от сторожа и когда обновлены", s.cmd_status(c2, {})["allow_sync"]["n"] == 2
+          and s.cmd_status(c2, {})["allow_sync"]["updated"] > 0)
+    order.clear()
+    os.environ["SSH_ORIGINAL_COMMAND"] = "allow-sync"
+    sys.stdin = Stdin(order, "93.184.216.8\n")
+    rc, out = run_main(["--ssh"])
+    check("AS9 allow-sync по SSH: тоже stdin до блокировки, список заменён целиком", rc == 0
+          and order[0] == ("stdin", s.ALLOW_STDIN_MAX + 1) and order.index("lock") == 1
+          and open(s.ALLOW_SYNC_FILE, encoding="utf-8").read() == "93.184.216.8/32\n")
+    del os.environ["SSH_ORIGINAL_COMMAND"]
+    for name_, text_ in (("AS10 больше предела размера — отказ целиком, файл и ядро не тронуты", "1.2.3.4\n" * (s.ALLOW_STDIN_MAX // 8 + 1)),
+                         ("AS11 после проверки пусто (только мусор и 0.0.0.0/0) — список не меняется", "0.0.0.0/0\nмусор\n")):
+        s.nft = OrderNft()
+        sys.stdin = Stdin(order, text_)
+        rc, out = run_main(["allow-sync"])
+        check(name_, rc == 1 and not out["ok"] and not any(i and "allow4" in i for i in s.nft.inputs)
+              and open(s.ALLOW_SYNC_FILE, encoding="utf-8").read() == "93.184.216.8/32\n")
+    try:
+        s.dispatch(["allow-sync"], dict(C), {})
+        check("AS12 dispatch allow-sync без списка — отказ", False)
+    except ValueError as e:
+        check("AS12 dispatch allow-sync без списка — отказ", "не передан" in str(e))
+    s.nft = FakeNft(table=False)
+    r = s.cmd_allow_sync(dict(C), "93.184.216.9\n")
+    check("AS13 таблицы нет — файл записан (load подхватит), applied=false", r["ok"] and r["applied"] is False
+          and open(s.ALLOW_SYNC_FILE, encoding="utf-8").read() == "93.184.216.9/32\n"
+          and "93.184.216.9" in s.render(s.cfg(), "eth0"))
+
+    class FailF(FakeNft):
+        def __call__(self, args, inp=None):
+            if args[:1] == ["-f"]:
+                raise RuntimeError("nft -f -: Error: Could not process rule")
+            return FakeNft.__call__(self, args, inp)
+    s.nft = FailF()
+    try:
+        s.cmd_allow_sync(dict(C), "93.184.216.10\n")
+        check("AS14 nft не принял — ошибка, файл прежний (в нём то, что действует)", False)
+    except RuntimeError:
+        check("AS14 nft не принял — ошибка, файл прежний (в нём то, что действует)",
+              open(s.ALLOW_SYNC_FILE, encoding="utf-8").read() == "93.184.216.9/32\n")
+    s.ALLOW_SYNC_FILE = os.path.join(tmp, "нет.txt")
+    check("AS15 файла нет (старый щит обновлён, сторож ещё не слал) — как раньше, только allow установщика",
+          s.cfg()["allow_sync"] == [] and s.allow_list(dict(C)) == s.allow_list(dict(C, allow_sync=[])))
+sys.stdin, s.lock, s.unlock = real_stdin, real_lock, real_unlock
+s.nft, s.tick_timer_state = real_nft, real_timer
+s.ALLOW_SYNC_FILE, s.CONF_FILE = real_sync_file, real_conf
+
+# --- сторож: отправка allow-sync тем же проходом, что scanners-load
+fs = []
+check("AS16 свой адрес: только глобальный (частный за NAT не шлём), сбой — без адреса",
+      sl.self_addresses(lambda fam, t: "10.0.0.5" if ":" not in t else "2a01:4f8:c0c:1::5") == ["2a01:4f8:c0c:1::5"]
+      and sl.self_addresses(lambda fam, t: (_ for _ in ()).throw(OSError("нет сети"))) == [])
+check("AS17 ответ старого щита — пометка, не ошибка",
+      sl.allow_status({"ok": False, "error": "команда не разрешена"}).startswith("старый щит")
+      and sl.allow_status({"ok": False, "error": "не понимаю: allow-sync"}).startswith("старый щит")
+      and sl.allow_status({"ok": False, "error": "сервер не ответил"}).startswith("ошибка")
+      and sl.allow_status({"ok": True, "n": 5, "refused_total": 1}) == "ok, своих 5, отвергнуто 1"
+      and sl.allow_status(None, sent=False).startswith("не слали"))
+
+
+def no_dns(h, p):
+    raise OSError("без сети")
+
+
+with tempfile.TemporaryDirectory() as tmp:
+    real_etc = sl.ETC
+    sl.ETC = tmp
+    json.dump([{"name": "n1", "host": "192.0.2.10"}], open(os.path.join(tmp, "nodes.json"), "w", encoding="utf-8"))
+    json.dump([{"url": "https://192.0.2.20:9109"}], open(os.path.join(tmp, "vantage.json"), "w", encoding="utf-8"))
+    open(os.path.join(tmp, "owner.txt"), "w", encoding="utf-8").write("93.184.89.45  # ваш адрес\n")
+    HS = {"DE7": {"host": "198.51.100.107"}, "NL1": {"host": "198.51.100.47"}, "OLD": {"host": "198.51.100.48"}}
+    loads, syncs, msgs = {}, {}, []
+
+    def ctl(h, args, inp=None):
+        if args == ["scanners-load"]:
+            loads[h] = inp
+            return {"ok": True, "v4": 1} if h != "NL1" else {"ok": False, "error": "timeout"}
+        if args == ["allow-sync"]:
+            syncs[h] = inp
+            if h == "OLD":
+                return {"ok": False, "error": "команда не разрешена"}
+            r = s.parse_allow_sync(inp)
+            return {"ok": True, "n": len(r[0]), "applied": True, "refused_total": len(r[1])}
+        return {"ok": True, "clients": {}}
+    sm = sl.run([], fetcher=lambda n: "203.0.113.0/24\n" if n == "skipa" else "37.0.113.0/24\n", run_ctl=ctl, hosts=HS,
+                send=msgs.append, now=1000, base=tmp, resolve=no_dns, self_addrs=["203.0.113.50"])
+    body = syncs.get("DE7") or ""
+    own_ = {ln for ln in body.splitlines()}
+    check("AS18 сторож шлёт allow-sync тем же проходом тем, кто принял сканеры: owner.txt, ddos.json, свой адрес; "
+          "ноды nodes.json и точки vantage.json — нет", set(syncs) == {"DE7", "OLD"} and syncs["DE7"] == syncs["OLD"]
+          and {"93.184.89.45/32", "198.51.100.107/32", "198.51.100.47/32", "203.0.113.50/32"} <= own_
+          and not own_ & {"192.0.2.10/32", "192.0.2.20/32"})
+    check("AS19 щит принимает список сторожа без отказов", s.parse_allow_sync(body)[1] == [] and s.parse_allow_sync(body)[0])
+    check("AS20 summary: allow-sync по серверам; старый щит — пометка, недоступный — не слали",
+          sm["allow_sync"]["DE7"].startswith("ok, своих") and "отвергнуто" not in sm["allow_sync"]["DE7"]
+          and sm["allow_sync"]["OLD"] == "старый щит: allow-sync не знает"
+          and sm["allow_sync"]["NL1"].startswith("не слали")
+          and json.load(open(os.path.join(tmp, "summary.json"), encoding="utf-8"))["allow_sync"] == sm["allow_sync"])
+    check("AS21 старый щит — не ошибка прохода: сканеры у него «ok»", sm["hosts"]["OLD"] == "ok" and sm["hosts"]["DE7"] == "ok")
+    check("AS22 свой адрес вырезан и из списка сканеров", "203.0.113.0/24" not in loads["DE7"]
+          and "203.0.113.50" not in loads["DE7"] and "203.0.113.51/32" in loads["DE7"])
+    syncs.clear()
+    sl.run(["--dry"], fetcher=lambda n: "37.0.113.0/24\n", run_ctl=ctl, hosts=HS, send=None, now=2000, base=tmp,
+           resolve=no_dns, self_addrs=["203.0.113.50"])
+    check("AS23 --dry: allow-sync не шлётся", syncs == {})
+    sl.ETC = real_etc
 print("щит: тестов пройдено %d" % ok)

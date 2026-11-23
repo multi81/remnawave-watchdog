@@ -58,8 +58,13 @@ import urllib.parse
 import urllib.request
 
 import blockwatch
+import netprobe
 import nodewatch
 import rucheck
+
+# Через локальные SOCKS-порты сторожа ходим с паролем из socks.auth (netprobe.curl_socks); метка для
+# build_channels.py --socks-auth: этот модуль пароль умеет.
+SOCKS_AUTH_READY = True
 
 ETC = "/etc/channel-watch"
 SPEED_FILE = "/var/lib/channel-watch/speed.json"  # замеры probe.py --speed (закачка побольше перед отчётом)
@@ -187,8 +192,10 @@ Q_EVENT = {"up": "вырос", "down": "вернулся к обычному", "
 
 def curl(port, url, timeout, fmt, body=False, ua=None, limit=None):
     cmd = ["curl", "-s", "-m", str(timeout), "-w", fmt]
+    cfg = ""
     if port:
-        cmd += ["-x", f"socks5h://127.0.0.1:{port}"]
+        proxy, cfg = netprobe.curl_socks(port)  # пароль SOCKS — в конфиге на stdin, не в argv
+        cmd += proxy
     if ua:
         cmd += ["-A", ua]
     if limit:
@@ -197,7 +204,8 @@ def curl(port, url, timeout, fmt, body=False, ua=None, limit=None):
         cmd += ["-o", "/dev/null"]
     cmd.append(url)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5,
+                           **({"input": cfg} if cfg else {}))
         return r.stdout.strip(), r.returncode
     except subprocess.TimeoutExpired:
         return "", 28
@@ -922,6 +930,9 @@ def tg_post(token, chat, text, proxy=None, markup=True):
            'data = "disable_web_page_preview=true"']
     if markup:
         cfg.append('data = "parse_mode=HTML"')
+    auth = netprobe.curl_proxy_cfg(proxy)  # свой канал сторожа под паролем — логин и пароль тем же конфигом
+    if auth:
+        cfg.append(auth.rstrip("\n"))
     cmd = ["curl", "-s", "-m", "10", "-o", os.devnull, "-w", "%{http_code}", "-K", "-"]
     if proxy:
         cmd[1:1] = ["-x", proxy]

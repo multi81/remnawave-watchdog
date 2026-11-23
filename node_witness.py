@@ -19,6 +19,9 @@
   - ничего не отправляет и не принимает команд: раз в 10 секунд пишет небольшой JSON рядом с маячком ноды
     (то же случайное имя), сторож забирает его сам.
 Запуск: node_witness.py <файл> [интерфейс]. Нужны права на захват (CAP_NET_RAW) и tcpdump.
+Диапазон меток — /etc/node-witness/site.json: {"mss_mark": [начало, конец]} или на время смены диапазона два:
+{"mss_mark": [[старое начало, конец], [новое начало, конец]]}. Файла нет — прежний 1201–1260. Читается при запуске
+(после правки — systemctl restart node-witness).
 """
 import json
 import os
@@ -34,7 +37,39 @@ try:
 except ImportError:  # Windows (тесты)
     pwd = None
 
-MARK = (1201, 1260)      # тот же диапазон, что netprobe.MSS_MARK
+MARK_DEFAULT = (1201, 1260)
+SITE_JSON = "/etc/node-witness/site.json"
+
+
+def mark_ranges(value):
+    """Диапазоны меток из настроек: [начало, конец] или список таких (не больше трёх — на время смены диапазона).
+    Каждый: целые, 536 ≤ начало < конец ≤ 1460, ширина не больше 200. Что-то не так — прежний диапазон."""
+    if isinstance(value, (list, tuple)) and value and all(type(x) is int for x in value):
+        value = [value]  # один диапазон [начало, конец]
+    out = []
+    try:
+        for lo, hi in value:
+            bad_type = any(isinstance(x, bool) or not isinstance(x, int) for x in (lo, hi))
+            if bad_type or not (536 <= lo < hi <= 1460 and hi - lo <= 200):
+                return [MARK_DEFAULT]
+            out.append((lo, hi))
+    except (TypeError, ValueError):
+        return [MARK_DEFAULT]
+    return out[:3] if out else [MARK_DEFAULT]
+
+
+def load_marks(path=SITE_JSON):
+    """Диапазоны меток из файла настроек свидетеля; файла нет или он битый — прежний диапазон."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return [MARK_DEFAULT]
+    return mark_ranges(data.get("mss_mark")) if isinstance(data, dict) else [MARK_DEFAULT]
+
+
+MARKS = load_marks()     # те же диапазоны, что netprobe.MSS_MARK у сторожа (на время смены — старый и новый)
+MARK = MARKS[0]          # первый диапазон — для совместимости
 PORT = 443
 LIVE = 14                # секунд следим за соединением: за это время нода успевает повторить ответ до 4 раз
 KEEP = 1800              # секунд храним счётчики
@@ -53,8 +88,12 @@ def build_filter(local=()):
     hosts = sorted(a for a in local if IPV4.fullmatch(a))
     to = " and (" + " or ".join(f"dst host {a}" for a in hosts) + ")" if hosts else ""
     frm = " and (" + " or ".join(f"src host {a}" for a in hosts) + ")" if hosts else ""
-    return (f"(tcp dst port {PORT} and tcp[tcpflags] == tcp-syn and tcp[20:2] = 0x0204 and tcp[22:2] >= {MARK[0]} "
-            f"and tcp[22:2] <= {MARK[1]}{to}) or (tcp src port {PORT} and tcp[tcpflags] & (tcp-syn|tcp-rst) != 0{frm}) "
+    if len(MARKS) == 1:  # один диапазон — фильтр слово в слово прежний
+        mark = f"tcp[22:2] >= {MARKS[0][0]} and tcp[22:2] <= {MARKS[0][1]}"
+    else:  # в фильтре BPF and и or равны по старшинству — каждый диапазон в своих скобках
+        mark = "(" + " or ".join(f"(tcp[22:2] >= {lo} and tcp[22:2] <= {hi})" for lo, hi in MARKS) + ")"
+    return (f"(tcp dst port {PORT} and tcp[tcpflags] == tcp-syn and tcp[20:2] = 0x0204 and {mark}"
+            f"{to}) or (tcp src port {PORT} and tcp[tcpflags] & (tcp-syn|tcp-rst) != 0{frm}) "
             f"or (tcp dst port {PORT} and tcp[tcpflags] & tcp-rst != 0{to})")
 
 
@@ -93,7 +132,7 @@ class Flows:
                 cur = self.live.get(key)
                 if cur and ts - cur[0] <= LIVE:
                     cur[2] += 1  # повторный запрос того же соединения
-                elif mss and MARK[0] <= int(mss) <= MARK[1]:
+                elif mss and any(lo <= int(mss) <= hi for lo, hi in MARKS):
                     if not cur and len(self.live) >= MAX_LIVE:
                         if ts - self.swept >= 1:  # под потоком — не чаще раза в секунду
                             self._sweep(ts)

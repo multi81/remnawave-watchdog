@@ -30,10 +30,18 @@ Prerouting — потому что у панели, sub и бота порты �
 держит блокировку (flock), список scanners-load читается до неё, status держит её только на снятие истёкшего on;
 IPv6: отказ блокировать /64, если она пересекается со своими; режим on с вышедшим сроком снимает любая команда, status
 показывает, режет ли ядро, жив ли таймер tick и версию таблицы в ядре (table_v); allow «a, b» и «a,» разбираются.
+allow-sync: сторож раз в сутки присылает на stdin список своих адресов — то же, что установщик и так кладёт в allow:
+ваши адреса (owner.txt), серверы ddos.json и свой адрес сторожа. Ноды и точки проверки сюда не входят: адрес выхода
+ноды — это трафик клиентов VPN, а свой в allow проходит мимо калитки и блокировок. Щит хранит список отдельно от allow
+установщика (config.json не трогается) — в /etc/storozh-shield/allow-sync.txt — и учитывает везде, где allow: наборы
+allow4/6 в ядре (обновляются сразу, без пересоздания таблицы), отказ блокировать, вырезание из списка сканеров.
+Сеть шире /24 (IPv4) или /64 (IPv6), зона IPv6, мусор — отказ по строке; пустой итог — список не меняется. Блокировки
+адресов, ставших своими, снимаются той же транзакцией nft и из state. Старый сторож команду не шлёт — щит как раньше.
 
 Команды: load | unload | tick | status | block СЕК [--clients] АДРЕС… | unblock all|АДРЕС… | mode watch |
          mode on ЧАСОВ | clients АДРЕС… (кто из них наш клиент) | scanners-load (список сетей на stdin) |
-         scan-mode count|drop | scan-clients (наши клиенты, попавшие в список сканеров)
+         scan-mode count|drop | scan-clients (наши клиенты, попавшие в список сканеров) |
+         allow-sync (список своих адресов от сторожа на stdin)
          --ssh — то же из SSH_ORIGINAL_COMMAND, кроме load/unload/tick (для ключа rf1).
 Настройки /etc/storozh-shield/config.json, состояние /var/lib/storozh-shield/state.json (блокировки и режим
 переживают перезагрузку). Без внешних зависимостей.
@@ -61,6 +69,10 @@ SCANNERS_FILE = "/etc/storozh-shield/scanners.txt"
 LOCK_FILE = "/var/lib/storozh-shield/shield-ctl.lock"   # отдельный файл: state.json заменяется через os.replace
 LOCK_WAIT = 30
 STDIN_MAX = 20 * 2 ** 20   # scanners-load: больше не читаем
+ALLOW_SYNC_FILE = "/etc/storozh-shield/allow-sync.txt"   # свои от сторожа (allow-sync), отдельно от config.json
+ALLOW_STDIN_MAX = 256 * 1024   # allow-sync: список длиннее — отказ целиком (своих адресов десятки)
+ALLOW_SYNC_MAX = 4096          # записей в allow-sync не больше
+ALLOW_MIN_PREFIX = {4: 24, 6: 64}   # шире — не свои, а ошибка: свой в allow проходит мимо калитки и блокировок
 TABLE_V = "table_v_"       # счётчик table_v_1_4_0: версия, которой собрана таблица в ядре
 TICK_TIMER = "storozh-shield-tick.timer"
 SCAN_MIN_PREFIX = {4: 16, 6: 28}   # шире — не принимаем (ошибка в списке не должна отрезать полмира)
@@ -90,7 +102,17 @@ def load_json(path, default):
 def cfg():
     c = dict(DEFAULTS)
     c.update(load_json(CONF_FILE, {}))
+    c["allow_sync"] = load_allow_sync()
     return c
+
+
+def load_allow_sync(path=None):
+    """Свои от сторожа из файла allow-sync (проверяются заново: файл могли поправить руками). Нет файла — []."""
+    try:
+        text = open(path or ALLOW_SYNC_FILE, encoding="utf-8").read()
+        return parse_allow_sync(text)[0]
+    except (OSError, ValueError):
+        return []
 
 
 def save_state(st, path=None):
@@ -142,7 +164,34 @@ def allow_bad(c):
 
 
 def allow_list(c):
-    return allow_items(c) + (ALWAYS_ALLOW if c.get("allow_private", True) else ["127.0.0.0/8", "::1/128"])
+    """Все свои: allow из config.json, allow-sync от сторожа и частные сети."""
+    return allow_items(c) + list(c.get("allow_sync") or []) + (ALWAYS_ALLOW if c.get("allow_private", True) else ["127.0.0.0/8", "::1/128"])
+
+
+def parse_allow_sync(text):
+    """Список allow-sync (адрес или сеть в строке, # — комментарий; запятые и пробелы тоже разделяют) ->
+    (сети строками, склеенные; отброшено [(запись, почему)]). ValueError — записей больше ALLOW_SYNC_MAX."""
+    nets, bad = [], []
+    for ln in text.splitlines():
+        for x in ln.split("#")[0].replace(",", " ").split():
+            if "%" in x:   # зона IPv6 (fe80::1%eth0) — адресом в nft не станет
+                bad.append((x[:60], "зона IPv6"))
+                continue
+            try:
+                n = ipaddress.ip_network(x, strict=False)
+            except ValueError:
+                bad.append((x[:60], "не адрес"))
+                continue
+            if n.prefixlen < ALLOW_MIN_PREFIX[n.version]:
+                bad.append((x, "слишком широкая (шире /%d)" % ALLOW_MIN_PREFIX[n.version]))
+            elif n.network_address.is_unspecified or n.is_multicast:
+                bad.append((x, "служебный адрес"))
+            else:
+                nets.append(n)
+    if len(nets) > ALLOW_SYNC_MAX:
+        raise ValueError("записей больше %d" % ALLOW_SYNC_MAX)
+    out = [str(n) for v in (4, 6) for n in ipaddress.collapse_addresses([x for x in nets if x.version == v])]
+    return out, bad
 
 
 def networks(items):
@@ -189,7 +238,7 @@ def check_block(addrs, c, clients=None, with_clients=False):
         elif a.version == 4 and any(a in n for n in allow4):
             bad.append((x, "в списке своих"))
         elif a.version == 6 and any(n.overlaps(ipaddress.ip_network("%s/64" % k)) for n in allow6):
-            # блокируется вся /64: отказ, если в ней есть хоть один свой адрес (временные адреса SLAAC владельца — )
+            # блокируется вся /64: отказ, если в ней есть хоть один свой адрес (временные адреса SLAAC владельца)
             bad.append((x, "в списке своих"))
         elif k in clients and not with_clients:
             bad.append((x, "наш клиент"))
@@ -402,6 +451,95 @@ def clients_nft(clients):
     return "\n".join(out) + "\n"
 
 
+def allow_nft(c):
+    """Текст для nft -f: наборы allow4/6 заново (config.json + allow-sync + частные), одной транзакцией — без
+    пересоздания таблицы: блокировки, счётчики и «подозрительные» остаются."""
+    allow4, allow6 = networks(allow_list(c))
+    out = ["flush set %s allow4" % TABLE, "flush set %s allow6" % TABLE]
+    for name, items in (("allow4", allow4), ("allow6", allow6)):
+        items = [str(n) for n in items]
+        for i in range(0, len(items), 2000):
+            out.append("add element %s %s { %s }" % (TABLE, name, ", ".join(items[i:i + 2000])))
+    return "\n".join(out) + "\n"
+
+
+def kernel_blocks():
+    """Ключи из наборов blocked4/6 в ядре (там бывает и то, чего нет в state). Не прочиталось — []."""
+    out = []
+    for fam in (4, 6):
+        name = "blocked%d" % fam
+        try:
+            out += [a for a, _ in parse_set(json.loads(nft(["-j", "list", "set", TABLE, name])), name)]
+        except (RuntimeError, ValueError):
+            pass
+    return out
+
+
+def own_blocked(keys, c):
+    """Ключи блокировок, попавшие в свои: IPv4 — адрес внутри своей сети, IPv6 — блокируемая /64 пересекается со своей
+    (те же правила, что у отказа блокировать в check_block). Порядок сохраняется, повторы убираются."""
+    allow4, allow6 = networks(allow_list(c))
+    out = []
+    for k in dict.fromkeys(str(x) for x in keys):
+        try:
+            a = ipaddress.ip_address(k)
+        except ValueError:
+            continue
+        if a.version == 4:
+            hit = any(a in n for n in allow4)
+        else:
+            hit = any(n.overlaps(ipaddress.ip_network("%s/64" % a, strict=False)) for n in allow6)
+        if hit:
+            out.append(k)
+    return out
+
+
+def unblock_nft(keys):
+    """Текст для nft -f: снять блокировки keys. Перед delete — add того же элемента: add существующего не ошибка, а
+    delete отсутствующего (срок вышел секундой раньше) уронил бы всю транзакцию вместе с обновлением allow4/6."""
+    out = []
+    for k in keys:
+        name = "blocked%d" % ipaddress.ip_address(k).version
+        out.append("add element %s %s { %s timeout 1s }" % (TABLE, name, k))
+        out.append("delete element %s %s { %s }" % (TABLE, name, k))
+    return "".join(x + "\n" for x in out)
+
+
+def cmd_allow_sync(c, text, st=None):
+    """allow-sync: свои от сторожа. Сначала ядро (если таблица есть), потом файл: при сбое nft файл остаётся прежним,
+    и в нём то, что на самом деле действует. Таблицы нет — только файл (load подхватит).
+    Блокировки адресов, ставших своими (из state и из ядра), снимаются тем же nft -f, что обновляет allow4/6, и
+    убираются из state: иначе status и кнопки показывали бы своего заблокированным до конца срока."""
+    if len(text) > ALLOW_STDIN_MAX:
+        raise ValueError("список больше %d байт — не принимаю" % ALLOW_STDIN_MAX)
+    nets, bad = parse_allow_sync(text)
+    if not nets:
+        raise ValueError("пустой список — не меняю")
+    st = st if st is not None else {}
+    blocks = live_blocks(st)
+    c2 = dict(c, allow_sync=nets)
+    applied = table_state() is not False
+    freed = own_blocked(list(blocks) + (kernel_blocks() if applied else []), c2)
+    if applied:
+        nft(["-f", "-"], allow_nft(c2) + unblock_nft(freed))
+    c["allow_sync"] = nets
+    os.makedirs(os.path.dirname(ALLOW_SYNC_FILE), exist_ok=True)
+    tmp = ALLOW_SYNC_FILE + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        f.write("".join("%s\n" % n for n in nets))
+    os.replace(tmp, ALLOW_SYNC_FILE)
+    if freed:
+        for k in freed:
+            blocks.pop(k, None)
+        st["blocks"] = blocks
+        save_state(st)
+    log("allow-sync: своих %d, в ядре %s, отброшено %d%s" % (
+        len(nets), "да" if applied else "нет таблицы", len(bad),
+        ("; сняты блокировки своих: " + " ".join(freed)) if freed else ""))
+    return {"ok": True, "n": len(nets), "applied": applied, "refused": bad[:20], "refused_total": len(bad),
+            "unblocked": freed}
+
+
 # ---------- сканеры ----------
 def parse_scanners(text, c):
     """Текст (сеть в строке, # — комментарий) -> (сети v4, сети v6, отброшено [(строка, почему)]). Свои вырезаются."""
@@ -601,7 +739,7 @@ def cmd_unblock(c, st, addrs):
                 continue
             if k in keys:   # повтор адреса: второй delete в nft упал бы ошибкой
                 continue
-            # снимаем в ядре и то, чего нет в state (блок, записанный в обход state до блокировки команд, — );
+            # снимаем в ядре и то, чего нет в state (блок, записанный в обход state до блокировки команд);
             # нет элемента в ядре (срок вышел секундой раньше) — не ошибка, из state всё равно убрать
             try:
                 nft(["delete", "element", TABLE, "blocked%d" % ipaddress.ip_address(k).version, "{ %s }" % k])
@@ -698,6 +836,10 @@ def cmd_status(c, st, expired=False, expire_err=""):
         scan_updated = int(os.path.getmtime(SCANNERS_FILE))
     except OSError:
         scan_nets, scan_updated = 0, 0
+    try:
+        sync_updated = int(os.path.getmtime(ALLOW_SYNC_FILE))
+    except OSError:
+        sync_updated = 0
     mode, warn, timer, enforce = current_mode(st), [], tick_timer_state(), enforce_drops()
     timer_ok = timer in ("active", "unknown")
     if expired:
@@ -722,6 +864,7 @@ def cmd_status(c, st, expired=False, expire_err=""):
             "blocked": sorted(live_blocks(st).items()), "suspects": [list(x) for x in sus[:SUSPECT_TOP]],
             "suspects_total": len(sus), "counters": counters, "clients": len(load_clients()),
             "limits": {"rate": int(c["rate"]), "conns": int(c["conns"])},
+            "allow_sync": {"n": len(c.get("allow_sync") or []), "updated": sync_updated},
             "proto": {k: counters.get("in_" + k, 0) for k in ("tcp", "udp", "icmp")},
             "ports": [list(x) for x in nports[:10]],
             "gate": {"tcp": list(c.get("gate_tcp") or []), "udp": list(c.get("gate_udp") or []),
@@ -738,7 +881,9 @@ def cmd_tick(c, st):
     return {"ok": True, "changed": changed}
 
 
-SSH_ALLOWED = ("status", "block", "unblock", "mode", "clients", "scanners-load", "scan-mode", "scan-clients")
+SSH_ALLOWED = ("status", "block", "unblock", "mode", "clients", "scanners-load", "scan-mode", "scan-clients",
+               "allow-sync")
+STDIN_CMDS = {"scanners-load": STDIN_MAX, "allow-sync": ALLOW_STDIN_MAX + 1}   # +1: длиннее предела — отказ, а не обрезка
 
 
 def expire_step(c, st):
@@ -751,7 +896,7 @@ def expire_step(c, st):
 
 
 def dispatch(argv, c, st, data=None):
-    """data — список сетей для scanners-load, прочитанный до блокировки (main)."""
+    """data — список сетей для scanners-load или allow-sync, прочитанный до блокировки (main)."""
     if not argv:
         raise ValueError("нет команды")
     cmd, a = argv[0], argv[1:]
@@ -775,6 +920,10 @@ def dispatch(argv, c, st, data=None):
         if data is None:
             raise ValueError("список сетей не передан")
         return cmd_scanners_load(c, data)
+    if cmd == "allow-sync" and not a:
+        if data is None:
+            raise ValueError("список своих не передан")
+        return cmd_allow_sync(c, data, st)
     if cmd == "scan-mode" and len(a) == 1:
         return cmd_scan_mode(c, st, a[0])
     if cmd == "scan-clients" and not a:
@@ -838,9 +987,9 @@ def main(argv):
         if argv[:1] == ["--ssh"]:
             argv = ssh_argv(os.environ.get("SSH_ORIGINAL_COMMAND", ""))
             log("ssh: " + " ".join(argv)[:300])
-        # список сканеров — до блокировки: зависшая передача по SSH (обрыв без FIN, EOF не придёт) держит только эту
-        # команду, а tick, status и кнопки работают
-        data = sys.stdin.read(STDIN_MAX) if argv == ["scanners-load"] else None
+        # список сканеров и allow-sync — до блокировки: зависшая передача по SSH (обрыв без FIN, EOF не придёт) держит
+        # только эту команду, а tick, status и кнопки работают
+        data = sys.stdin.read(STDIN_CMDS[argv[0]]) if len(argv) == 1 and argv[0] in STDIN_CMDS else None
         fd = lock()
         st = load_json(STATE_FILE, {})   # state — только под блокировкой: иначе перетрём то, что записал соседний вызов
         st = st if isinstance(st, dict) else {}

@@ -1,4 +1,6 @@
-"""Тесты (партия 1, сканеры): behavscan и scanlists — (сторож), и мелочи; второй круг (П1–П10) и третий (Р1–Р9) — замечания проверяющих. Без сети: python test_scan_behavior.py"""
+"""Тесты списка сканеров «по поведению» (behavscan) и списков сканеров (scanlists): стук с нескольких нод и в разные
+сутки, клиенты и свои, рост и уменьшение списков, дробление широких сетей; блоки П1–П10 и Р1–Р9.
+Без сети: python test_scan_behavior.py"""
 import io
 import ipaddress
 import json
@@ -313,8 +315,8 @@ with tempfile.TemporaryDirectory() as tmp:
                 now=NOW, base=tmp)
     check("М9 широкое исключение вырезает сеть из списка", sm["nets"] == 1)
 check("М10 докстринг: 5 списков и свой «по поведению»", "5 списков" in sl.__doc__ and "по поведению" in sl.__doc__
-      and len(sl.LISTS) == 5 and "все три списка, скачивание" in sl.__doc__)
-# ================= второй круг (П1–П10): замечания проверяющих =================
+      and len(sl.LISTS) == 5 and "пять внешних" in sl.__doc__ and "три списка" not in sl.__doc__)
+# ================= П1–П10: IPv6, рассылка, клиенты, сутки по нодам, соль, свои, рост списков =================
 bs.SALT = os.path.join(TMP, "p.salt")
 
 # ---------------- П1: смесь IPv4 и IPv6 не роняет step ----------------
@@ -417,7 +419,7 @@ st = {}
 xb = kn(("A", [[X, 1, 1, 1]]), ("B", [[X, 1, 1, 1]]))
 l1, _ = bs.step(st, xb, own, NOW, info_all(), clients_of=shields({X}))
 l2, _ = bs.step(st, kn(("A", [[X, 1, 1, 1]])), own, NOW + DAY, info_all(), clients_of=shields(set()))
-check("П5-1 клиент в первые сутки, во вторые щит его уже не помнит — не вносим (как до первого круга)",
+check("П5-1 клиент в первые сутки, во вторые щит его уже не помнит — не вносим (как раньше)",
       seen[0] == [X] and l1 == [] and l2 == [] and X not in json.dumps(st))
 st, seen[:] = {}, []
 one = kn(("A", [["77.18.9.9", 1, 1, 1], ["77.18.9.10", 1, 1, 1]]))
@@ -489,7 +491,7 @@ st = {"salt": "старая", "clients": {"abc": NOW}, "ips": {
                     "days": {d: {"nodes": ["A"], "ports": 1, "hits": 1, "strong": 1},
                              bs.day_of(NOW + DAY): {"nodes": ["B"], "ports": 1, "hits": 1, "strong": 1}}}}}
 l3, _ = bs.step(st, kn(("A", [["77.18.11.3", 1, 1, 1]])), own, NOW + DAY + 60, lk)
-check("П7-4 state первого круга: сутки разложены по нодам, стуки не удвоены",
+check("П7-4 state прежней версии: сутки разложены по нодам, стуки не удвоены",
       st["ips"]["77.18.11.3"]["days"][d] == {"A": {"ports": 2, "hits": 4, "strong": 1}, "B": {"ports": 2, "hits": 0, "strong": 1}}
       and "77.18.11.3" in l3)
 check("П7-5 внесённый по старому правилу (A и B в разные сутки) снят", "77.18.11.4" not in l3
@@ -522,7 +524,7 @@ bs.step(st, {}, own, NOW + bs.KEEP_DAYS * DAY, info_all())
 check("П8-6 соль сменилась — отметки клиентов сброшены", st["clients"] == {} and st["salt_ts"] == NOW + bs.KEEP_DAYS * DAY)
 st = {"salt": "старая", "clients": {"abc": NOW}, "ips": {}}
 bs.step(st, {}, own, NOW + bs.KEEP_DAYS * DAY + 60, info_all())
-check("П8-7 соль первого круга из state убрана, её хэши сброшены", "salt" not in st and st["clients"] == {})
+check("П8-7 соль прежней версии из state убрана, её хэши сброшены", "salt" not in st and st["clients"] == {})
 
 # ---------------- П9: own_hosts в scanlists; ddos.json — имена разрешаются ----------------
 check("П9-1 own_hosts живёт в scanlists, behavscan своего не держит", hasattr(sl, "own_hosts") and not hasattr(bs, "own_hosts"))
@@ -583,7 +585,7 @@ with tempfile.TemporaryDirectory() as tmp:
           and open(os.path.join(tmp, "skipa.list"), encoding="utf-8").read() == grown
           and any("--accept нет_такого: такого списка нет" in x for x in sm["notes"]))
 
-# ================= третий круг (Р1–Р9): замечания второго круга проверки =================
+# ================= Р1–Р9: щиты параллельно, IPv6 /64, двойной счёт суток, повреждённый state, --accept ====
 import threading  # noqa: E402
 
 bs.SALT = os.path.join(TMP, "r.salt")
@@ -777,4 +779,4 @@ with tempfile.TemporaryDirectory() as tmp:
     check("Р9-3 run --accept: уменьшенная копия сохранена «прошлой»", sm["notes"] == [] and sm["per_list"]["skipa"] == 50
           and open(os.path.join(tmp, "skipa.list"), encoding="utf-8").read() == shrunk)
 check("Р9-4 докстринг: --accept и про уменьшение", "«резко вырос» или «резко уменьшился»" in sl.__doc__)
-print("проверки, партия 1 (сканеры), со вторым и третьим кругом: тестов пройдено %d" % ok)
+print("сканеры «по поведению» и списки сканеров: тестов пройдено %d" % ok)

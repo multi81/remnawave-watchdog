@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
-"""channel-watch: единый список сканеров для щита на всех серверах. Владелец 22.10: «защита от сканеров … единую,
-в первую очередь от сканеров ркн»; «все три списка, скачивание списков разрешаю» (с 05.11 списков пять).
+"""channel-watch: единый список сканеров (в первую очередь сканеров РКН) для щита на всех серверах: пять внешних
+списков и свой «по поведению».
 
 Раз в сутки (таймер channel-watch-scanlists) на сервере сторожа:
   1. скачивает 5 списков (LISTS): antiscanner, government_networks, skipa из shadow-netlab/traffic-guard-lists, госорганы
@@ -13,7 +13,10 @@
      MIN_PREFIX дробит обратно (щит шире не принимает); итог больше ADDR4_MAX адресов IPv4, ADDR6_MAX сетей /32 IPv6
      или ADDR6_NETS_MAX сетей IPv6 (behavior.list — по /64 на адрес) не рассылает;
   4. рассылает итог на все серверы щита (ключ щита, команда scanners-load) и спрашивает, кто из наших клиентов попал в
-     список (scan-clients) — это строка в отчёте сторожа, решение за вами;
+     список (scan-clients) — это строка в отчёте сторожа, решение за вами; щитам, принявшим список, тем же
+     проходом — свои адреса (allow-sync: ваши адреса из owner.txt, ddos.json и свой адрес — то, что установщик щита и
+     так кладёт в allow; ноды и точки — нет: адрес выхода ноды — трафик клиентов VPN; старый щит команды не знает —
+     пометка);
   5. пишет итог в /var/lib/channel-watch/scanners/summary.json (для отчёта 3 раза в день).
 Сообщение — только когда что-то не так (список не скачался, резко уменьшился или вырос, сервер не принял или
 отверг часть сетей) или в списке появились новые наши клиенты.
@@ -35,6 +38,10 @@ import sys
 import threading
 import time
 import urllib.parse
+
+# Списки качаются и через SOCKS-порты каналов сторожа (маршруты probe.tg_routes): там логин и пароль из socks.auth
+# идут конфигом curl на stdin (proxy_cfg). Метка для build_channels.py --socks-auth: этот модуль пароль умеет.
+SOCKS_AUTH_READY = True
 
 ETC = "/etc/channel-watch"
 DIR = "/var/lib/channel-watch/scanners"
@@ -128,14 +135,25 @@ def parse(text, wide=False):
     return nets, bad
 
 
+def proxy_cfg(proxy):
+    """Конфиг curl для stdin (-K -) с логином и паролем SOCKS, если proxy — порт канала сторожа (127.0.0.1:2100x)
+    и есть socks.auth; '' — пароль не нужен (напрямую, мост 10809, пароля ещё нет). Логин и пароль — не в argv."""
+    if not proxy:
+        return ""
+    import netprobe  # лежит рядом (/opt/channel-watch); маршруты через каналы и так даёт probe, который его импортирует
+    return netprobe.curl_proxy_cfg(proxy)
+
+
 def fetch(name, routes=(None,)):
     url = list_url(name)
     for proxy in routes:
         cmd = ["curl", "-s", "-f", "-m", "40", url]
+        cfg = proxy_cfg(proxy)
         if proxy:
-            cmd[1:1] = ["-x", proxy]
+            cmd[1:1] = ["-x", proxy] + (["-K", "-"] if cfg else [])
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=50)
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=50,
+                               **({"input": cfg} if cfg else {}))  # stdin — только когда есть пароль
         except (subprocess.TimeoutExpired, OSError):
             continue
         if r.returncode == 0 and r.stdout.strip():
@@ -241,6 +259,58 @@ def own_networks(hosts, etc=None, resolve=None, load=None, failed=None):
     а не теряются; неразрешённые — в failed."""
     names = owner_addrs() + [str(h.get("host") or "") for h in hosts if isinstance(h, dict)] + host_names(etc, load)
     return resolve_names(names, resolve, failed)
+
+
+def sync_networks(hosts, self_addrs=(), resolve=None):
+    """Свои для allow-sync щита: ровно то, что установщик щита и так кладёт в allow, — ваши адреса (owner.txt),
+    серверы ddos.json — и свой внешний адрес сторожа. Без хостов nodes.json и vantage.json: адрес выхода ноды — это
+    трафик клиентов VPN, а свой в allow проходит мимо калитки и блокировок щита."""
+    names = owner_addrs() + [str(h.get("host") or "") for h in hosts if isinstance(h, dict)] + [str(x) for x in self_addrs or []]
+    return resolve_names(names, resolve)
+
+
+def self_addresses(connect=None):
+    """Свой внешний адрес (IPv4 и IPv6): адрес, с которого сторож выходит наружу (UDP connect пакетов не шлёт).
+    Только глобальные адреса: за NAT частный адрес щитам не нужен. connect — подстановка для тестов."""
+    def probe(fam, target):
+        s = socket.socket(fam, socket.SOCK_DGRAM)
+        try:
+            s.connect((target, 53))
+            return s.getsockname()[0]
+        finally:
+            s.close()
+    connect = connect or probe
+    out = []
+    for fam, target in ((socket.AF_INET, "1.1.1.1"), (getattr(socket, "AF_INET6", None), "2606:4700:4700::1111")):
+        if fam is None:
+            continue
+        try:
+            a = ipaddress.ip_address(str(connect(fam, target)).split("%")[0])
+        except (OSError, ValueError):
+            continue
+        if a.is_global:
+            out.append(str(a))
+    return out
+
+
+def allow_status(r, sent=True):
+    """Ответ щита на allow-sync -> строка для summary. Старый щит не знает команды — пометка, а не ошибка прохода."""
+    if not sent:
+        return "не слали: щит не принял список сканеров"
+    r = r if isinstance(r, dict) else {}
+    if r.get("ok"):
+        s = "ok, своих %s" % r.get("n", "?")
+        if r.get("refused_total"):
+            s += ", отвергнуто %s" % r["refused_total"]
+        if r.get("unblocked"):
+            s += ", сняты блокировки своих: %d" % len(r["unblocked"])
+        if r.get("applied") is False:
+            s += ", таблицы щита нет — подхватит при загрузке"
+        return s
+    err = str(r.get("error") or "нет ответа")
+    if "команда не разрешена" in err or err.startswith("не понимаю"):
+        return "старый щит: allow-sync не знает"
+    return "ошибка: %s" % err[:80]
 
 
 def combine(per_list, extra, exclude, own):
@@ -355,8 +425,12 @@ def write(path, text):
     os.replace(path + ".tmp", path)
 
 
-def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=DIR, users=None, resolve=None):
-    """Один проход. -> итог (dict). Все внешние вызовы подставляются (тесты)."""
+def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=DIR, users=None, resolve=None,
+        self_addrs=None):
+    """Один проход. -> итог (dict). Все внешние вызовы подставляются (тесты). self_addrs — свой внешний адрес
+    (main берёт из self_addresses). Щиту, принявшему список сканеров, тем же проходом уходит allow-sync — свои
+    (sync_networks: ваши адреса, ddos.json, свой адрес), итог по серверам — summary["allow_sync"]. Из списка сканеров
+    вырезается шире: ещё ноды и точки (own_networks)."""
     now = now or time.time()
     dry = "--dry" in argv
     accept = {argv[i + 1] for i, a in enumerate(argv[:-1]) if a == "--accept"}
@@ -377,12 +451,14 @@ def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=
     extra = parse(read(os.path.join(ETC, "scanners-extra.txt")))[0]
     exclude = parse(read(os.path.join(ETC, "scanners-exclude.txt")), wide=True)[0]
     unresolved = []
-    final, cut = combine(per_list, extra, exclude, own_networks(hosts.values(), resolve=resolve, failed=unresolved))
+    own = own_networks(hosts.values(), resolve=resolve, failed=unresolved)
+    own += [n for n in resolve_names(list(self_addrs or []), resolve) if n not in own]
+    final, cut = combine(per_list, extra, exclude, own)
     addrs4, addrs6 = volume(final, 4), v6_32(final)
     nets6 = sum(1 for n in final if n.version == 6)
     summary = {"ts": int(now), "nets": len(final), "addrs4": addrs4, "addrs6_32": addrs6,
                "per_list": {k: len(v) for k, v in per_list.items()}, "extra": len(extra), "cut": cut,
-               "unresolved": len(unresolved), "notes": notes, "hosts": {}, "clients": {}}
+               "unresolved": len(unresolved), "notes": notes, "hosts": {}, "clients": {}, "allow_sync": {}}
     hold = []
     if addrs4 > ADDR4_MAX:
         hold.append("в итоге %d адресов IPv4, больше предела %d — не рассылаю" % (addrs4, ADDR4_MAX))
@@ -416,13 +492,23 @@ def run(argv, fetcher=None, run_ctl=None, hosts=None, send=None, now=None, base=
     for name, text in fresh.items():
         write(os.path.join(base, name + ".list"), text)
     body = "".join("%s\n" % n for n in final)
-    res, th = {}, []
+    allow_body = "".join("%s\n" % n for n in sync_networks(hosts.values(), self_addrs, resolve))
+    res, sync, th = {}, {}, []
+
+    def push(h):
+        r = run_ctl(h, ["scanners-load"], inp=body)
+        res[h] = r
+        # тем же проходом — свои (allow-sync); щит, не принявший сканеры (недоступен), второй раз не ждём
+        if (r or {}).get("ok") and allow_body:
+            sync[h] = run_ctl(h, ["allow-sync"], inp=allow_body)
     for h in hosts:
-        t = threading.Thread(target=lambda h=h: res.__setitem__(h, run_ctl(h, ["scanners-load"], inp=body)))
+        t = threading.Thread(target=push, args=(h,))
         t.start()
         th.append(t)
     for t in th:
-        t.join(180)
+        t.join(240)
+    for h in list(res):
+        summary["allow_sync"][h] = allow_status(sync.get(h), sent=h in sync)
     for h, r in res.items():
         r = r or {}
         if not r.get("ok"):
@@ -477,7 +563,8 @@ def main(argv):
         hs = {k: v for k, v in hs.items() if k == only}
     routes = [None] + [r for r in probe.tg_routes() if r]
     s = run(argv, fetcher=lambda n: fetch(n, routes), run_ctl=lambda h, a, inp=None: shieldbot.run_ctl(h, a, hs, inp),
-            hosts=hs, send=None if "--dry" in argv else probe.tg_send, users=panel_users)
+            hosts=hs, send=None if "--dry" in argv else probe.tg_send, users=panel_users,
+            self_addrs=[] if "--dry" in argv else self_addresses())
     print(json.dumps({k: v for k, v in s.items() if k != "clients"}, ensure_ascii=False))
     print("наших клиентов в списке:", len(s["clients"]))
     if "--dry" not in argv:

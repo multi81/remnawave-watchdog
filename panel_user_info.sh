@@ -5,10 +5,12 @@
 # Имена пользователей или номера (id — так клиент записан в журнале Xray) — в команде ssh через пробел (SSH_ORIGINAL_COMMAND), не больше 20, только [A-Za-z0-9_.@-].
 # Печатает одну строку JSON: {"users": [{id, username, status, expire, created, tg, desc, tag, online, node, traffic_gb,
 #   devices, ua}]}; время — секунды UTC. Ничего не пишет.
-# Рекомендация: вместо postgres — отдельная роль базы только на чтение, например
-#   create role watch_ro login; grant select on users, user_traffic, nodes, hwid_user_devices,
-#   user_subscription_request_history to watch_ro;   и ниже psql -U watch_ro
-# (транзакция и так только на чтение, но роль без прав на запись — второй замок).
+# Роль базы: watch_ro (только SELECT на пять таблиц, без пароля — вход только через локальный сокет в контейнере),
+#   если она заведена (panel_ro_role.sql, как применить — в его шапке); нет роли — как раньше, postgres.
+#   Транзакция и так только на чтение, роль без прав на запись — второй замок.
+#   Готова ли роль, проверяется входом под ней же и пробным запросом к тем же пяти таблицам (select 1 from … limit 0,
+#   строк не читает), без запросов под postgres: нет роли или прав хоть на одну таблицу (миграция панели пересоздала
+#   таблицу) — запрос под postgres, как раньше.
 set -euo pipefail
 set -f   # SSH_ORIGINAL_COMMAND режется на слова без раскрытия шаблонов (* не превращается в имена файлов)
 names=()
@@ -18,8 +20,14 @@ for n in ${SSH_ORIGINAL_COMMAND:-}; do
 done
 [ "${#names[@]}" -ge 1 ] && [ "${#names[@]}" -le 20 ] || { echo '{"error": "need 1-20 names"}'; exit 1; }
 list=$(IFS=,; echo "${names[*]}")
+db_user=postgres
+ro_check='select 1 from users, user_traffic, nodes, hwid_user_devices, user_subscription_request_history limit 0'
+if timeout 10 docker exec remnawave-db psql -U watch_ro -d postgres -At -v ON_ERROR_STOP=1 -c "$ro_check" \
+     </dev/null >/dev/null 2>&1; then
+  db_user=watch_ro
+fi
 docker exec -i -e PGOPTIONS='-c default_transaction_read_only=on -c statement_timeout=15000' remnawave-db \
-  psql -U postgres -d postgres -At -v ON_ERROR_STOP=1 -v names="$list" <<'SQL'
+  psql -U "$db_user" -d postgres -At -v ON_ERROR_STOP=1 -v names="$list" <<'SQL'
 select json_build_object('users', coalesce(json_agg(t order by t.username), '[]'::json)) from (
   select u.id::text as id, u.username, u.status,
          extract(epoch from (u.expire_at at time zone 'UTC'))::bigint as expire,

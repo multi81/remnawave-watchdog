@@ -27,6 +27,10 @@ import netprobe
 import nodewatch
 import rucheck
 
+# Через локальные SOCKS-порты сторожа ходим с паролем из socks.auth (netprobe.curl_socks); метка для
+# build_channels.py --socks-auth: этот модуль пароль умеет.
+SOCKS_AUTH_READY = True
+
 try:
     import vantage_client  # TLS к точке проверки с закреплённым отпечатком (лежит рядом, ставит install.sh)
 except ImportError:  # сторож обновили частично: точки без sha256 работают по HTTP, с sha256 — «не ответила»
@@ -105,10 +109,13 @@ def fetch(url, dest, socks_port=None):
     """Скачать список в файл; не вышло напрямую — через канал сторожа. True — файл на месте и не пустой."""
     for port in (None, socks_port) if socks_port else (None,):
         cmd = ["curl", "-sL", "-m", "150", "--max-filesize", str(MAX_LIST), "-o", dest + ".tmp", url]
+        cfg = ""
         if port:
-            cmd[1:1] = ["-x", f"socks5h://127.0.0.1:{port}"]
+            proxy, cfg = netprobe.curl_socks(port)  # пароль SOCKS — в конфиге на stdin, не в argv
+            cmd[1:1] = proxy
         try:
-            ok = subprocess.run(cmd, capture_output=True, timeout=170).returncode == 0
+            ok = subprocess.run(cmd, capture_output=True, timeout=170,
+                                **({"input": cfg.encode()} if cfg else {})).returncode == 0
         except (subprocess.TimeoutExpired, OSError):
             ok = False
         if ok and os.path.exists(dest + ".tmp") and os.path.getsize(dest + ".tmp") > 50:
@@ -301,10 +308,13 @@ def doh(name, socks_port=None):
     found = None
     for tpl in DOH:
         cmd = ["curl", "-s", "-m", "8", "-H", "accept: application/dns-json", tpl.format(urllib.parse.quote(name))]
+        cfg = ""
         if socks_port:
-            cmd[1:1] = ["-x", f"socks5h://127.0.0.1:{socks_port}"]
+            proxy, cfg = netprobe.curl_socks(socks_port)
+            cmd[1:1] = proxy
         try:
-            data = json.loads(subprocess.run(cmd, capture_output=True, text=True, timeout=12).stdout)
+            data = json.loads(subprocess.run(cmd, capture_output=True, text=True, timeout=12,
+                                             **({"input": cfg} if cfg else {})).stdout)
         except (ValueError, subprocess.TimeoutExpired, OSError):
             continue
         if data.get("Status") not in (0, 3):
@@ -803,17 +813,40 @@ def witness_url(beacon):
     return f"{head}/flows.json" if tail == "state.json" else None
 
 
-def fetch_witness(url, socks_port=None):
+WITNESS_MAX = 400000  # файл свидетеля больше — не берём (--max-filesize у curl, предел и для TLS)
+
+
+def witness_pin(url):
+    """Отпечаток сертификата для файла свидетеля: поле "sha256" у ноды в nodes.json, чей маячок лежит рядом
+    (witness_url(маячок) == url; маячок в режиме --serve отдаёт flows.json тем же сервером и по TLS).
+    None — поля нет (по-старому, HTTP); строка — только TLS с этим отпечатком ('' — испорченное поле)."""
+    return nodewatch.beacon_pin(url, derive=witness_url)
+
+
+def fetch_witness(url, socks_port=None, sha256=None):
     """Счётчики ноды: {"ts", "flows": [[время, метка, SYN, SYN-ACK, RST от ноды, RST к ноде], ...]} либо None.
-    Напрямую; не вышло и есть живой канал — через него (нода может быть закрыта из России)."""
+    Напрямую; не вышло и есть живой канал — через него (нода может быть закрыта из России).
+    У ноды в nodes.json есть "sha256" (или sha256 передан) — только TLS с этим сертификатом и напрямую, и через канал
+    (nodewatch.pinned_get, тот же код, что у маячка), без отката на HTTP: счётчики не видны на пути и не
+    подменяются. Нет отпечатка — по-старому, curl по HTTP."""
     if not url:
         return None
+    pin = witness_pin(url) if sha256 is None else str(sha256 or "")
     for port in (None, socks_port) if socks_port else (None,):
-        cmd = ["curl", "-s", "-m", "10", "--max-filesize", "400000", "-H", "Cache-Control: no-cache", url]
-        if port:
-            cmd[1:1] = ["-x", f"socks5h://127.0.0.1:{port}"]
         try:
-            data = json.loads(subprocess.run(cmd, capture_output=True, text=True, timeout=14).stdout)
+            if pin is not None:
+                raw = nodewatch.pinned_get(url, pin, 10, WITNESS_MAX, socks_port=port)
+                if raw is None:
+                    continue
+                data = json.loads(raw.decode("utf-8"))
+            else:
+                cmd = ["curl", "-s", "-m", "10", "--max-filesize", str(WITNESS_MAX), "-H", "Cache-Control: no-cache", url]
+                cfg = ""
+                if port:
+                    proxy, cfg = netprobe.curl_socks(port)
+                    cmd[1:1] = proxy
+                data = json.loads(subprocess.run(cmd, capture_output=True, text=True, timeout=14,
+                                                 **({"input": cfg} if cfg else {})).stdout)
         except (subprocess.TimeoutExpired, OSError, ValueError):
             continue
         if isinstance(data, dict) and isinstance(data.get("flows"), list) and isinstance(data.get("ts"), (int, float)):

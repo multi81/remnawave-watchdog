@@ -37,14 +37,24 @@ done
 
 if [ "$uninstall" -eq 1 ]; then
   # 1) DDoS-часть первой: без /opt и /etc/channel-watch её таймеры и кнопки начали бы падать
-  if ls /etc/systemd/system/channel-watch-{ddos,shieldbot,scanlists,behavscan}.* >/dev/null 2>&1; then
+  #    Каждую службу — по отдельности: стоит любая часть (например, только ddos и shieldbot) — убирается то, что есть
+  #    (прежний ls по общему шаблону при одной недостающей службе давал ошибку, и DDoS-часть оставалась целиком).
+  ddos_units=()
+  for u in ddos.timer scanlists.timer behavscan.timer \
+           ddos.service shieldbot.service scanlists.service behavscan.service; do
+    if [ -e "/etc/systemd/system/channel-watch-$u" ] || [ -L "/etc/systemd/system/channel-watch-$u" ]; then
+      ddos_units+=("channel-watch-$u")   # битая ссылка на юнит — тоже убрать
+    fi
+  done
+  if [ "${#ddos_units[@]}" -gt 0 ]; then
     if [ -s "$SRC/install_ddos.sh" ]; then
       bash "$SRC/install_ddos.sh" --uninstall
     else
-      systemctl disable --now channel-watch-ddos.timer channel-watch-shieldbot.service channel-watch-scanlists.timer \
-        channel-watch-behavscan.timer 2>/dev/null || true
-      rm -f /etc/systemd/system/channel-watch-ddos.{service,timer} /etc/systemd/system/channel-watch-shieldbot.service \
-            /etc/systemd/system/channel-watch-scanlists.{service,timer} /etc/systemd/system/channel-watch-behavscan.{service,timer}
+      echo "== DDoS-часть: ${ddos_units[*]}"
+      for u in "${ddos_units[@]}"; do   # сначала таймеры, потом службы — таймер не перезапустит снятую службу
+        systemctl disable --now "$u" 2>/dev/null || true
+      done
+      for u in "${ddos_units[@]}"; do rm -f "/etc/systemd/system/$u"; done
       systemctl daemon-reload
     fi
   fi
@@ -122,6 +132,11 @@ PY
         /etc/systemd/system/channel-watch-loss.service /etc/systemd/system/channel-watch-loss.timer \
         /etc/systemd/system/channel-watch-side.service /etc/systemd/system/channel-watch-side.timer \
         /etc/systemd/system/channel-watch-xray.service
+  # drop-in песочницы от sandbox_dropins.sh — вместе со службами (только свои, по первой строке)
+  for f in /etc/systemd/system/channel-watch*.service.d/50-sandbox.conf; do
+    { [ -f "$f" ] && head -n 1 "$f" | grep -qF '# channel-watch: песочница systemd (sandbox_dropins.sh'; } || continue
+    rm -f "$f"; rmdir "${f%/*}" 2>/dev/null || true
+  done
   systemctl daemon-reload
   echo "сторож убран. Не тронуты: $TG_ENV (настройки Telegram) и служебный пользователь в панели — его удалить вручную."
   if [ "$keep_shield" -eq 1 ]; then
@@ -231,7 +246,9 @@ rc=0; python3 /opt/channel-watch/build_channels.py || rc=$?
 # Песочница Python-служб (дописывается в конец [Service]). Они остаются от root: читают sub.url и guard.env (600 root),
 # ходят в docker (rucheck: docker exec remnanode), трассируют TCP SYN (traceroute -T, нужен raw-сокет), а их файлы
 # в /etc и /var/lib/channel-watch делят со службами DDoS-части, которые тоже от root. Зато писать можно только в свои
-# папки, /var/log (журнал и его ротация) и папки пульса; /home и /root только для чтения (свой docker context).
+# папки, /var/log (журнал и его ротация) и папки пульса; /home и /root только для чтения (свой docker context); /run
+# тоже (ProtectSystem=strict его не закрывает), сокеты docker и D-Bus при этом работают. Те же настройки на работающем
+# стороже без переустановки кладёт sandbox_dropins.sh.
 hb_rw=""
 for f in "$ETC/heartbeat.path" "$ETC/heartbeat-full.path"; do
   [ -s "$f" ] || continue
@@ -246,6 +263,7 @@ py_sandbox() {   # $1 — дополнительные папки для зап�
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=/etc/channel-watch /var/lib/channel-watch /var/log${1:-}
+ReadOnlyPaths=/run
 ProtectHome=read-only
 PrivateTmp=yes
 ProtectKernelTunables=yes

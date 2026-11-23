@@ -7,6 +7,7 @@
 3. tcp_trace — трассировка TCP SYN до порта (системный traceroute -T): дошли ли пакеты и где оборвались.
 """
 import http.client
+import json
 import os
 import random
 import select
@@ -18,6 +19,12 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
+import urllib.request
+
+# Локальный SOCKS сторожа (клиент Xray, build_channels.py) — под паролем, если есть файл socks.auth.
+# По этой метке build_channels.py --socks-auth проверяет, что модуль рядом с ним умеет ходить с паролем.
+SOCKS_AUTH_READY = True
 
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) "
       "Chrome/126.0 Safari/537.36")
@@ -111,17 +118,55 @@ def resolve_system(name):
     return "ok", sorted({i[4][0] for i in infos})
 
 
-FALLBACK_DNS = ("77.88.8.8", "8.8.8.8")  # запасной DNS, когда свой (системный) имя не нашёл
+# Запасной DNS, когда свой (системный) имя не нашёл. Только защищённый (DoH, JSON): имена наших нод открытым UDP
+# не уходят. Адреса серверов DoH — IP в сертификате, поэтому их имена тоже не спрашиваются открыто.
+# Строка без «https://» — прежний вопрос по UDP к этому серверу; по умолчанию таких нет, оставлено только для
+# явной настройки и тестов.
+FALLBACK_DNS = ("https://1.1.1.1/dns-query?name={}&type=A", "https://8.8.8.8/resolve?name={}&type=A")
+DOH_TIMEOUT = 4
+
+
+def doh_query(name, url, timeout=DOH_TIMEOUT):
+    """Запись A по защищённому DNS (DoH, ответ JSON): ('ok' | 'nx' | 'err', [адреса])."""
+    try:
+        req = urllib.request.Request(url.format(urllib.parse.quote(name.rstrip("."), safe="")),
+                                     headers={"accept": "application/dns-json", "User-Agent": UA})
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            data = json.loads(r.read(65536).decode("utf-8"))
+    except (OSError, ValueError, UnicodeError, http.client.HTTPException):
+        return "err", []
+    if not isinstance(data, dict):
+        return "err", []
+    if data.get("Status") == 3:
+        return "nx", []
+    if data.get("Status") != 0:
+        return "err", []
+    ips = []
+    for a in data.get("Answer") or []:
+        if isinstance(a, dict) and a.get("type") == 1:
+            try:
+                socket.inet_aton(str(a.get("data")))
+            except OSError:
+                continue
+            ips.append(str(a["data"]))
+    return "ok", sorted(set(ips))
 
 
 def resolve(host, port=443):
-    """Адрес сервера: своим (системным) DNS, а не нашёл — публичным по UDP. (адрес, чем нашли): «system», адрес
-    публичного DNS или «fail»."""
+    """Адрес сервера: своим (системным) DNS, а не нашёл — защищённым (DoH). (адрес, чем нашли): «system»,
+    «doh» или «fail». Запасной сервер по UDP (только явной настройкой FALLBACK_DNS) — его адрес."""
     try:
         return socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_STREAM)[0][4][0], "system"
     except (OSError, UnicodeError):
         pass
     for srv in FALLBACK_DNS:
+        if srv.startswith("https://"):
+            status, ips = doh_query(host, srv)
+            if status == "ok" and ips:
+                return ips[0], "doh"
+            if status == "nx":
+                break  # защищённый DNS сказал «имени нет» — дальше спрашивать незачем
+            continue
         status, ips = dns_udp(host, srv)
         if status == "ok" and ips:
             return ips[0], srv
@@ -340,7 +385,48 @@ def direct_probe(host, port=443, sni=None, need=NEED, tls=True, deadline=12, ver
 
 # ---------- серия соединений и сравнение имён ----------
 
-MSS_MARK = (1201, 1260)   # метка серии: SYN с таким MSS узнаёт помощник на ноде (node_witness.py)
+MSS_DEFAULT = (1201, 1260)  # прежний диапазон меток (он открыт в исходниках — поэтому его можно сменить настройкой)
+MSS_WIDTH = 59              # не уже прежнего: метки точек — начало + 2 * № точки, приветствие TLS — ещё + 30
+SITE_JSON = "/etc/channel-watch/site.json"  # настройки сторожа: {"mss_mark": [начало, конец]}
+# Сменить диапазон на всех: 1) ноды — /etc/node-witness/site.json {"mss_mark": [[1201, 1260], [НОВ, НОВ+59]]}
+# (старый и новый сразу), restart node-witness; 2) точки — "mss_mark": [НОВ, НОВ+59] в agent.json, restart
+# vantage-agent; сторож — то же в /etc/channel-watch/site.json (читается при каждом запуске probe.py);
+# 3) ноды — оставить только новый. Шаг 2 — одним заходом: пока диапазоны сторожа и точки расходятся, точка
+# прижимает чужую метку к краю своего диапазона, и серии разных точек на свидетеле могут смешаться.
+
+
+def mss_range(value, default=MSS_DEFAULT):
+    """Диапазон меток из настроек: [начало, конец] — целые, 536 ≤ начало, конец ≤ 1460, ширина от MSS_WIDTH до 200.
+    Что-то не так — default (прежний диапазон): сторож работает, как раньше."""
+    try:
+        lo, hi = value
+        if isinstance(lo, bool) or isinstance(hi, bool) or not isinstance(lo, int) or not isinstance(hi, int):
+            return default
+    except (TypeError, ValueError):
+        return default
+    if 536 <= lo and hi <= 1460 and MSS_WIDTH <= hi - lo <= 200:
+        return lo, hi
+    return default
+
+
+def load_mss_mark(path=SITE_JSON):
+    """Диапазон меток из файла настроек (ключ "mss_mark"); файла нет, не читается или ключа нет — прежний."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+    except (OSError, ValueError):
+        return MSS_DEFAULT
+    return mss_range(data.get("mss_mark")) if isinstance(data, dict) else MSS_DEFAULT
+
+
+def set_mss_mark(value):
+    """Сменить диапазон меток на ходу (агент точки берёт его из своих настроек): итоговый диапазон."""
+    global MSS_MARK
+    MSS_MARK = mss_range(value, MSS_MARK)
+    return MSS_MARK
+
+
+MSS_MARK = load_mss_mark()  # метка серии: SYN с таким MSS узнаёт помощник на ноде (node_witness.py)
 SERIES_MAX = 40
 SLOW_SYN = 0.9            # соединение дольше — прошло только со второй посылки SYN (первая через 1 с)
 NEUTRAL_SNI = "www.example.org"
@@ -635,12 +721,129 @@ VPN_URL = "https://speed.cloudflare.com/__down?bytes=524288"  # 512 КБ чер�
 VPN_NEED = 524288
 
 
+# ---------- локальный SOCKS сторожа (клиент Xray из build_channels.py) ----------
+
+SOCKS_AUTH_FILE = "/etc/channel-watch/socks.auth"  # {"user", "pass"}, 600; нет файла — Xray ещё без пароля
+SOCKS_PORTS = range(21000, 21100)                  # порты каналов; логин и пароль шлём только на них
+
+
+def socks_auth():
+    """(логин, пароль) локального SOCKS или None. Сначала $CREDENTIALS_DIRECTORY/socks.auth (LoadCredential: агент
+    VPN-точки работает не от root), потом /etc/channel-watch/socks.auth. Нет файла — None: ходим без пароля, как
+    раньше (старый xray.json без пароля или файл ещё не создан)."""
+    d = os.environ.get("CREDENTIALS_DIRECTORY")
+    for path in ([os.path.join(d, "socks.auth")] if d else []) + [SOCKS_AUTH_FILE]:
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+            user, pw = data["user"], data["pass"]
+        except (OSError, ValueError, KeyError, TypeError):
+            continue
+        if isinstance(user, str) and isinstance(pw, str) and 0 < len(user) < 256 and 0 < len(pw) < 256:
+            return user, pw
+    return None
+
+
+def _local_port(port):
+    try:
+        return int(port) in SOCKS_PORTS
+    except (TypeError, ValueError):
+        return False
+
+
+def curl_quote(value):
+    """Строка для конфига curl (-K): в кавычках, с экранированием, без переводов строки."""
+    value = str(value).replace("\\", "\\\\").replace('"', '\\"')
+    return '"' + value.replace("\n", "\\n").replace("\r", "\\r").replace("\t", "\\t") + '"'
+
+
+def curl_socks_cfg(port):
+    """Строки конфига curl (-K -) с логином и паролем для SOCKS 127.0.0.1:port; '' — пароля нет (или порт не наш).
+    Логин и пароль — только через stdin: аргументы процесса видны всем пользователям сервера (ps, /proc/*/cmdline)."""
+    auth = socks_auth() if _local_port(port) else None
+    return f"proxy-user = {curl_quote(auth[0] + ':' + auth[1])}\n" if auth else ""
+
+
+def curl_socks(port):
+    """Для curl через SOCKS 127.0.0.1:port: (аргументы, текст для stdin). Без пароля — (['-x', …], ''),
+    с паролем — ещё '-K -', а логин и пароль в тексте для stdin."""
+    args = ["-x", f"socks5h://127.0.0.1:{int(port)}"]
+    cfg = curl_socks_cfg(port)
+    return (args + ["-K", "-"], cfg) if cfg else (args, "")
+
+
+def curl_proxy_cfg(proxy):
+    """То же для адреса прокси строкой (socks5h://127.0.0.1:PORT): строки конфига curl или ''."""
+    if not proxy:
+        return ""
+    p = urllib.parse.urlsplit(str(proxy))
+    try:
+        port = p.port
+    except ValueError:
+        return ""
+    if p.scheme in ("socks5", "socks5h") and p.hostname == "127.0.0.1" and port:
+        return curl_socks_cfg(port)
+    return ""
+
+
+def socks_connect(socks_port, host, port, timeout, auth=None):
+    """TCP до host:port через локальный SOCKS 127.0.0.1:socks_port (SOCKS5, имя отдаём прокси). Пароль из socks.auth
+    (или auth): предлагаем оба способа — «без пароля» и «логин/пароль», выбирает сервер (старый Xray без пароля
+    выберет первый). Сокет либо None — канал не принял."""
+    if auth is None and _local_port(socks_port):
+        auth = socks_auth()
+    try:
+        s = socket.create_connection(("127.0.0.1", int(socks_port)), timeout=timeout)
+    except OSError:
+        return None
+    try:
+        s.settimeout(timeout)
+        s.sendall(b"\x05\x02\x00\x02" if auth else b"\x05\x01\x00")
+        method = _recv_exact(s, 2)
+        if not method or method[0] != 5:
+            raise OSError("не SOCKS5")
+        if method[1] == 2 and auth:
+            user, pw = auth[0].encode(), auth[1].encode()
+            s.sendall(b"\x01" + bytes([len(user)]) + user + bytes([len(pw)]) + pw)
+            if _recv_exact(s, 2) != b"\x01\x00":
+                raise OSError("логин или пароль не приняты")
+        elif method[1] != 0:
+            raise OSError("способ входа не подошёл")
+        name = host.encode("idna")
+        s.sendall(b"\x05\x01\x00\x03" + bytes([len(name)]) + name + struct.pack(">H", int(port)))
+        reply = _recv_exact(s, 4)
+        if not reply or reply[1] != 0:
+            raise OSError("прокси не соединил")
+        tail = {1: 4, 4: 16}.get(reply[3])
+        if tail is None and reply[3] == 3:
+            ln = _recv_exact(s, 1)
+            tail = ln[0] if ln else None
+        if tail is None or _recv_exact(s, tail + 2) is None:
+            raise OSError("ответ прокси не разобрать")
+        return s
+    except (OSError, UnicodeError, ValueError):
+        s.close()
+        return None
+
+
+def _recv_exact(s, n):
+    buf = b""
+    while len(buf) < n:
+        chunk = s.recv(n - len(buf))
+        if not chunk:
+            return None
+        buf += chunk
+    return buf
+
+
 def socks_load(port, url=VPN_URL, need=VPN_NEED, timeout=25):
     """Загрузка url через SOCKS 127.0.0.1:port (свой клиент Xray): {"ok", "code", "bytes", "mbit", "s", "ttfb_ms", "rc"}."""
-    cmd = ["curl", "-s", "-m", str(timeout), "-x", f"socks5h://127.0.0.1:{int(port)}", "-o", os.devnull,
+    proxy, cfg = curl_socks(port)
+    cmd = ["curl", "-s", "-m", str(timeout), *proxy, "-o", os.devnull,
            "-w", "%{http_code} %{size_download} %{speed_download} %{time_total} %{time_starttransfer}", url]
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5,
+                           **({"input": cfg} if cfg else {}))  # stdin — только когда есть пароль
         code, size, speed, total, ttfb = r.stdout.split()
         size = int(float(size))
         return {"ok": code == "200" and size >= need, "code": code, "bytes": size, "mbit": round(float(speed) * 8 / 1e6, 1),

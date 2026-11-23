@@ -1,23 +1,35 @@
 #!/usr/bin/env bash
-# beacon_install.sh --site-dir ПАПКА | --serve ПОРТ --allow АДРЕС [--home-ro] | --uninstall
+# beacon_install.sh --site-dir ПАПКА | --serve ПОРТ --allow АДРЕС [--tls-only] [--home-ro] | --uninstall
 # Маячок состояния ноды для сторожа каналов (в недельную сводку — диск, память,
 # версии; счётчик сканирования). Рядом должен лежать node_beacon.py. Раз в 10 минут пишет небольшой JSON без секретов.
 #   --site-dir ПАПКА        нода со своим сайтом-прикрытием: файл со случайным именем кладётся в папку сайта, сторож
 #                           забирает его по https; портов и настроек веб-сервера не трогает;
-#   --serve ПОРТ --allow IP нода без своего сайта: файл отдаёт крошечный веб-сервер на ПОРТу (от пользователя nobody),
-#                           в ufw порт открыт только адресу сторожа (IP). ufw выключен — правило не ставится,
-#                           порт открыт всем (установщик об этом пишет).
+#   --serve ПОРТ --allow IP нода без своего сайта: файл отдаёт крошечный веб-сервер beacon_serve.py на ПОРТу (от
+#                           пользователя nobody, рядом должен лежать beacon_serve.py), в ufw порт открыт только адресу
+#                           сторожа (IP). ufw выключен — правило не ставится, порт открыт всем (установщик об этом пишет).
+#                           На том же порту и HTTP, и TLS: сертификат самоподписанный, создаётся при первой
+#                           установке и потом не меняется; его отпечаток печатается строкой «BEACON-SHA256 <отпечаток>».
+#                           Порядок перехода без простоя: обновить ноду этим установщиком (путь и порт прежние, сторож
+#                           ходит по HTTP как раньше) → у ноды в /etc/channel-watch/nodes.json сторожа добавить
+#                           "sha256": "<отпечаток>" — сторож перейдёт на TLS и будет сверять сертификат.
+#                           Сам сервер тоже отвечает только адресу сторожа (--allow), а также 127.0.0.1 и адресу самой
+#                           ноды; чужие соединения закрывает сразу, места не занимают — и при выключенном ufw.
+#   --tls-only              вместе с --serve: HTTP закрыт, только TLS. Включать последним шагом, когда у ноды в
+#                           nodes.json уже есть "sha256" и сторож с новым nodewatch.py и blockwatch.py забирает по TLS
+#                           и маячок, и flows.json свидетеля. Без сертификата (нет openssl или systemd старше 247)
+#                           установщик с --tls-only сервер и юнит не трогает и выходит с ошибкой. Повтор без ключа —
+#                           снова HTTP и TLS.
 #   --home-ro               ProtectHome=read-only вместо yes: на ноде со своим docker context в
 #                           /root/.docker — иначе docker CLI его не видит и поля xray, mptcp_listeners_ct будут None.
 # Повторный запуск с другим режимом, папкой, --allow или --port убирает прежний файл, веб-сервер и правило ufw.
-# В конце печатает одну строку «BEACON <хвост адреса>» — её забирает сторож.
+# В конце печатает строку «BEACON <хвост адреса>» — её забирает сторож; в режиме --serve перед ней — «BEACON-SHA256 …».
 # Откат: bash beacon_install.sh --uninstall
 set -euo pipefail
 [ "$(id -u)" = 0 ] || { echo "нужен root (sudo bash $0 …)"; exit 1; }
 SRC="$(cd "$(dirname "$0")" && pwd)"
 ETC=/etc/node-beacon
 WWW=/var/lib/node-beacon/www
-mode="" dir="" port="" allow="" home_ro=0
+mode="" dir="" port="" allow="" home_ro=0 fp="" tls_only=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --site-dir) mode=site; dir="$2"; shift 2 ;;
@@ -25,6 +37,7 @@ while [ $# -gt 0 ]; do
     --allow) allow="$2"; shift 2 ;;
     --uninstall) mode=uninstall; shift ;;
     --home-ro) home_ro=1; shift ;;
+    --tls-only) tls_only=1; shift ;;
     *) echo "не понимаю параметр $1"; exit 2 ;;
   esac
 done
@@ -60,7 +73,10 @@ if [ "$mode" = uninstall ]; then
   echo "маячок убран"; exit 0
 fi
 
+[ "$tls_only" = 0 ] || [ "$mode" = serve ] || { echo "--tls-only — только вместе с --serve"; exit 2; }
 [ -s "$SRC/node_beacon.py" ] || { echo "рядом нет node_beacon.py"; exit 1; }
+# до любых изменений: без сервера маячка прежняя установка остаётся как есть
+[ "$mode" != serve ] || [ -s "$SRC/beacon_serve.py" ] || { echo "рядом нет beacon_serve.py (нужен для --serve)"; exit 1; }
 install -d -m 755 /opt/node-beacon
 install -d -m 700 "$ETC"
 install -m 755 "$SRC/node_beacon.py" /opt/node-beacon/node_beacon.py
@@ -82,6 +98,7 @@ if [ "$mode" = site ]; then
     systemctl reset-failed node-beacon-http.service 2>/dev/null || true
   fi
   ufw_delete_saved; rm -f "$ETC/ufw-rule"
+  rm -f "$ETC/cert.pem" "$ETC/key.pem" /opt/node-beacon/beacon_serve.py   # сертификат был только для --serve
 elif [ "$mode" = serve ]; then
   [ -n "$port" ] && [ -n "$allow" ] || { echo "нужны --serve ПОРТ и --allow АДРЕС"; exit 1; }
   case "$port" in ''|*[!0-9]*) echo "порт — только цифры: $port"; exit 1 ;; esac
@@ -96,21 +113,56 @@ if not re.fullmatch(r"[0-9A-Fa-f.:]{2,45}(/[0-9]{1,3})?", a):
 n = ipaddress.ip_network(a, strict=False)
 sys.exit(1 if n.prefixlen == 0 else 0)
 ' "$allow" 2>/dev/null || { echo "«$allow» — не адрес (нужен IP или сеть без зоны «%» и пробелов, не /0)"; exit 1; }
+  # сертификат TLS: самоподписанный, создаётся один раз — при обновлении отпечаток у сторожа остаётся верным
+  if [ ! -s "$ETC/cert.pem" ] || [ ! -s "$ETC/key.pem" ]; then
+    command -v openssl >/dev/null || { apt-get update -qq && apt-get install -y -qq openssl; } >/dev/null 2>&1 || true
+    if ( umask 077; openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes -sha256 -days 3650 \
+           -subj "/CN=localhost" -keyout "$ETC/key.pem.tmp" -out "$ETC/cert.pem.tmp" ) >/dev/null 2>&1; then
+      mv -f "$ETC/key.pem.tmp" "$ETC/key.pem"; mv -f "$ETC/cert.pem.tmp" "$ETC/cert.pem"
+    fi
+    rm -f "$ETC/key.pem.tmp" "$ETC/cert.pem.tmp"
+  fi
+  # ключ читает только root; службе от nobody его передаёт systemd (LoadCredential, systemd 247+). Иначе — только HTTP
+  creds="" fp=""
+  sdv="$(systemctl --version 2>/dev/null | awk 'NR==1{print $2+0}')"
+  if [ -s "$ETC/cert.pem" ] && [ -s "$ETC/key.pem" ] && [ "${sdv:-0}" -ge 247 ]; then
+    chmod 600 "$ETC/key.pem"; chmod 644 "$ETC/cert.pem"; chown root:root "$ETC/key.pem" "$ETC/cert.pem"
+    creds="LoadCredential=cert.pem:$ETC/cert.pem
+LoadCredential=key.pem:$ETC/key.pem"
+    fp="$(python3 -c 'import hashlib, ssl, sys; print(hashlib.sha256(ssl.PEM_cert_to_DER_cert(open(sys.argv[1], encoding="ascii").read())).hexdigest())' "$ETC/cert.pem")"
+  fi
+  # --tls-only без сертификата — служба бы не запустилась: выходим до записи out, сервера и юнита (прежнее цело)
+  [ "$tls_only" = 0 ] || [ -n "$fp" ] || {
+    echo "--tls-only: сертификата нет (openssl не поставился или systemd старше 247) — сервер маячка и юнит прежние"; exit 1; }
+  tls_arg=""; [ "$tls_only" = 0 ] || tls_arg=" --tls-only"
   install -d -m 755 /var/lib/node-beacon "$WWW"
   echo "$WWW/state.json" > "$ETC/out"
+  install -m 755 "$SRC/beacon_serve.py" /opt/node-beacon/beacon_serve.py
+  # порт ниже 1024 пользователь nobody занять не может — только это право, остальные убраны
+  caps=""; [ "$port" -ge 1024 ] || caps="CAP_NET_BIND_SERVICE"
   cat > /etc/systemd/system/node-beacon-http.service <<UNIT
 [Unit]
 Description=node-beacon: отдаёт файл состояния ноды сторожу каналов (порт $port открыт в ufw только его адресу)
 After=network-online.target
 
 [Service]
-ExecStart=/usr/bin/python3 -m http.server $port --bind 0.0.0.0 --directory $WWW
+# --allow: чужие адреса сервер закрывает сразу после accept (и при выключенном ufw), места они не занимают
+ExecStart=/usr/bin/python3 /opt/node-beacon/beacon_serve.py $port $WWW --allow $allow$tls_arg
 User=nobody
 Group=nogroup
+$creds
+CapabilityBoundingSet=$caps
+AmbientCapabilities=$caps
 ProtectSystem=strict
 ProtectHome=yes
 PrivateTmp=yes
+PrivateDevices=yes
 NoNewPrivileges=yes
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryMax=64M
+SyslogLevel=warning
 LogLevelMax=warning
 Restart=always
 RestartSec=5
@@ -119,7 +171,7 @@ RestartSec=5
 WantedBy=multi-user.target
 UNIT
   rule="allow from $allow to any port $port proto tcp"
-  fw="ufw не включён — порт $port открыт всем (в файле только состояние ноды, без секретов); закройте его своим файрволом"
+  fw="ufw не включён — порт $port открыт всем, но сервер маячка отвечает только $allow (прочих закрывает сразу); лучше закройте порт и своим файрволом"
   if command -v ufw >/dev/null; then
     # прежнее правило (другой адрес сторожа или порт) — убрать, иначе оно останется навсегда
     if [ -s "$ETC/ufw-rule" ] && [ "$(cat "$ETC/ufw-rule")" != "$rule" ]; then ufw_delete_saved; rm -f "$ETC/ufw-rule"; fi
@@ -210,8 +262,21 @@ systemctl start node-beacon.service
 out="$(cat "$ETC/out")"
 [ -s "$out" ] || { echo "маячок не записал файл $out"; journalctl -u node-beacon.service -n 8 --no-pager; exit 1; }
 python3 -c 'import json, sys; d = json.load(open(sys.argv[1])); print("   " + sys.argv[2] + ": диск", str(d["disk_pct"]) + "%, свободно памяти", d["mem_avail_mb"], "МБ, Xray", d["xray"], "| ufw", d["ufw"], "| отбито:", d["drops"], "| ssh-подбор за сутки:", d["ssh_fail_24h"])' "$out" "$(hostname)" >&2
-if [ "$mode" = serve ]; then echo "   $fw" >&2; fi
+if [ "$mode" = serve ]; then
+  echo "   $fw" >&2
+  # самопроверка с самой ноды: HTTP (прежний сторож) и TLS со сверкой отпечатка (новый)
+  chk="$(python3 /opt/node-beacon/beacon_serve.py --check "$port" $fp$tls_arg 2>&1)" || {
+    echo "   веб-сервер маячка не отвечает как надо ($chk): journalctl -u node-beacon-http -n 20" >&2; exit 1; }
+  if [ "$tls_only" = 1 ]; then
+    echo "   на порту $port только TLS, HTTP закрыт ($chk). У ноды в nodes.json сторожа должно быть \"sha256\": \"$fp\" — без него сторож маячок не прочитает" >&2
+  elif [ -n "$fp" ]; then
+    echo "   на порту $port и HTTP, и TLS ($chk). У ноды в nodes.json сторожа добавьте \"sha256\": \"$fp\" — сторож перейдёт на TLS" >&2
+  else
+    echo "   сертификата нет (openssl или systemd старше 247) — только HTTP ($chk)" >&2
+  fi
+fi
 if [ "$moved" = 1 ] && [ -s /etc/node-witness/out ]; then
   echo "   свидетель пишет в прежнюю папку — запустите witness_install.sh ещё раз" >&2
 fi
+if [ "$mode" = serve ] && [ -n "$fp" ]; then echo "BEACON-SHA256 $fp"; fi
 echo "BEACON $tail"

@@ -12,7 +12,8 @@
   - адрес сервера узнаёт сам по имени — указать ему произвольный адрес нельзя;
   - не больше MAX_PARALLEL проверок разом и RATE запросов в минуту.
 Настройки — /etc/vantage-agent/agent.json: {"token", "allow": [...], "suffixes": [...], "ports": [443], "port": 9109,
-  "hosts": [...], "snis": [...]} (hosts и snis необязательны: адреса вне своих доменов и имена TLS для них).
+  "hosts": [...], "snis": [...], "mss_mark": [1201, 1260]} (hosts и snis необязательны: адреса вне своих доменов и
+  имена TLS для них; mss_mark — диапазон меток MSS, тот же, что у сторожа и свидетелей на нодах, по умолчанию прежний).
 Запросы (ответ — JSON):
   /health
   /probe?host=ИМЯ[&port=443][&sni=ИМЯ]   порт, TLS, набираются ли 64 КБ
@@ -377,6 +378,7 @@ def tls_context(cfg):
 def main(conf=None):
     cfg = json.load(open(conf or cred_path("agent.json", CONF), encoding="utf-8"))
     assert len(cfg["token"]) >= 32 and cfg["allow"] and cfg["suffixes"], "в настройках нет токена, списка адресов или доменов"
+    netprobe.set_mss_mark(cfg.get("mss_mark"))  # нет ключа или он неверный — прежний диапазон
     tls = tls_context(cfg)
     assert tls or not cfg.get("tls_only"), "в настройках tls_only, а сертификата нет (cert.pem, key.pem)"
     Agent((cfg.get("bind", "0.0.0.0"), int(cfg.get("port", 9109))), cfg, tls).serve_forever()

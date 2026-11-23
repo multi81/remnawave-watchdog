@@ -23,6 +23,10 @@ import sys
 import threading
 import time
 
+# Telegram идёт и через SOCKS-порты каналов сторожа (маршруты probe.tg_routes): там логин и пароль из socks.auth —
+# строкой proxy-user в том же конфиге curl на stdin (proxy_cfg). Метка для build_channels.py --socks-auth.
+SOCKS_AUTH_READY = True
+
 try:
     import fcntl
 except ImportError:   # Windows (тесты на ПК) — без блокировки файла
@@ -75,6 +79,18 @@ def curl_config(url, body):
     return "url = %s\ndata-binary = %s\n" % (curl_quote(url), curl_quote(body))
 
 
+def proxy_cfg(proxy):
+    """Строка proxy-user для конфига curl, если proxy — порт канала сторожа (127.0.0.1:2100x) и есть socks.auth;
+    '' — пароль не нужен (напрямую, мост 10809, пароля ещё нет)."""
+    if not proxy:
+        return ""
+    here = os.path.dirname(os.path.abspath(__file__))
+    if here not in sys.path:
+        sys.path.insert(0, here)
+    import netprobe  # лежит рядом (/opt/channel-watch)
+    return netprobe.curl_proxy_cfg(proxy)
+
+
 def tg_call(method, payload, timeout=20):
     """-> ответ Telegram (dict) или None. Маршруты — как у сторожа (напрямую, через свой канал, мост)."""
     probe = _probe()
@@ -89,7 +105,9 @@ def tg_call(method, payload, timeout=20):
         if proxy:
             cmd[1:1] = ["-x", proxy]
         try:
-            r = subprocess.run(cmd, input=conf, capture_output=True, text=True, timeout=timeout + 5)
+            # через порт канала сторожа — ещё логин и пароль SOCKS, в том же конфиге на stdin (не в argv)
+            r = subprocess.run(cmd, input=conf + proxy_cfg(proxy), capture_output=True, text=True,
+                               timeout=timeout + 5)
             d = json.loads(r.stdout or "null")
         except (subprocess.TimeoutExpired, ValueError, OSError):
             continue
