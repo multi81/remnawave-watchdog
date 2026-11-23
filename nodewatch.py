@@ -204,8 +204,24 @@ def dns_flags(x):
     if not x.get("active"):
         return ["свой DNS не работает (система на запасном)"]
     out = []
+    pq = x.get("mode") == "per-query"   # node_dns.sh --per-query: current — путь запросов по /etc/resolv.conf
+    if pq and x.get("resolv_foreign"):
+        ns = " ".join(str(a) for a in (x.get("nameservers") or [])[:3])
+        out.append("/etc/resolv.conf подменён" + (f" (nameserver {ns})" if ns else ""))
+    elif pq and (x.get("resolv_replaced_24h") or 0) > 0:
+        out.append(f"/etc/resolv.conf подменяли {x['resolv_replaced_24h']} раз за сутки (таймер вернул свой)")
     if x.get("current") and x["current"] != "127.0.0.1":
         out.append(f"DNS сейчас на запасном {x['current']}")
+    if pq and x.get("resolv_card"):
+        card = x["resolv_card"]
+        out.append("запасные DNS молчали — за Unbound стоят DNS карты"
+                   + (f" {' '.join(map(str, card))}" if isinstance(card, list) else ""))
+    if pq and x.get("xray_resolv") and x["xray_resolv"] != "127.0.0.1":
+        if x.get("xray_net") and x["xray_net"] != "host":
+            out.append(f"Xray ходит не по своему resolv.conf (контейнер не в сети хоста, nameserver {x['xray_resolv']})")
+        else:
+            out.append("Xray ходит через systemd-resolved, а не по своему resolv.conf (копия в контейнере старая, "
+                       f"nameserver {x['xray_resolv']}; обновить копию или перезапустить remnanode)")
     if (x.get("fallback_24h") or 0) >= DNS_FALLBACK_WARN:
         out.append(f"DNS уходил на запасной {x['fallback_24h']} раз за сутки")
     q, e = x.get("queries") or 0, x.get("exceeded") or 0

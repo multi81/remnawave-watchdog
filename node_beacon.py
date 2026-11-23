@@ -11,6 +11,8 @@
            и в контейнерах со своей сетью, synflood): сторож пишет,
            если профиль слетел;
   dns    — свой резолвер Unbound (node_dns.sh): работает ли, на нём ли система, кэш, очередь, уходы на запасной;
+           с 23.11 и режим «запасной на каждый запрос» (mode="per-query"): current — реальный путь запросов программ
+           по /etc/resolv.conf, а не сервер systemd-resolved; nameservers, resolv_foreign, resolv_card, xray_resolv;
   knocks — кто за сутки стучался в закрытые порты (по журналу ufw, только SYN): адрес, сколько разных портов, сколько
            раз, стучался ли на 80/443/8443. Из этого сторож собирает свой список сканеров «по поведению».
 
@@ -303,10 +305,96 @@ def knocks(lines, now, since=86400):
     return res
 
 
-def dns():
-    """Свой резолвер Unbound (node_dns.sh): работает ли, на нём ли система, кэш, очередь, уходы на запасной. Нет — None."""
-    if not os.path.exists("/etc/unbound/unbound.conf.d/storozh.conf"):
+UCONF = "/etc/unbound/unbound.conf.d/storozh.conf"
+RESOLV = "/etc/resolv.conf"
+DNS_BAK = "/root/node-dns-backup"            # dns.env и флаги таймера; под ProtectHome=yes маячку не видна
+DNS_LOG = "/var/log/storozh-unbound.log"
+RMARK = "# storozh-per-query: этим файлом управляет node_dns.sh"   # первая строка своего resolv.conf (как в node_dns.sh)
+LOG_FRESH = 1800   # «Unbound не отвечает» таймер пишет каждый прогон (10 мин), пока не ответит: старше 30 мин — уже не так
+
+
+def nameservers(text):
+    return [ln.split()[1] for ln in text.splitlines() if ln.split()[:1] == ["nameserver"] and len(ln.split()) > 1]
+
+
+def read_text(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.read()
+    except OSError:
         return None
+
+
+def unbound_answers(srv="127.0.0.1", timeout=2):
+    """Отвечает ли Unbound на 127.0.0.1:53 (запрос localhost — своя зона Unbound, наружу не ходит). Как glibc с
+    timeout:2: молчит или отказал (REFUSED, SERVFAIL) — программы уходят на запасной."""
+    import random
+    import socket
+    import struct
+    q = struct.pack(">HHHHHH", random.getrandbits(16), 0x0100, 1, 0, 0, 0) + b"\x09localhost\x00" + struct.pack(">HH", 1, 1)
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.settimeout(timeout)
+    try:
+        s.sendto(q, (srv, 53))
+        r = s.recv(1500)
+        return r[:2] == q[:2] and bool(r[2] & 0x80) and r[3] & 15 in (0, 3)
+    except OSError:
+        return False
+    finally:
+        s.close()
+
+
+def pq_log_state(lines, now):
+    """Что таймер в режиме per-query написал последним (когда /root маячку не виден): (Unbound не отвечает,
+    адреса DNS карт за 127.0.0.1 или None)."""
+    down, card = False, None
+    for ln in lines:
+        if "Unbound не отвечает (3 попытки)" in ln:
+            try:
+                down = now - dt.datetime.strptime(ln[:19], "%Y-%m-%dT%H:%M:%S").replace(
+                    tzinfo=dt.timezone.utc).timestamp() <= LOG_FRESH
+            except ValueError:
+                down = False
+        elif "вернула запросы на Unbound" in ln:
+            down = False
+        if "за 127.0.0.1 поставлены DNS карты " in ln:
+            card = ln.split("поставлены DNS карты ", 1)[1].split(" (", 1)[0].split()
+        elif "(DNS карты убраны)" in ln:
+            card = None
+    return down, card
+
+
+def docker_resolv():
+    """Первый nameserver в копии resolv.conf контейнера remnanode (её Docker пишет при старте контейнера; Xray в сети
+    хоста ходит по ней, а не по /etc/resolv.conf хоста) и сеть контейнера. Без docker exec: путь — docker inspect,
+    файл читается с диска. Нет контейнера — (None, None)."""
+    code, out, _ = proc(["docker", "inspect", "-f", "{{.ResolvConfPath}}|{{.HostConfig.NetworkMode}}|{{.State.Running}}",
+                         "remnanode"])
+    if code != 0 or out.count("|") < 2:
+        return None, None
+    path, net, running = out.strip().split("|", 2)
+    if running != "true":
+        return None, None   # контейнер стоит — Xray не работает, его копия ни о чём не говорит
+    text = read_text(path) if path else None
+    ns = nameservers(text) if text is not None else []
+    return (ns[0] if ns else None), (net or None)
+
+
+def dns(now=None):
+    """Свой резолвер Unbound (node_dns.sh): работает ли, на нём ли система, кэш, очередь, уходы на запасной. Нет — None.
+
+    Режим «запасной на каждый запрос» (node_dns.sh install --per-query): программы идут не в systemd-resolved, а по
+    /etc/resolv.conf (127.0.0.1 первым, за ним запасные) — current тогда реальный путь запросов: 127.0.0.1, пока Unbound
+    отвечает; не отвечает (флаг таймера unbound-down, его строка в журнале или сам не ответил на запрос) — первый
+    запасной. resolved — сервер systemd-resolved (для сведения: в этом режиме им почти никто не пользуется).
+    resolv_foreign — /etc/resolv.conf не свой (подменили до прогона таймера); resolv_replaced_24h — сколько раз за сутки
+    таймер находил его подменённым; resolv_card — за 127.0.0.1 стоят DNS карты (молчали Unbound и запасные);
+    xray_resolv — первый nameserver в копии resolv.conf контейнера remnanode.
+    Песочница маячка (ProtectHome=yes) прячет /root: dns.env и флаги не видны — режим тогда по метке файла, «Unbound
+    не отвечает» и DNS карты — по журналу таймера; подменённый файл без метки там не отличить от обычного режима."""
+    if not os.path.exists(UCONF):
+        return None
+    now = time.time() if now is None else now
     st = {}
     for line in run(["unbound-control", "stats_noreset"]).splitlines():
         k, _, v = line.partition("=")
@@ -314,7 +402,7 @@ def dns():
             st[k] = float(v)
         except ValueError:
             pass
-    conf = open("/etc/unbound/unbound.conf.d/storozh.conf").read()
+    conf = read_text(UCONF) or ""
 
     def size_mb(key, default):
         m = re.search(r"^\s*%s:\s*(\d+)([kmg]?)" % key, conf, re.M | re.I)
@@ -322,20 +410,58 @@ def dns():
             return default
         return int(m.group(1)) * {"": 1 / 1048576, "k": 1 / 1024, "m": 1, "g": 1024}[m.group(2).lower()]
 
-    cur = run(["resolvectl", "status"])
-    m = re.search(r"Current DNS Server:\s*(\S+)", cur)
-    since = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(time.time() - 86400))
-    try:
-        fb = sum(1 for ln in open("/var/log/storozh-unbound.log", errors="replace") if ln[:16] >= since and "вернула" in ln)
-    except OSError:
-        fb = 0
+    m = re.search(r"Current DNS Server:\s*(\S+)", run(["resolvectl", "status"]))
+    resolved = m.group(1) if m else None
+    since = time.strftime("%Y-%m-%dT%H:%M", time.gmtime(now - 86400))
+    log = read_text(DNS_LOG)
+    lines = log.splitlines() if log is not None else []
+    fb = sum(1 for ln in lines if ln[:16] >= since and "вернула" in ln)
     g = lambda k: int(st[k]) if k in st else None
-    return {"active": run(["systemctl", "is-active", "unbound"]).strip() == "active", "current": m.group(1) if m else None,
-            "queries": g("total.num.queries"), "hits": g("total.num.cachehits"), "exceeded": g("total.requestlist.exceeded"),
-            "servfail": g("num.answer.rcode.SERVFAIL"), "uptime": g("time.up"),
-            "rrset_mb": round(st.get("mem.cache.rrset", 0) / 1048576, 1), "rrset_max_mb": size_mb("rrset-cache-size", 4),
-            "msg_mb": round(st.get("mem.cache.message", 0) / 1048576, 1), "msg_max_mb": size_mb("msg-cache-size", 4),
-            "fallback_24h": fb}
+    active = run(["systemctl", "is-active", "unbound"]).strip() == "active"
+    out = {"active": active, "current": resolved,
+           "queries": g("total.num.queries"), "hits": g("total.num.cachehits"), "exceeded": g("total.requestlist.exceeded"),
+           "servfail": g("num.answer.rcode.SERVFAIL"), "uptime": g("time.up"),
+           "rrset_mb": round(st.get("mem.cache.rrset", 0) / 1048576, 1), "rrset_max_mb": size_mb("rrset-cache-size", 4),
+           "msg_mb": round(st.get("mem.cache.message", 0) / 1048576, 1), "msg_max_mb": size_mb("msg-cache-size", 4),
+           "fallback_24h": fb}
+
+    # режим: dns.env (PER_QUERY=yes), а если /root не виден (ProtectHome=yes) — метка первой строки /etc/resolv.conf
+    bak = os.path.isdir(DNS_BAK) and os.access(DNS_BAK, os.R_OK | os.X_OK)
+    env = read_text(os.path.join(DNS_BAK, "dns.env")) if bak else None
+    pq_env = None if env is None else (re.search(r"^PER_QUERY=yes\s*$", env, re.M) is not None)
+    rtext = read_text(RESOLV)
+    ours = not os.path.islink(RESOLV) and rtext is not None and rtext.split("\n", 1)[0].rstrip("\r") == RMARK
+    mode_file = (read_text("/etc/node-dns.mode") or "").strip() == "per-query"   # виден и из песочницы
+    if pq_env is None and mode_file:
+        pq_env = True
+    if not (pq_env or (pq_env is None and ours)):
+        return out   # обычный режим — поля как раньше
+    # в этом режиме программы resolved не спрашивают: его прежние «уходы» («resolved был на … — вернула») к делу не
+    # относятся — считаем только настоящие возвраты после отказа Unbound
+    out["fallback_24h"] = sum(1 for ln in lines if ln[:16] >= since and "вернула" in ln and "resolved был на" not in ln)
+    ns = nameservers(rtext or "")
+    if bak and env is not None:
+        down = os.path.exists(os.path.join(DNS_BAK, "unbound-down"))
+        card = (read_text(os.path.join(DNS_BAK, "resolv-card")) or "").split() or None
+    else:
+        down, card = pq_log_state(lines, now)
+        if card and ns[1:] != card:
+            card = None   # строка в журнале старая: в файле уже не DNS карты
+    alive = active and not down and unbound_answers()
+    if ours and ns:
+        spare = [a for a in ns if a != "127.0.0.1"]
+        current = ns[0] if (ns[0] != "127.0.0.1" or alive) else (spare[0] if spare else None)
+    else:
+        current = ns[0] if ns else None   # чужой файл: запросы идут туда, что в нём первым
+    # подмену таймер исправляет за 10 мин — маячок её застаёт редко; строки таймера видны и из песочницы
+    replaced = sum(1 for ln in lines if ln[:16] >= since and "/etc/resolv.conf был подменён" in ln)
+    out.update({"mode": "per-query", "current": current, "resolved": resolved, "nameservers": ns,
+                "unbound_ok": alive, "resolv_foreign": not ours, "resolv_card": card, "resolv_replaced_24h": replaced})
+    xr, net = docker_resolv()
+    if xr is not None or net is not None:
+        out["xray_resolv"] = xr
+        out["xray_net"] = net
+    return out
 
 
 UFW_LOGS = ("/var/log/ufw.log.1", "/var/log/ufw.log")

@@ -110,7 +110,7 @@ restore_resolv() {   # вернуть /etc/resolv.conf, как был до per-q
   elif [ -s "$RBEF" ]; then
     echo "/etc/resolv.conf: сейчас не свой файл — не трогаю ($(ls -l "$RESOLV" 2>/dev/null | sed 's/.* \/etc/\/etc/'))"
   fi
-  rm -f "$RBEF" "$RBEF.tmp" "$B/resolv.conf.before" "$tmp" "$B/unbound-down" "$B/resolv-card"
+  rm -f "$RBEF" "$RBEF.tmp" "$B/resolv.conf.before" "$tmp" "$B/unbound-down" "$B/resolv-card" /etc/node-dns.mode
 }
 
 probe() {   # ответ DNS-сервера $2 (по умолчанию свой Unbound) на запрос A имени $1: rcode (0 — норма) или «нет ответа»
@@ -284,6 +284,8 @@ do_install() {
   [ -n "$(ip -6 -o addr show scope global 2>/dev/null)" ] && [ -n "$(ip -6 route show default 2>/dev/null)" ] && ip6=yes
   DEBIAN_FRONTEND=noninteractive apt-get update -q >/dev/null || echo "apt-get update с ошибкой — ставлю из того, что есть"
   DEBIAN_FRONTEND=noninteractive apt-get install -y -q unbound >/dev/null
+  # пакет снимали без purge при выключенном автозапуске — ключа корня DNSSEC нет, unbound-checkconf упадёт
+  [ -s /var/lib/unbound/root.key ] || /usr/libexec/unbound-helper root_trust_anchor_update >/dev/null 2>&1 || true
   systemctl mask --now unbound-resolvconf.service >/dev/null 2>&1 || true
   cat > "$UCONF" <<CONF
 # node_dns.sh: свой кэширующий резолвер ноды. Только для самой ноды (127.0.0.1), спрашивает корневые серверы сам.
@@ -342,6 +344,10 @@ CONF
   fi
   printf 'FALLBACK=%s\nSYSTEM_DNS=%s\n' "$FALLBACK" "$sysdns" > "$B/dns.env"
   [ "$pq" = yes ] && printf 'PER_QUERY=yes\nRESOLV_NS=%s\nRESOLV_SEARCH=%s\n' "$ns" "$rsearch" >> "$B/dns.env"
+  # признак режима там, где его видит маячок из песочницы (ProtectHome=yes прячет /root): подменённый resolv.conf
+  # без метки маячок отличит от обычного режима сразу, а не через 10 мин
+  if [ "$pq" = yes ]; then echo per-query > /etc/node-dns.mode.tmp && chmod 644 /etc/node-dns.mode.tmp \
+       && mv -f /etc/node-dns.mode.tmp /etc/node-dns.mode; else rm -f /etc/node-dns.mode; fi
   cat > "$RET.tmp" <<'SH'
 #!/usr/bin/env bash
 # node_dns.sh: держать систему на своём Unbound. Каждое переключение — строка в /var/log/storozh-unbound.log.
