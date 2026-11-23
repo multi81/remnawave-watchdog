@@ -7,11 +7,37 @@
 # Российские сайты не страдают: в шаблонах подписки они идут напрямую с устройства, а адреса, которые находит Unbound,
 # совпадают с ответами 1.1.1.1.
 #
-#   bash node_dns.sh install | status | rollback   [FALLBACK="адрес …" — запасной DNS, каждый адрес проверяется;
+#   bash node_dns.sh install [--per-query | --regular] | status | rollback
+#                                                  [FALLBACK="адрес …" — запасной DNS, каждый адрес проверяется;
 #                                                   по умолчанию DNS системы до установки (глобальные и у сетевой
 #                                                   карты; если снимок снят после прежней установки — только у карты),
 #                                                   если их нет — 1.1.1.1. Нужен маршрут IPv4 наружу: по нему ищется
 #                                                   сетевая карта]
+#
+# Режим «запасной на каждый запрос» (install --per-query; запоминается в dns.env как PER_QUERY=yes — повторный
+# install без ключа, status, таймер и rollback его знают; выйти — install --regular или rollback). Без ключа на ноде,
+# где режим не включали, всё как раньше.
+#   Зачем: systemd-resolved подбирает таймаут по RTT; свой Unbound из кэша отвечает за доли мс, а на промахе кэша
+#   рекурсия идёт 0,3–1,5 с — resolved не дожидается, уходит на запасной и залипает на нём (до таймера). Нужен там,
+#   где маячок показывает частые «уходы на запасной» при исправном Unbound.
+#   Что делает: /etc/resolv.conf — не ссылка на stub resolved, а свой файл: nameserver 127.0.0.1, за ним до двух
+#   запасных (ответившие при установке адреса FALLBACK; если не ответил ни один — DNS карты), options timeout:2
+#   attempts:1 edns0 trust-ad, search как в stub. glibc и Go-резолвер (Xray в remnanode, сеть хоста) не помнят
+#   прошлых отказов: каждый запрос — сначала Unbound, не ответил за 2 с (или SERVFAIL) — сразу запасной, следующий
+#   запрос снова в Unbound; залипать нечему. Остановленный Unbound (порт закрыт) отказывает сразу — запасной без
+#   задержки; зависший — через 2 с. timeout:2 — промах кэша (до ~1,5 с) обычно успевает, а 1 с glibc — уже на
+#   границе; больше 2 с — каждый запрос при зависшем Unbound ждал бы дольше. resolved и его drop-in остаются как в
+#   обычном режиме (для тех, кто идёт в 127.0.0.53). Docker: контейнеры в сети bridge берут файл хоста без loopback —
+#   у них остаются запасные (как и в обычном режиме: тогда Docker брал /run/systemd/resolve/resolv.conf без 127.0.0.1);
+#   контейнеры в сети хоста видят этот файл целиком. Переход с обычного режима — повторный install --per-query: файл
+#   меняется атомарно (tmp + mv), DNS не пропадает ни на миг. Как был resolv.conf до режима — resolv-before.env.
+#   Таймер в этом режиме: подменили /etc/resolv.conf (cloud-init, netplan, resolvconf, руками) — вернуть свой и
+#   записать; Unbound не отвечает (3 попытки) — из файла не убирать (запросы и так уходят на запасной), записать
+#   «Unbound не отвечает» и перезапустить его; «вернула» — только когда Unbound снова ответил после отказа; молчат
+#   и Unbound, и запасные — за 127.0.0.1 ставятся DNS карты (как в обычном режиме возвращается DNS провайдера),
+#   запасные ответили — снова они (resolv-card в /root/node-dns-backup).
+#   Откат: bash node_dns.sh rollback (всё) или install --regular (только режим): /etc/resolv.conf снова ссылка на
+#   stub resolved (или как был до режима).
 #
 # Что ставит:
 #   /etc/unbound/unbound.conf.d/storozh.conf      Unbound только на 127.0.0.1, кэш 32+64 МБ, prefetch, serve-expired,
@@ -50,6 +76,42 @@ RCONF=/etc/systemd/resolved.conf.d/storozh-unbound.conf
 ROFF=$B/storozh-unbound.conf.off   # drop-in, снятый таймером, когда не отвечали ни Unbound, ни запасной
 RET=/usr/local/sbin/storozh-unbound-return
 NOW=$B/resolvectl-now.txt          # свежий `resolvectl status` для разбора (rv читает файл, не аргумент)
+RESOLV=/etc/resolv.conf
+RBEF=$B/resolv-before.env          # режим per-query: как был /etc/resolv.conf (KIND=link|file, TARGET=), один раз
+RMARK='# storozh-per-query: этим файлом управляет node_dns.sh'   # первая строка своего resolv.conf (так же в $RET)
+STUB=../run/systemd/resolve/stub-resolv.conf
+PQ_ARG=                            # install --per-query → yes, --regular → no, без ключа — как в dns.env
+pq_saved() { sed -n 's/^PER_QUERY=//p' "$B/dns.env" 2>/dev/null | head -n1 || true; }
+ours() { [ ! -L "$RESOLV" ] && head -n1 "$RESOLV" 2>/dev/null | grep -qxF "$RMARK"; }   # стоит свой resolv.conf
+
+save_resolv_before() {   # один раз: как был /etc/resolv.conf до режима per-query (свой файл уже стоит — не трогать)
+  [ -s "$RBEF" ] && return 0
+  ours && return 0   # снимок потерян, а свой файл стоит: откат поставит ссылку на stub
+  if [ -L "$RESOLV" ]; then printf 'KIND=link\nTARGET=%s\n' "$(readlink "$RESOLV")"
+  elif [ -e "$RESOLV" ]; then cp -p "$RESOLV" "$B/resolv.conf.before" && printf 'KIND=file\n'
+  else printf 'KIND=link\nTARGET=%s\n' "$STUB"; fi > "$RBEF.tmp" && mv -f "$RBEF.tmp" "$RBEF"
+}
+
+restore_resolv() {   # вернуть /etc/resolv.conf, как был до per-query (только если стоит свой файл); атомарно
+  local k t tmp=/etc/.resolv.conf.storozh.tmp
+  if ours || [ "${UPLINK_TMP:-}" = 1 ]; then   # UPLINK_TMP: откат временно поставил ссылку на uplink resolved
+    k=$(sed -n 's/^KIND=//p' "$RBEF" 2>/dev/null | head -n1) || k=
+    t=$(sed -n 's/^TARGET=//p' "$RBEF" 2>/dev/null | head -n1) || t=
+    rm -f "$tmp"
+    if [ "$k" = file ] && [ -s "$B/resolv.conf.before" ]; then
+      cp -p "$B/resolv.conf.before" "$tmp" && mv -fT "$tmp" "$RESOLV" &&
+        echo "/etc/resolv.conf: возвращён прежний файл (как до режима per-query)" || echo "/etc/resolv.conf: не смогла вернуть прежний файл"
+    else
+      t=${t:-$STUB}
+      ln -s "$t" "$tmp" && mv -fT "$tmp" "$RESOLV" &&
+        echo "/etc/resolv.conf: снова ссылка на $t" || echo "/etc/resolv.conf: не смогла вернуть ссылку на $t"
+      [ -e "$RESOLV" ] || echo "/etc/resolv.conf: ссылка ведёт в никуда ($t) — systemd-resolved не работает?"
+    fi
+  elif [ -s "$RBEF" ]; then
+    echo "/etc/resolv.conf: сейчас не свой файл — не трогаю ($(ls -l "$RESOLV" 2>/dev/null | sed 's/.* \/etc/\/etc/'))"
+  fi
+  rm -f "$RBEF" "$RBEF.tmp" "$B/resolv.conf.before" "$tmp" "$B/unbound-down" "$B/resolv-card"
+}
 
 probe() {   # ответ DNS-сервера $2 (по умолчанию свой Unbound) на запрос A имени $1: rcode (0 — норма) или «нет ответа»
   python3 - "$1" "${2:-127.0.0.1}" <<'PY'
@@ -202,6 +264,7 @@ before_env() {   # как было до первой установки: Unbound
 }
 
 do_install() {
+  local pq; pq=$(pq_saved); pq=${PQ_ARG:-${pq:-no}}   # режим: ключ, иначе как при прошлой установке, иначе обычный
   ss -lunH | awk '{print $4}' | grep -qE '^127\.0\.0\.1:53$' && ! systemctl is-active -q unbound && {
     echo "127.0.0.1:53 уже занят чем-то другим — не ставлю"; exit 1; }
   [ -n "$IF" ] || { echo "нет маршрута IPv4 наружу (ip route get 1.1.1.1) — не понять сетевую карту, не ставлю"; exit 1; }
@@ -250,7 +313,11 @@ CONF
   ok=0; for _ in 1 2 3; do [ "$(probe ya.ru)" = 0 ] && { ok=1; break; }; sleep 3; done   # холодный кэш: первый ответ бывает долгим
   [ "$ok" = 1 ] || { echo "Unbound не отвечает — откат"; do_rollback; exit 1; }
   read -ra fbs <<< "$FALLBACK"
-  for a in "${fbs[@]}"; do [ "$(probe ya.ru "$a")" = 0 ] && { fb_ok=1; break; }; done
+  local fb_alive=() x ns="" rsearch=""
+  # per-query: проверить все (в resolv.conf идут ответившие); обычный режим — до первого ответившего, как раньше
+  for a in "${fbs[@]}"; do
+    [ "$(probe ya.ru "$a")" = 0 ] && { fb_ok=1; fb_alive+=("$a"); [ "$pq" = yes ] || break; }
+  done
   # DNS карты на случай мягкого drop-in, если у карты сейчас их нет: живые, иначе DNS системы из снимка «до», иначе
   # DNS= из resolved.conf и его .conf.d (хостеры прописывают туда; пустое DNS= нашего drop-in их прячет), кроме нашего
   resolvectl status > "$NOW" 2>&1 || true
@@ -263,8 +330,19 @@ CONF
     done
     sysdns=$(rv conf "${rcfs[@]}") || sysdns=
   fi
+  if [ "$pq" = yes ]; then
+    # запасные для resolv.conf, не больше двух (glibc и Go читают до 3 nameserver, первый — 127.0.0.1): ответившие
+    # адреса FALLBACK; не ответил ни один — DNS карты; нет и их — FALLBACK как есть (лучше, чем один Unbound)
+    if [ "${#fb_alive[@]}" -gt 0 ]; then ns="${fb_alive[*]:0:2}"
+    else read -ra x <<< "$sysdns"; [ "${#x[@]}" -gt 0 ] && ns="${x[*]:0:2}"; fi
+    [ -n "$ns" ] || ns="${fbs[*]:0:2}"
+    # search как в stub resolved (glibc берёт последнюю строку search/domain); stub пропал — как при прошлой установке
+    rsearch=$(grep -E '^(search|domain)[[:space:]]' /run/systemd/resolve/stub-resolv.conf 2>/dev/null | tail -n1) || rsearch=
+    [ -n "$rsearch" ] || { rsearch=$(sed -n 's/^RESOLV_SEARCH=//p' "$B/dns.env" 2>/dev/null | head -n1) || rsearch=; }
+  fi
   printf 'FALLBACK=%s\nSYSTEM_DNS=%s\n' "$FALLBACK" "$sysdns" > "$B/dns.env"
-  cat > "$RET" <<'SH'
+  [ "$pq" = yes ] && printf 'PER_QUERY=yes\nRESOLV_NS=%s\nRESOLV_SEARCH=%s\n' "$ns" "$rsearch" >> "$B/dns.env"
+  cat > "$RET.tmp" <<'SH'
 #!/usr/bin/env bash
 # node_dns.sh: держать систему на своём Unbound. Каждое переключение — строка в /var/log/storozh-unbound.log.
 #   storozh-unbound-return                   проверка (таймер раз в 10 минут)
@@ -273,6 +351,13 @@ CONF
 # soft — запасной не отвечает: DNS=127.0.0.1 и DNS карты без Domains=~., default-route как до установки — resolved
 #        спрашивает Unbound и DNS карты параллельно, отвечает быстрейший. Если молчат и Unbound, и запасной —
 #        drop-in снимается совсем (до ответа Unbound).
+#   storozh-unbound-return resolv            только записать свой /etc/resolv.conf (режим per-query; так его пишет
+#                                            и node_dns.sh install); stdout — что стояло раньше, пусто — уже такой
+# Режим per-query (PER_QUERY=yes в dns.env): программы идут не в resolved, а по /etc/resolv.conf — 127.0.0.1 первым,
+# запасные RESOLV_NS за ним. Проверка: файл подменили — вернуть свой (строка в журнале); Unbound не отвечает — из файла
+# не убирать, записать и перезапустить Unbound; «вернула» — только когда Unbound снова ответил после отказа (маячок
+# считает такие строки уходами на запасной). resolved и drop-in — как в обычном режиме, но его возврат на Unbound
+# в журнал не пишется: в этом режиме им почти никто не пользуется.
 set -u
 LOG=/var/log/storozh-unbound.log
 CONF=/etc/systemd/resolved.conf.d/storozh-unbound.conf
@@ -280,6 +365,42 @@ B=/root/node-dns-backup
 OFF=$B/storozh-unbound.conf.off   # drop-in, снятый, когда не отвечали ни Unbound, ни запасной
 env_() { sed -n "s/^$1=//p" "$2" 2>/dev/null | head -n1; }
 FB=$(env_ FALLBACK "$B/dns.env")
+PQ=$(env_ PER_QUERY "$B/dns.env")
+NS=$(env_ RESOLV_NS "$B/dns.env")
+RESOLV=/etc/resolv.conf
+DOWN=$B/unbound-down              # per-query: Unbound не отвечал при прошлой проверке
+SLOW=$B/unbound-slow              # per-query: служба жива, а рекурсия разово не прошла — ждём следующий прогон
+CARDF=$B/resolv-card              # per-query: молчали Unbound и запасные — за 127.0.0.1 стоят DNS карты (они в файле)
+NSX=$NS; [ -s "$CARDF" ] && NSX=$(cat "$CARDF")
+MARK='# storozh-per-query: этим файлом управляет node_dns.sh'
+resolv_text() {
+  local s a
+  s=$(grep -E '^(search|domain)[[:space:]]' /run/systemd/resolve/stub-resolv.conf 2>/dev/null | tail -n1)
+  [ -n "$s" ] || s=$(env_ RESOLV_SEARCH "$B/dns.env")
+  echo "$MARK"
+  echo "# Режим «запасной на каждый запрос» (node_dns.sh install --per-query). Каждый запрос программ (glibc, Go)"
+  echo "# идёт сначала в свой Unbound 127.0.0.1; не ответил за 2 с или отказал — сразу в запасной, следующий запрос —"
+  echo "# снова в Unbound. Не править руками: таймер storozh-unbound-return (раз в 10 мин) вернёт этот файл."
+  echo "# systemd-resolved (127.0.0.53) работает как раньше. Откат: bash node_dns.sh rollback (всё) или"
+  echo "# bash node_dns.sh install --regular (только режим) — снова ссылка на stub resolved."
+  echo "nameserver 127.0.0.1"
+  for a in $NSX; do echo "nameserver $a"; done
+  echo "options timeout:2 attempts:1 edns0 trust-ad"
+  [ -z "$s" ] || echo "$s"
+}
+put_resolv() {   # свой /etc/resolv.conf, если стоит не он; атомарно (tmp в /etc + mv). stdout: что стояло, пусто — уже такой
+  local t=/etc/.resolv.conf.storozh.tmp was
+  [ -n "$NS" ] || { echo "нет RESOLV_NS в $B/dns.env — без запасных не пишу" >&2; return 1; }
+  resolv_text > "$t" || { rm -f "$t"; return 1; }
+  if [ ! -L "$RESOLV" ] && cmp -s "$t" "$RESOLV"; then rm -f "$t"; return 0; fi
+  if [ -L "$RESOLV" ]; then was="ссылка на $(readlink "$RESOLV")"
+  elif [ ! -e "$RESOLV" ]; then was="файла не было"
+  elif head -n1 "$RESOLV" | grep -qxF "$MARK"; then was="свой, устарел (сменились search или запасные)"
+  else was="чужой файл, nameserver: $(awk '/^nameserver/{printf "%s ", $2}' "$RESOLV")"
+  fi
+  chmod 644 "$t" && mv -fT "$t" "$RESOLV" || { rm -f "$t"; return 1; }
+  echo "$was"
+}
 IF=$(ip -o route get 1.1.1.1 2>/dev/null | grep -o "dev [^ ]*" | cut -d" " -f2)
 now() { date -u +%Y-%m-%dT%H:%M:%SZ; }
 py() { python3 - "$@" <<'PY'
@@ -323,6 +444,7 @@ PY
 }
 alive() { py alive "$1"; }
 fb_alive() { local a; for a in $FB; do alive "$a" && return 0; done; return 1; }
+ns_alive() { local a; for a in $NS; do alive "$a" && return 0; done; return 1; }   # запасные из resolv.conf
 card() { local c; c=$(py link "$(resolvectl dns "$IF" 2>/dev/null)"); echo "${c:-$(env_ SYSTEM_DNS "$B/dns.env")}"; }
 write_conf() {   # $1: full | soft; пустое DNS= сбрасывает список из основного resolved.conf (хостеры часто прописывают
                  # там свои), иначе Unbound встанет последним
@@ -346,8 +468,63 @@ if [ "${1:-}" = conf ]; then
   [ -n "$IF" ] || { echo "нет маршрута наружу — не понять сетевую карту"; exit 1; }
   install -d /etc/systemd/resolved.conf.d; write_conf "${2:-full}"; exit
 fi
+if [ "${1:-}" = resolv ]; then put_resolv; exit; fi
+u=
+if [ "$PQ" = yes ]; then
+  if w=$(put_resolv); then   # сначала вернуть свой файл, если подменили (с теми же адресами, что стояли)
+    case "$w" in
+      "") ;;
+      свой*) echo "$(now) /etc/resolv.conf обновлён: $w; nameserver 127.0.0.1 $NSX" >> "$LOG" ;;
+      *) echo "$(now) /etc/resolv.conf был подменён ($w) — поставлен свой: nameserver 127.0.0.1 $NSX" >> "$LOG" ;;
+    esac
+  else
+    echo "$(now) /etc/resolv.conf не свой, а записать свой не вышло" >> "$LOG"
+  fi
+  u=0; alive 127.0.0.1 && u=1
+  if [ "$u" = 0 ] && systemctl is-active -q unbound && [ ! -e "$SLOW" ] && [ ! -e "$DOWN" ]; then
+    # служба работает, а живая рекурсия разово не прошла (медленные серверы имён) — перезапуск стёр бы кэш и дал бы
+    # ложную «вернула»; ждём следующий прогон, запросы тем временем и так уходят на запасные
+    touch "$SLOW"; u=slow
+  fi
+  [ "$u" = slow ] || rm -f "$SLOW"
+  if [ "$u" = 0 ]; then   # из resolv.conf не убирать: запросы и так уходят на запасные (сразу или через 2 с)
+    systemctl restart unbound >/dev/null 2>&1; sleep 2
+    if alive 127.0.0.1; then
+      u=1; rm -f "$DOWN"
+      echo "$(now) Unbound не отвечал (3 попытки) — перезапущен и снова отвечает; вернула запросы на Unbound (до этого шли на запасные $NSX)" >> "$LOG"
+    else
+      touch "$DOWN"
+      echo "$(now) Unbound не отвечает (3 попытки), перезапуск не помог — остаётся первым в /etc/resolv.conf, запросы уходят на запасные $NSX (сразу, если порт закрыт; через 2 с, если завис)" >> "$LOG"
+    fi
+  elif [ "$u" = slow ]; then
+    u=0
+  elif [ -e "$DOWN" ]; then
+    rm -f "$DOWN"
+    echo "$(now) Unbound снова отвечает — вернула запросы на Unbound" >> "$LOG"
+  fi
+  # молчат и Unbound, и запасные — за 127.0.0.1 DNS карты (как в обычном режиме: тогда возвращается DNS провайдера);
+  # запасные ответили — снова они. Пока Unbound отвечает и DNS карты не стоят, запасные не проверяются.
+  if [ "$u" = 0 ] || [ -s "$CARDF" ]; then
+    nsok=0; ns_alive && nsok=1
+    if [ "$nsok" = 0 ] && [ "$u" = 0 ] && [ ! -s "$CARDF" ]; then
+      c=$(for a in $(card); do case " $NS " in *" $a "*) ;; *) echo "$a" ;; esac; done | head -n2 | tr '\n' ' ')
+      c=${c% }
+      if [ -n "$c" ]; then
+        echo "$c" > "$CARDF"; NSX=$c
+        put_resolv >/dev/null
+        echo "$(now) не отвечают ни Unbound, ни запасные $NS — в /etc/resolv.conf за 127.0.0.1 поставлены DNS карты $c (запасные вернутся, когда ответят)" >> "$LOG"
+      else
+        echo "$(now) не отвечают ни Unbound, ни запасные $NS, других DNS карты нет — /etc/resolv.conf без изменений" >> "$LOG"
+      fi
+    elif [ "$nsok" = 1 ] && [ -s "$CARDF" ]; then
+      rm -f "$CARDF"; NSX=$NS
+      put_resolv >/dev/null
+      echo "$(now) запасные $NS снова отвечают — в /etc/resolv.conf за 127.0.0.1 снова они (DNS карты убраны)" >> "$LOG"
+    fi
+  fi
+fi
 [ -n "$IF" ] || exit 0   # нет маршрута — проверять нечего
-u=0; alive 127.0.0.1 && u=1
+[ -n "$u" ] || { u=0; alive 127.0.0.1 && u=1; }
 f=0; fb_alive && f=1
 m=soft; [ "$f" = 1 ] && m=full
 if [ ! -e "$CONF" ]; then
@@ -355,7 +532,11 @@ if [ ! -e "$CONF" ]; then
   if [ "$u" = 1 ]; then
     write_conf "$m" && rm -f "$OFF"
     systemctl restart systemd-resolved; sleep 1; route "$m"
-    echo "$(now) Unbound снова отвечает — drop-in возвращён ($m), вернула на Unbound (сейчас $(current))" >> "$LOG"
+    if [ "$PQ" = yes ]; then   # per-query: «вернула» пишет только проверка Unbound выше
+      echo "$(now) Unbound снова отвечает — drop-in resolved возвращён ($m), resolved снова на Unbound (сейчас $(current))" >> "$LOG"
+    else
+      echo "$(now) Unbound снова отвечает — drop-in возвращён ($m), вернула на Unbound (сейчас $(current))" >> "$LOG"
+    fi
   fi
   exit 0
 fi
@@ -377,7 +558,10 @@ elif [ "$m" = full ] && resolvectl status "$IF" 2>/dev/null | grep -q "+DefaultR
   resolvectl default-route "$IF" false && echo "$(now) DNS сетевой карты $IF снова был маршрутом по умолчанию — выключен" >> "$LOG"
 fi
 cur=$(current)
-if [ "$cur" != "127.0.0.1" ]; then
+if [ "$cur" != "127.0.0.1" ] && [ "$PQ" = yes ]; then
+  # per-query: программы идут мимо resolved; вернуть его тихо (без строки «вернула» — маячок счёл бы её уходом)
+  if [ "$u" = 1 ]; then systemctl restart systemd-resolved; sleep 1; route "$m"; fi
+elif [ "$cur" != "127.0.0.1" ]; then
   if [ "$u" = 1 ]; then
     systemctl restart systemd-resolved; sleep 1; route "$m"
     echo "$(now) resolved был на ${cur:-?} — вернула на Unbound (сейчас $(current))" >> "$LOG"
@@ -386,7 +570,20 @@ if [ "$cur" != "127.0.0.1" ]; then
   fi
 fi
 SH
-  chmod 755 "$RET"
+  chmod 755 "$RET.tmp" && mv -f "$RET.tmp" "$RET"
+  # режим per-query — до перезапуска resolved: программы сразу идут по своему resolv.conf (Unbound уже проверен),
+  # перезапуск resolved их не задевает; файл меняется атомарно — DNS не пропадает. Обычный режим после per-query —
+  # resolv.conf, как был до режима (ссылка на stub), но уже после перезапуска resolved (ниже).
+  local w
+  if [ "$pq" = yes ]; then
+    save_resolv_before
+    if w=$("$RET" resolv); then
+      echo "режим «запасной на каждый запрос»: /etc/resolv.conf — свой файл (было: ${w:-уже стоял свой})," \
+           "nameserver 127.0.0.1 $ns, options timeout:2 attempts:1"
+    else
+      echo "режим «запасной на каждый запрос»: /etc/resolv.conf записать не вышло — программы пока идут через resolved; таймер попробует снова"
+    fi
+  fi
   mode=soft; [ "$fb_ok" = 1 ] && mode=full
   "$RET" conf "$mode"
   rm -f "$ROFF"
@@ -399,6 +596,9 @@ SH
     echo "запасной DNS ($FALLBACK) не отвечает — drop-in мягкий: без Domains=~., DNS=127.0.0.1 $(sed -n 's/^DNS=127\.0\.0\.1 *//p' "$RCONF");" \
          "resolved спрашивает Unbound и DNS карты $IF параллельно, default-route у $IF как до установки ($(before DEFAULT_ROUTE)); таймер сделает полный, когда запасной ответит"
   fi
+  # выход из per-query (install --regular): ссылка на stub — когда resolved уже перезапущен; до этого программы шли
+  # по своему файлу в живой Unbound. На ноде, где режима не было, restore_resolv ничего не делает.
+  [ "$pq" = yes ] || restore_resolv
   cat > /etc/systemd/system/storozh-unbound-return.service <<'UNIT'
 [Unit]
 Description=storozh: держать систему на своём Unbound (возврат с запасного DNS)
@@ -430,7 +630,22 @@ L
 
 do_status() {
   resolvectl query -t A ya.ru >/dev/null 2>&1 || true   # сразу после перезапуска resolved ещё не выбрал сервер
-  echo "unbound: $(systemctl is-active unbound) · система спрашивает: $(resolvectl status | awk '/Current DNS Server/{print $4; exit}')" \
+  local who="система спрашивает"
+  if [ "$(pq_saved)" = yes ]; then
+    who="resolved (127.0.0.53) спрашивает"
+    if ours; then
+      echo "режим: запасной на каждый запрос · /etc/resolv.conf свой: nameserver $(awk '/^nameserver/{printf "%s ", $2}' "$RESOLV")·" \
+           "$(grep -m1 '^options' "$RESOLV") · $(grep -E '^(search|domain)' "$RESOLV" | tail -n1)"
+    else
+      echo "режим: запасной на каждый запрос, но /etc/resolv.conf не свой ($(ls -l "$RESOLV" 2>/dev/null | sed 's/.* \/etc/\/etc/'))" \
+           "— таймер вернёт; nameserver: $(awk '/^nameserver/{printf "%s ", $2}' "$RESOLV" 2>/dev/null)"
+    fi
+    [ ! -e "$B/unbound-down" ] || echo "при последней проверке таймера Unbound не отвечал — запросы шли на запасные"
+    [ ! -s "$B/resolv-card" ] || echo "молчали и Unbound, и запасные $(sed -n 's/^RESOLV_NS=//p' "$B/dns.env") — за 127.0.0.1 стоят DNS карты $(cat "$B/resolv-card")"
+  else
+    echo "режим: обычный (программы спрашивают systemd-resolved через $RESOLV → $(readlink "$RESOLV" 2>/dev/null || echo файл))"
+  fi
+  echo "unbound: $(systemctl is-active unbound) · $who: $(resolvectl status | awk '/Current DNS Server/{print $4; exit}')" \
        "· ya.ru: rcode $(probe ya.ru) · ozon.ru: rcode $(probe ozon.ru)" \
        "· строк в журнале переключений за сутки: $(awk -v d="$(date -u -d '-24 hours' +%Y-%m-%dT%H:%M)" '$1>=d' /var/log/storozh-unbound.log 2>/dev/null | wc -l)"
   if [ -e "$ROFF" ]; then
@@ -450,6 +665,7 @@ do_rollback() {   # каждый шаг сам по себе: ошибка од�
   local was en dr mask
   was=$(before UNBOUND_WAS_ACTIVE); en=$(before UNBOUND_WAS_ENABLED); dr=$(before DEFAULT_ROUTE); mask=$(before MASKED_BY_US)
   systemctl disable --now storozh-unbound-return.timer >/dev/null 2>&1 || true
+  systemctl stop storozh-unbound-return.service >/dev/null 2>&1 || true   # дождаться идущего запуска
   rm -f /etc/systemd/system/storozh-unbound-return.{service,timer} "$RET" || echo "откат: таймер не удалён"
   systemctl daemon-reload || echo "откат: daemon-reload с ошибкой"
   rm -f "$RCONF" "$RCONF.tmp" "$ROFF" "$B/dns.env" || echo "откат: drop-in не удалён"
@@ -459,11 +675,27 @@ do_rollback() {   # каждый шаг сам по себе: ошибка од�
   else
     echo "откат: нет маршрута IPv4 наружу — сетевую карту не понять, default-route не трогаю (верните сами: resolvectl default-route КАРТА ${dr:-true})"
   fi
+  # режим per-query: resolved без drop-in (в нём DNS=) при старте читает чужой статический /etc/resolv.conf и берёт
+  # его nameserver себе в Global — свой файл остался бы у него после отката. Поэтому на время перезапуска
+  # /etc/resolv.conf — ссылка на uplink-файл самого resolved (свои файлы он не читает): там те же 127.0.0.1 и
+  # запасные из drop-in, программы идут прямо в живой Unbound; файл в /run переживает перезапуск resolved.
+  UPLINK_TMP=
+  if ours && [ -s /run/systemd/resolve/resolv.conf ]; then
+    rm -f /etc/.resolv.conf.storozh.tmp
+    if ln -s ../run/systemd/resolve/resolv.conf /etc/.resolv.conf.storozh.tmp && mv -fT /etc/.resolv.conf.storozh.tmp "$RESOLV"; then
+      UPLINK_TMP=1
+    else
+      echo "откат: /etc/resolv.conf на время перезапуска resolved не переставлен — resolved возьмёт адреса своего файла в Global до следующего перезапуска"
+    fi
+  fi
   systemctl restart systemd-resolved || echo "откат: systemd-resolved не перезапустился"
   sleep 1
   if [ -n "$IF" ]; then
     resolvectl default-route "$IF" "${dr:-true}" || echo "откат: default-route после перезапуска resolved не поставлен"
   fi
+  # режим per-query: resolv.conf — после перезапуска resolved (stub уже готов) и до остановки Unbound (программы
+  # до последнего идут в живой Unbound); таймер уже снят — не вернёт свой файл обратно
+  restore_resolv | sed 's/^/откат: /' || true
   if [ -e "$UCONF" ]; then mv -f "$UCONF" "$B/storozh.conf.rolled-back" || echo "откат: storozh.conf не убран"; fi
   if [ "$mask" = yes ]; then
     systemctl unmask unbound-resolvconf.service >/dev/null 2>&1 || echo "откат: маска unbound-resolvconf не снята"
@@ -487,8 +719,17 @@ do_rollback() {   # каждый шаг сам по себе: ошибка од�
 }
 
 case "${1:-}" in
-  install) do_install ;;
+  install)
+    shift
+    for a in "$@"; do
+      case "$a" in
+        --per-query) PQ_ARG=yes ;;
+        --regular) PQ_ARG=no ;;
+        *) echo "install: неизвестный ключ $a (есть --per-query и --regular)"; exit 2 ;;
+      esac
+    done
+    do_install ;;
   status) do_status ;;
   rollback) do_rollback ;;
-  *) echo "node_dns.sh install | status | rollback"; exit 2 ;;
+  *) echo "node_dns.sh install [--per-query | --regular] | status | rollback"; exit 2 ;;
 esac
