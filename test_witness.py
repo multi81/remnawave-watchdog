@@ -1,7 +1,7 @@
-"""Тесты к проверки (часть 3): свидетель ноды и установщики. (фильтр BPF по своим адресам, tcpdump без
--Z root, песочница юнита), (предел отслеживаемых соединений и размера файла, честный since), (запись файла
-свидетеля через mkstemp), и (beacon_install.sh: ufw только включённый, удаление правила без sh -c, проверка
-адреса и порта, смена правила), переход serve↔site, (install.sh: песочница служб, Xray от DynamicUser) и
+"""Тесты: свидетель ноды и установщики. Свидетель (фильтр BPF по своим адресам, tcpdump без
+-Z root, песочница юнита, предел отслеживаемых соединений и размера файла, честный since, запись файла
+свидетеля через mkstemp), beacon_install.sh (ufw только включённый, удаление правила без sh -c, проверка
+адреса и порта, смена правила), переход serve↔site, install.sh (песочница служб, Xray от DynamicUser) и
 обновление Xray при повторной установке, мелочи (SyslogLevel при LogLevelMax, пути в кавычках). Без сети."""
 import importlib.util
 import json
@@ -46,7 +46,8 @@ def bash(script, env=None):
 
 # --- фильтр BPF ---
 f0 = nw.build_filter()
-before = os.path.join(HERE, "..", "2026-11-23-review-p34", "before", "node_witness.py")
+OLD_DIR = os.environ.get("OLD_CODE_DIR", "")   # папка с прежней версией модулей — для сравнения (необязательно)
+before = os.path.join(OLD_DIR, "node_witness.py") if OLD_DIR else ""
 if os.path.exists(before):
     spec = importlib.util.spec_from_file_location("nw_before", before)
     old = importlib.util.module_from_spec(spec)
@@ -168,7 +169,7 @@ check("X2 пути в юните в кавычках (пробелы), \", \\ и
       'ExecStart=/usr/bin/python3 "$APP/node_witness.py" "$out"' in ul and 'ReadWritePaths="$dir"' in ul
       and 0 < wi.find('*\\"*|*\'\\\'*|*%*') < wi.find('cat > "$UNIT"'))
 check("X3 песочница свидетеля: только нужные возможности, без root-полномочий, запись только в папку",
-      "CapabilityBoundingSet=$caps" in ul and "AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN" in ul
+      "CapabilityBoundingSet=$caps" in ul and "AmbientCapabilities=$amb" in ul   # от node-witness — test_witness_user.py
       and 'caps="CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID"' in wi and 'caps="$caps CAP_DAC_OVERRIDE"' in wi
       and all(d in ul for d in ("NoNewPrivileges=yes", "ProtectSystem=strict", "PrivateTmp=yes", "ProtectHome=$ph",
                                 "RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK AF_PACKET",

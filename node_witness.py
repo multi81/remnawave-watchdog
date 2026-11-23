@@ -12,7 +12,10 @@
     пользователи выходной ноды) в процесс не попадают. Ответы ноды клиентам фильтр без состояния отличить не может —
     они сверяются только с помеченными соединениями и нигде не сохраняются;
   - адресов в выходном файле нет: только время, метка и счётчики;
-  - пакеты разбирает tcpdump, и он сразу после открытия захвата сбрасывает права до пользователя tcpdump (-Z);
+  - работает от своего пользователя node-witness (не root) с одной возможностью CAP_NET_RAW; пакеты разбирает
+    tcpdump от того же пользователя (возможность он наследует, -Z не нужен). Писать свидетель может только в папку
+    своего файла (ACL на неё ставит witness_install.sh). Если ACL поставить нельзя, служба от root с узкими
+    возможностями, и тогда tcpdump сразу после открытия захвата сбрасывает права до пользователя tcpdump (-Z);
   - поддельными помеченными SYN свидетеля не забить: следим не больше чем за MAX_LIVE соединениями, файл не больше
     MAX_BYTES. Что не уместилось, честно помечается: since сдвигается за время потери, и сторож не судит по
     сериям, которые свидетель видел не целиком;
@@ -21,7 +24,8 @@
 Запуск: node_witness.py <файл> [интерфейс]. Нужны права на захват (CAP_NET_RAW) и tcpdump.
 Диапазон меток — /etc/node-witness/site.json: {"mss_mark": [начало, конец]} или на время смены диапазона два:
 {"mss_mark": [[старое начало, конец], [новое начало, конец]]}. Файла нет — прежний 1201–1260. Читается при запуске
-(после правки — systemctl restart node-witness).
+(после правки — systemctl restart node-witness). Файл должен читаться группой node-witness (папка с g+s: новый файл
+получает её сам; chmod 600 — свидетель предупредит в журнале и возьмёт прежний диапазон).
 """
 import json
 import os
@@ -63,6 +67,10 @@ def load_marks(path=SITE_JSON):
     try:
         with open(path, encoding="utf-8") as f:
             data = json.load(f)
+    except PermissionError as e:  # есть, но не читается (не тот владелец или права) — молча не глотать
+        print(f"не прочитал {path}: {e} — диапазон меток прежний; нужно чтение группе node-witness",
+              file=sys.stderr, flush=True)
+        return [MARK_DEFAULT]
     except (OSError, ValueError):
         return [MARK_DEFAULT]
     return mark_ranges(data.get("mss_mark")) if isinstance(data, dict) else [MARK_DEFAULT]
@@ -77,6 +85,7 @@ MAX_FLOWS = 4000         # сосчитанных соединений в фай
 MAX_LIVE = 2000          # одновременно отслеживаемых: сверх — новые помеченные SYN не берём (поддельный поток)
 MAX_BYTES = 350000       # предел файла: сторож забирает не больше 400000 байт
 WRITE_EVERY = 10
+DENIED_EXIT = 3          # отказов записи подряд (≈30 с) — выйти: при перезапуске служба вернёт ACL на папку
 LINE = re.compile(r"^(\d+\.\d+) (?:\S+ +(?:In|Out) +)?IP (\d+\.\d+\.\d+\.\d+)\.(\d+) > (\d+\.\d+\.\d+\.\d+)\.(\d+): Flags \[([^\]]+)\]"
                   r"(?:.*?\bmss (\d+))?")
 IPV4 = re.compile(r"\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}")
@@ -228,9 +237,9 @@ def local_addrs():
 
 
 def drop_user():
-    """Кем станет tcpdump после открытия захвата: пользователь tcpdump (из пакета), нет его — nobody.
-    Не root — tcpdump права не сбрасывает (и не может), -Z не нужен."""
-    if pwd is None or os.geteuid() != 0:
+    """Кем станет tcpdump после открытия захвата (только прежняя схема — служба от root): пользователь tcpdump (из
+    пакета), нет его — nobody. Обычно свидетель от node-witness: tcpdump и так не root, -Z не нужен."""
+    if pwd is None or not is_root():
         return None
     for name in ("tcpdump", "nobody"):
         try:
@@ -247,18 +256,35 @@ def tcpdump_cmd(iface, local=()):
             + ["-i", iface, build_filter(local)])
 
 
+def is_root():
+    return hasattr(os, "geteuid") and os.geteuid() == 0
+
+
+def write_loop(path, flows, sleep=time.sleep, quit=os._exit):
+    """Раз в WRITE_EVERY секунд записать снимок. Отказ в праве записи подряд DENIED_EXIT раз у свидетеля не от root —
+    скорее всего, chmod папки (выкладка сайта, повторный beacon_install.sh) сбросил маску ACL: выйти, systemd
+    перезапустит службу, и та перед стартом поставит ACL заново. От root перезапуск не поможет — только сообщения."""
+    denied = 0
+    while True:
+        try:
+            write(path, flows.snapshot(time.time()))
+            denied = 0
+        except PermissionError as e:
+            denied += 1
+            print(f"не записал {path}: {e} — нет права записи в папку (ACL для node-witness сброшен?)",
+                  file=sys.stderr, flush=True)
+            if denied >= DENIED_EXIT and not is_root():
+                print("выхожу на перезапуск: служба перед стартом вернёт ACL на папку", file=sys.stderr, flush=True)
+                quit(75)
+        except OSError as e:
+            denied = 0
+            print(f"не записал {path}: {e}", file=sys.stderr, flush=True)
+        sleep(WRITE_EVERY)
+
+
 def main(path, iface=None):
     flows = Flows(local_addrs())
-
-    def writer():
-        while True:
-            try:
-                write(path, flows.snapshot(time.time()))
-            except OSError as e:
-                print(f"не записал {path}: {e}", file=sys.stderr, flush=True)
-            time.sleep(WRITE_EVERY)
-
-    threading.Thread(target=writer, daemon=True).start()
+    threading.Thread(target=write_loop, args=(path, flows), daemon=True).start()
     while True:
         flows.local = local_addrs() or flows.local  # адреса могли смениться — фильтр пересобирается при перезапуске
         cmd = tcpdump_cmd(iface or default_iface(), flows.local)

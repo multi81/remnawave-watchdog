@@ -6,10 +6,17 @@
 # Нужен уже установленный маячок (beacon_install.sh) и tcpdump (если его нет — ставится из пакетов Ubuntu).
 # Настройки Xray, файрвола, веб-сервера и маячка не трогает. Рядом должен лежать node_witness.py.
 # После смены режима маячка (--site-dir ↔ --serve) запустить ещё раз: файл свидетеля переедет за файлом маячка.
-# Откат: bash witness_install.sh --uninstall
+# Работает от своего системного пользователя node-witness (без входа и домашней папки) с одной возможностью —
+# захват пакетов (CAP_NET_RAW). Писать в папку файла маячка ему разрешает ACL только на эту папку (setfacl, пакет acl;
+# нет — ставится из пакетов Ubuntu): владелец и права папки для остальных не меняются. Файловая система без ACL —
+# прежняя схема (root с узкими возможностями) и предупреждение. Повторный запуск поверх прежней установки (от root):
+# файл, имя и путь те же. Если права папки сбросил chmod (выкладка сайта, повторный beacon_install.sh), свидетель
+# через 30 с отказов записи перезапускается, и служба перед стартом возвращает ACL сама.
+# Откат: bash witness_install.sh --uninstall (служба, файл, ACL с папки и пользователь node-witness убираются)
 set -euo pipefail
 SRC="$(cd "$(dirname "$0")" && pwd)"
 APP=/opt/node-witness; UNIT=/etc/systemd/system/node-witness.service; ETC=/etc/node-witness
+WUSER=node-witness
 [ "$(id -u)" -eq 0 ] || { echo "нужны права root"; exit 1; }
 
 # убрать файл свидетеля и его временные файлы (.fw-*.tmp — новые, $out.tmp — от прежних версий)
@@ -18,13 +25,30 @@ rm_out() {
   rm -f -- "$1" "$1.tmp" "$(dirname "$1")"/.fw-*.tmp
 }
 
+# снять ACL свидетеля с папки. setfacl -x оставляет запись mask; если других именованных записей нет и mask равна
+# правам группы (на права она уже не влияет), убирается и она — папка возвращается к виду до установки
+acl_off() {
+  [ -n "${1:-}" ] && [ -d "$1" ] && command -v setfacl >/dev/null || return 0
+  getfacl -cp -- "$1" 2>/dev/null | grep -q "^user:$WUSER:" || return 0
+  setfacl -P -x "u:$WUSER" -- "$1" || return 0
+  local acl
+  acl="$(getfacl -cp -- "$1" 2>/dev/null | grep -v '^$')" || return 0
+  if ! printf '%s\n' "$acl" | grep -Evq '^(user::|group::|other::|mask::)' \
+     && [ "$(printf '%s\n' "$acl" | sed -n 's/^mask:://p')" = "$(printf '%s\n' "$acl" | sed -n 's/^group:://p')" ]; then
+    setfacl -P -b -- "$1" || true
+  fi
+}
+
 if [ "${1:-}" = "--uninstall" ]; then
   systemctl disable --now node-witness.service 2>/dev/null || true
-  if [ -s "$ETC/out" ]; then rm_out "$(cat "$ETC/out")"; fi
+  if [ -s "$ETC/out" ]; then rm_out "$(cat "$ETC/out")"; acl_off "$(dirname "$(cat "$ETC/out")")"; fi
+  if [ -s "$ETC/acl" ]; then acl_off "$(cat "$ETC/acl")"; fi
   rm -rf "$APP" "$ETC" "$UNIT"
   systemctl daemon-reload
   systemctl reset-failed node-witness.service 2>/dev/null || true
-  echo "свидетель убран (tcpdump, если ставился, оставлен)"; exit 0
+  if id -u "$WUSER" >/dev/null 2>&1; then userdel "$WUSER" 2>/dev/null || true; fi
+  if getent group "$WUSER" >/dev/null; then groupdel "$WUSER" 2>/dev/null || true; fi
+  echo "свидетель убран: служба, файл, ACL папки и пользователь $WUSER (tcpdump и acl, если ставились, оставлены)"; exit 0
 fi
 
 [ -s "$SRC/node_witness.py" ] || { echo "рядом нет node_witness.py"; exit 1; }
@@ -50,20 +74,83 @@ if [ -s "$ETC/out" ] && [ "$(cat "$ETC/out")" != "$out" ]; then
   systemctl stop node-witness.service 2>/dev/null || true
   rm_out "$(cat "$ETC/out")"
 fi
-install -d -m 755 "$APP"; install -d -m 700 "$ETC"
+# и ACL с прежней папки снять
+if [ -s "$ETC/acl" ] && [ "$(cat "$ETC/acl")" != "$dir" ]; then
+  systemctl stop node-witness.service 2>/dev/null || true
+  acl_off "$(cat "$ETC/acl")"; rm -f "$ETC/acl"
+fi
+# свой пользователь: системный, без входа и домашней папки
+if ! id -u "$WUSER" >/dev/null 2>&1; then
+  if getent group "$WUSER" >/dev/null; then g=(-g "$WUSER"); else g=(--user-group); fi
+  useradd --system "${g[@]}" --no-create-home --home-dir /nonexistent --shell /usr/sbin/nologin "$WUSER"
+fi
+if ! command -v setfacl >/dev/null; then
+  echo "setfacl не найден — ставлю пакет acl"
+  # NEEDRESTART_SUSPEND — без простыни needrestart о службах; не поставился — ниже откат на прежнюю схему
+  if ! NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl >/dev/null 2>&1; then
+    apt-get update -qq >/dev/null 2>&1 || true
+    NEEDRESTART_SUSPEND=1 DEBIAN_FRONTEND=noninteractive apt-get install -y -qq acl 2>&1 | tail -n 2 || true
+  fi
+fi
+# папки НАД папкой файла — только root и без записи для группы и прочих: иначе их хозяин может подменить папку файла
+# ссылкой, и root (установщик, ExecStartPre при каждом старте) поставил бы ACL на чужую папку
+safe_parents() {
+  local d; d="$(dirname "$1")"
+  while :; do
+    [ "$(stat -c '%u' "$d")" = 0 ] || return 1
+    case "$(stat -c '%A' "$d")" in ?????w????|????????w?) return 1 ;; esac
+    [ "$d" = / ] && return 0
+    d="$(dirname "$d")"
+  done
+}
+# право записи — ACL только на папку файла и только для своего пользователя; проверка — запись от его имени
+asuser=0
+if command -v setfacl >/dev/null && [ ! -L "$dir" ] && safe_parents "$dir" \
+   && setfacl -P -m "u:$WUSER:rwx" -- "$dir" 2>/dev/null \
+   && runuser -u "$WUSER" -- test -w "$dir" -a -x "$dir" 2>/dev/null; then
+  asuser=1
+else
+  acl_off "$dir"
+  echo "ВНИМАНИЕ: не удалось дать пользователю $WUSER запись в $dir через ACL (нет setfacl, папка над ней не"
+  echo "   root-а или открыта на запись другим, файловая система"
+  echo "   без ACL или к папке нет прохода) — свидетель остаётся на прежней схеме: root с узкими возможностями"
+fi
+install -d -m 755 "$APP"
+if [ "$asuser" = 1 ]; then
+  # site.json (диапазон меток) свидетель читает сам: папка настроек — группе node-witness, новые файлы — её же (g+s)
+  install -d -m 2750 -o root -g "$WUSER" "$ETC"
+  if [ -f "$ETC/site.json" ]; then chgrp "$WUSER" "$ETC/site.json"; chmod 640 "$ETC/site.json"; fi
+  echo "$dir" > "$ETC/acl"
+  owner="$WUSER"
+else
+  install -d -m 700 -o root -g root "$ETC"; chmod g-s "$ETC"   # g+s от обычной схемы chmod/install сами не снимают
+  rm -f "$ETC/acl"
+  owner=root
+fi
 install -m 755 "$SRC/node_witness.py" "$APP/node_witness.py"
 echo "$out" > "$ETC/out"
+# файл от прежней установки — новому владельцу (замена в папке с липким битом иначе не пройдёт); ссылку не трогаем
+if [ -f "$out" ] && [ ! -L "$out" ]; then chown -h "$owner:" "$out"; fi   # 0644 свидетель ставит сам через 10 с
 case "$dir" in   # папка сайта в /home или /root: ProtectHome=yes спрятал бы её целиком
   /home/*|/root/*|/run/user/*) ph=read-only ;;
   *) ph=yes ;;
 esac
-# Песочница. Работает от root, но без его полномочий: из возможностей только захват (CAP_NET_RAW, CAP_NET_ADMIN),
-# смена пользователя для tcpdump (CAP_SETUID, CAP_SETGID — разбирает пакеты он уже от пользователя tcpdump) и, если
-# папка сайта не root-а, запись в неё (CAP_DAC_OVERRIDE). Отдельного пользователя для самого свидетеля нет: ему нужно
-# писать в папку сайта, а её владельца и права установщик не меняет. Писать можно только в эту папку.
-caps="CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID"
-perm="$(stat -c '%u %A' "$dir")"
-case "$perm" in 0\ ??w*) ;; *) caps="$caps CAP_DAC_OVERRIDE" ;; esac
+# Песочница. Обычно — от пользователя node-witness с одной возможностью CAP_NET_RAW: её наследует tcpdump (захват
+# с -p, CAP_NET_ADMIN не нужен — проверено на стенде), -Z ему не нужен — он и так не root. Перед запуском
+# («-+»: от root вне песочницы, ошибка не мешает старту) ACL на папку ставится заново. Писать можно только в эту папку.
+# Прежняя схема (ACL не вышло): от root, но без его полномочий — захват (CAP_NET_RAW, CAP_NET_ADMIN), смена
+# пользователя для tcpdump (CAP_SETUID, CAP_SETGID, -Z tcpdump) и, если папка сайта не root-а, CAP_DAC_OVERRIDE.
+if [ "$asuser" = 1 ]; then
+  caps="CAP_NET_RAW"; amb="CAP_NET_RAW"
+  run_as="User=$WUSER
+Group=$WUSER
+ExecStartPre=-+$(command -v setfacl) -P -m u:$WUSER:rwx \"$dir\""
+else
+  caps="CAP_NET_RAW CAP_NET_ADMIN CAP_SETUID CAP_SETGID"; amb="CAP_NET_RAW CAP_NET_ADMIN"
+  run_as="# без User=: ACL на папку поставить не удалось — от root с узкими возможностями"
+  perm="$(stat -c '%u %A' "$dir")"
+  case "$perm" in 0\ ??w*) ;; *) caps="$caps CAP_DAC_OVERRIDE" ;; esac
+fi
 cat > "$UNIT" <<EOF
 [Unit]
 Description=node-witness: что нода видела из проверочных соединений сторожа каналов (только помеченные, без адресов)
@@ -71,14 +158,16 @@ After=network-online.target
 Wants=network-online.target
 
 [Service]
+$run_as
 ExecStart=/usr/bin/python3 "$APP/node_witness.py" "$out"
+UMask=0022
 Restart=always
 RestartSec=10
 Nice=10
 MemoryMax=64M
 CPUQuota=15%
 CapabilityBoundingSet=$caps
-AmbientCapabilities=CAP_NET_RAW CAP_NET_ADMIN
+AmbientCapabilities=$amb
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths="$dir"
@@ -87,9 +176,13 @@ PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
 ProtectKernelModules=yes
+ProtectKernelLogs=yes
 ProtectControlGroups=yes
 ProtectClock=yes
 ProtectHostname=yes
+ProtectProc=invisible
+PrivateIPC=yes
+InaccessiblePaths=-/dev/shm -/run/lock -/run/screen -/run/cloud-init
 RestrictNamespaces=yes
 RestrictRealtime=yes
 RestrictSUIDSGID=yes
@@ -123,6 +216,9 @@ import json, sys, time
 d = json.load(open(sys.argv[1]))
 print("   файл пишется: возраст %.0f с, записей %d" % (time.time() - d["ts"], len(d["flows"])))
 PY
-tu="$(ps -o user= -C tcpdump 2>/dev/null | sort -u | tr '\n' ' ')"
-echo "== $(hostname): свидетель $(systemctl is-active node-witness.service), tcpdump $(pgrep -c -f 'tcpdump.*tcp-syn' || true) шт. (от ${tu:-?}), память $(systemctl show node-witness.service -p MemoryCurrent --value | awk '{printf "%.0f МБ", $1/1048576}')"
+# tcpdump свидетель запускает чуть позже первой записи файла — подождать до 5 с; нет его — «?», а не обрыв (pipefail)
+for _ in $(seq 10); do pgrep -f 'tcpdump.*tcp-syn' >/dev/null && break; sleep 0.5; done
+tu="$( (ps -o user:32= -C tcpdump 2>/dev/null || true) | sort -u | tr '\n' ' ')"
+wu="$(ps -o user:32= -p "$(systemctl show node-witness.service -p MainPID --value)" 2>/dev/null || true)"
+echo "== $(hostname): свидетель $(systemctl is-active node-witness.service) (от ${wu:-?}), tcpdump $(pgrep -c -f 'tcpdump.*tcp-syn' || true) шт. (от ${tu:-?}), память $(systemctl show node-witness.service -p MemoryCurrent --value | awk '{printf "%.0f МБ", $1/1048576}')"
 echo "WITNESS /$(basename "$out")"
