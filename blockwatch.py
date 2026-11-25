@@ -8,7 +8,10 @@
    только системным DNS rf1 и точек; публичные DNS по UDP — только на чужих именах (подменяют ли ответы по пути).
 3. Разбор сбоя канала: нода проверяется напрямую с rf1 и с других российских точек (агенты vantage_agent.py),
    из-за рубежа (через чужой канал) и трассировкой — чтобы отличить блокировку от поломки ноды.
-4. Заглушка под внешний сервис с добровольными сканерами в сетях операторов — ВЫКЛЮЧЕНА (см. external_scan).
+4. Взгляд из домашних сетей России — Globalping (globalping.py, external_scan): когда порт входа ноды не открывается
+   (таймаут, отказ) с rf1 или с двух наших точек, его адрес (сверенный с защищённым DNS) и порт (только IP, без имени) проверяются по TCP у добровольных точек
+   Globalping в сетях обычных провайдеров (МТС, Билайн, Ростелеком, Дом.ру…) и из Европы. Так видно: закрыто по всей
+   России, у части провайдеров или только для дата-центров. Включается в external.json; без него наружу не уходит ничего.
 """
 import concurrent.futures
 import html
@@ -18,6 +21,7 @@ import json
 import os
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -35,6 +39,10 @@ try:
     import vantage_client  # TLS к точке проверки с закреплённым отпечатком (лежит рядом, ставит install.sh)
 except ImportError:  # сторож обновили частично: точки без sha256 работают по HTTP, с sha256 — «не ответила»
     vantage_client = None
+try:
+    import globalping  # взгляд из домашних сетей России (лежит рядом, ставит install.sh)
+except ImportError:  # сторож обновили частично: внешней проверки нет, в сообщении «запрос не написан»
+    globalping = None
 
 ETC = "/etc/channel-watch"
 LISTS_FILE = "/var/lib/channel-watch/lists.json"
@@ -43,10 +51,18 @@ LISTS_STALE = 14 * 3600     # списки обновляются раз в 6 ч
 DNS_EVERY = 1800            # секунд между проверками подмены DNS
 DNS_MIN = 2                 # столько независимых ответов должны разойтись с защищённым DNS, чтобы считать подменой
 DEEP_MAX = 3                # за один запуск подробно разбираем не больше стольких каналов
+DEEP_TAIL = 4               # разбор со сроком: после срока ещё столько секунд на дописывание (чьи узлы трассировки)
+LINGER = False              # разбор обрезан по сроку, а его потоки ещё ждут ответов — probe выйдет, не дожидаясь их
+ABROAD_VIAS = 2             # из-за рубежа сверяем не больше чем через столько чужих каналов (разные входы и выходы)
+ABROAD_CONTROL = "www.gstatic.com"  # заведомо живой адрес: довозит ли сам обходной канал (тот же, что QUICK_URL у probe)
 LOSS_FILE = "/var/lib/channel-watch/loss.json"
 SIDE_FILE = "/var/lib/channel-watch/side.json"  # профиль точек и гео нод (probe.py --side, свой таймер)
 PROFILE_TRIES = 3           # попыток профиля точки за один сбор
 VPN_EVERY = 3600            # секунд между обходами плиток через VPN-точки (служба --side)
+VPN_STALE = 3 * VPN_EVERY        # обход через VPN-точки старше — не показывать как данные
+PROFILE_STALE = 13 * 3600        # профиль собирается раз в 6 ч: два пропуска и час запаса
+OUTSIDE_STALE = 13 * 3600        # взгляд снаружи — раз в 6 ч (probe.SLOW_EVERY)
+GEO_STALE = 25 * 3600            # гео — раз в 12 ч
 PROFILE_GAP = 60            # секунд между попытками
 # список профиля для самого rf1 — тот же, что DEFAULT_PROFILE у агентов (проверка ZL47 следит, чтобы не разошлись)
 PROFILE_LOCAL = {"sites": [["blocked", "rutracker.org"], ["blocked", "www.instagram.com"], ["blocked", "www.facebook.com"],
@@ -60,10 +76,11 @@ LOSS_CONFIRM = 2            # столько замеров подряд нуж�
 LOSS_STALE = 3 * 3600       # замер старше — в отчёт не идёт
 DEEP_SERIES = 6             # соединений с каждой точки при разборе сбоя
 WITNESS_LAG = 10            # столько после серии нода ещё дописывает счётчики (повторы своих ответов)
+WIT_MIN = 3                 # меньше дошедших до ноды соединений — об отказе самой ноды не судим
 WITNESS_WAIT = 16           # дольше этого за один раз счётчиков ноды не ждём
 SELF = "rf1"                # так в сообщениях называется сам сервер сторожа
 VANTAGE = "vantage.json"    # точки проверки в РФ: [{"name", "url", "token"}]
-EXTERNAL = "external.json"  # внешний сервис проверки блокировок: {"enabled": false, ...}
+EXTERNAL = "external.json"  # внешний сервис проверки блокировок: {"enabled": true, "service": "globalping"}
 
 # ключ, откуда, что внутри, hard — тревога сразу / soft — только в сводке за неделю
 SOURCES = (
@@ -96,6 +113,15 @@ def read_json_file(path, default=None):
         return default
 
 
+def side_age(part, limit, now):
+    """Сколько часов данным службы --side, если они старше срока; иначе None. Нет ts или now — срок неизвестен,
+    не устарело."""
+    ts = (part or {}).get("ts")
+    if now and ts and now - ts > limit:
+        return int((now - ts) // 3600)
+    return None
+
+
 def read_etc(name, default):
     try:
         return json.load(open(os.path.join(ETC, name), encoding="utf-8"))
@@ -108,7 +134,8 @@ def read_etc(name, default):
 def fetch(url, dest, socks_port=None):
     """Скачать список в файл; не вышло напрямую — через канал сторожа. True — файл на месте и не пустой."""
     for port in (None, socks_port) if socks_port else (None,):
-        cmd = ["curl", "-sL", "-m", "150", "--max-filesize", str(MAX_LIST), "-o", dest + ".tmp", url]
+        # -f: страница ошибки сервера (4xx/5xx) — не список
+        cmd = ["curl", "-fsL", "-m", "150", "--max-filesize", str(MAX_LIST), "-o", dest + ".tmp", url]
         cfg = ""
         if port:
             proxy, cfg = netprobe.curl_socks(port)  # пароль SOCKS — в конфиге на stdin, не в argv
@@ -163,17 +190,24 @@ def ip_match(index, ip):
 def scan_domains(path, names, bases):
     """Список доменов (он большой — читаем построчно): ({запись списка: она же}, сколько записей). Совпадение —
     любое наше имя, наш основной домен (тогда закрыты все имена на нём) или любой поддомен основного домена."""
-    hits, n = {}, 0
+    hits, n, junk = {}, 0, 0
     names = {x.lower() for x in names} | set(bases)
     tails = tuple("." + b for b in bases)
     with open(path, encoding="utf-8", errors="replace") as f:
         for line in f:
-            d = line.strip().strip('"').lower().rstrip(".")
+            d = line.strip().strip('"')
+            if d and any(ch in d for ch in "<>{}= \t"):
+                junk += 1  # «/» мусором не считаем: в настоящем списке он бывает
+            d = d.lower().rstrip(".")
             if not d or "." not in d:
                 continue
             n += 1
             if d in names or d.endswith(tails):
                 hits[d] = d
+    if junk > max(5, n // 100):
+        # страница ошибки или заглушка вместо списка: строки с точкой есть, но это не домены — источник считаем
+        # нескачавшимся
+        return {}, 0
     return hits, n
 
 
@@ -262,8 +296,18 @@ def lists_step(st, data):
         alerts += [f"✅ <b>Больше нет в списке блокировок: {html.escape(who)}</b> — {LIST_NAMES[key]}."
                    for who in was if who not in cur]
     near = data.get("neighbours", {}) if data["sources"].get("rkn_ip", {}).get("ok") else prev.get("neighbours", {})
+    # когда каждый список скачался удачно в последний раз: по этому отчёт видит источник, который давно не качается
+    last = dict(prev.get("last") or {})
+    if "last" not in prev and prev.get("ts"):
+        # состояние до этой правки: удачно скачанные в прошлый раз считаем скачанными тогда
+        for k, v in (prev.get("sources") or {}).items():
+            if v.get("ok"):
+                last[k] = prev["ts"]
+    for k in KIND:
+        if data["sources"].get(k, {}).get("ok") or k not in last:
+            last[k] = data["ts"]  # не скачался и раньше не знали — смотрим с этого момента
     st["lists"] = {"ts": data["ts"], "hits": merged, "sources": data["sources"], "targets": data["targets"],
-                   "neighbours": near}
+                   "neighbours": near, "last": last}
     return alerts
 
 
@@ -303,10 +347,13 @@ def near_hits(st):
 
 # ---------- 2. подмена DNS ----------
 
-def doh(name, socks_port=None):
-    """Адреса имени по защищённому DNS (DoH, JSON) — напрямую или через канал сторожа; None — не ответили."""
+def doh(name, socks_port=None, first=False):
+    """Адреса имени по защищённому DNS (DoH, JSON) — напрямую или через канал сторожа; None — не ответили.
+    first — хватит первого ответившего сервиса (быстрее, для сверки адреса перед Globalping)."""
     found = None
     for tpl in DOH:
+        if first and found is not None:
+            break
         cmd = ["curl", "-s", "-m", "8", "-H", "accept: application/dns-json", tpl.format(urllib.parse.quote(name))]
         cfg = ""
         if socks_port:
@@ -589,8 +636,11 @@ def vpn_step(st, data, chan_ok):
     return msgs
 
 
-def vpn_line(st):
-    """Строка обычного отчёта: сколько плиток работает через VPN с каждой VPN-точки."""
+def vpn_line(st, now=None):
+    """Строка обычного отчёта: сколько плиток работает через VPN с каждой VPN-точки. Обход старше VPN_STALE — не данные
+    (None; о нём говорит block_items)."""
+    if side_age(st.get("vpn_pt"), VPN_STALE, now) is not None:
+        return None
     by = (st.get("vpn_pt") or {}).get("by") or {}
     parts = []
     for point, res in sorted(by.items()):
@@ -683,8 +733,11 @@ def profile_text(point, prof):
             + (f"; загрузка, Мбит/с: {loads}" if loads else "") + f" [попыток {prof.get('tries', 1)}]")
 
 
-def profiles_line(st):
-    """Строка обычного отчёта: сколько точек за фильтром."""
+def profiles_line(st, now=None):
+    """Строка обычного отчёта: сколько точек за фильтром. Профиль старше PROFILE_STALE — не данные (None; о нём
+    говорит block_items)."""
+    if side_age(st.get("profiles"), PROFILE_STALE, now) is not None:
+        return None
     prof = (st.get("profiles") or {}).get("by") or {}
     if not prof:
         return None
@@ -729,32 +782,145 @@ def agent_bundle(agent, i, query, verify=False):
     return probe, ser, cmp_, path, ref
 
 
-def deep_diag(ch, via, agents, bases):
+def abroad_vias(cands, ch, exits=None):
+    """Через какие чужие каналы смотреть на вход ch из-за рубежа: не больше ABROAD_VIAS, список {"name", "port"}.
+    cands — уже отобранные живые каналы без expected_exit, по порядку: {"name" (для показа), "port", "entry",
+    "key" (полное имя канала — по нему ищем выход в exits)}. Вход посредника не совпадает со входом ch, входы выбранных
+    разные. Выход (exits[полное имя], если известен) не совпадает с выходом ch: иначе посредник, возможно, выходит
+    через ту же ноду и стучится к ней же — «не отвечает» будет ложным; выходы выбранных тоже разные. Неизвестный
+    выход кандидата не отсекает."""
+    exits = exits or {}
+    own = exits.get(ch.get("name"))
+    out, entries, seen = [], set(), set()
+    for c in cands:
+        entry, ex = c.get("entry"), exits.get(c.get("key", c.get("name")))
+        if entry == ch.get("entry") or entry in entries:
+            continue
+        if ex and ((own and ex == own) or ex in seen):
+            continue
+        out.append({"name": c["name"], "port": c["port"]})
+        entries.add(entry)
+        if ex:
+            seen.add(ex)
+        if len(out) >= ABROAD_VIAS:
+            break
+    return out
+
+
+def abroad_check(vias, host, port, tls=False, sni=None):
+    """Отвечает ли вход host:port из-за рубежа — через чужие каналы vias (список {"name", "port"}, первый — основной).
+    Сначала цель через vias[0]; ответила — всё (обычный случай, один запрос). Нет — один параллельный шаг: контрольный
+    адрес через vias[0] (довозит ли сам канал), цель через vias[1] (если его нет — ещё раз через vias[0]) и контроль
+    через vias[1]. К цели — не больше двух запросов: меньше шансов попасть под антискан ноды.
+    Подтвердил «не отвечает» тот канал, у которого цель молчит, а контрольный адрес открылся.
+    {"ok": True|False|None, "tries": [[имя, цель, контроль|None], ...], "sure": 0|1|2 (сколько каналов подтвердили
+    «не отвечает»), "via": имена для показа, "port": порт канала, который точно довозит (для сверки с нодой)}.
+    None — проверить не удалось: обходной канал сам не работал."""
+    tries = []
+    first = vias[0] if vias else None
+    try:
+        kw = {"sni": sni} if sni else {}
+
+        def target(v):
+            return nodewatch.socks_open(v["port"], host, port, 5, tls, **kw)
+
+        def control(v):
+            return nodewatch.socks_open(v["port"], ABROAD_CONTROL, 443, 5, True)
+        if not vias:
+            return {"ok": None, "tries": tries, "sure": 0, "via": None, "port": None}
+        a = vias[0]
+        if target(a):
+            tries.append([a["name"], True, None])
+            return {"ok": True, "tries": tries, "sure": 0, "via": a["name"], "port": a["port"]}
+        b = vias[1] if len(vias) > 1 else a
+        with concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
+            f_ca = ex.submit(control, a)
+            f_tb = ex.submit(target, b)
+            f_cb = ex.submit(control, b) if b is not a else None
+            ca, tb = bool(f_ca.result()), bool(f_tb.result())
+            cb = bool(f_cb.result()) if f_cb else ca
+        tries += [[a["name"], False, ca], [b["name"], tb, cb]]
+        if tb:
+            return {"ok": True, "tries": tries, "sure": 0, "via": b["name"], "port": b["port"]}
+        sure = [v for v, c in ((a, ca), (b, cb)) if c]
+        sure = [v for i, v in enumerate(sure) if v not in sure[:i]]   # один канал дважды — один подтвердивший
+        good = sure[0]["port"] if sure else a["port"]
+        if sure:
+            return {"ok": False, "tries": tries, "sure": len(sure), "via": " и ".join(v["name"] for v in sure),
+                    "port": good}
+        names = list(dict.fromkeys(v["name"] for v in (a, b)))
+        return {"ok": None, "tries": tries, "sure": 0, "via": " и ".join(names), "port": good}
+    except Exception:  # noqa: BLE001 — проверка из-за рубежа не должна сорвать разбор канала
+        if not tries and first:
+            tries.append([first["name"], None, None])
+        # err — сорвалась сама проверка (ошибка в коде или окружении), а не «обходной канал не довёз»
+        return {"ok": None, "tries": tries, "sure": 0, "via": first["name"] if first else None,
+                "port": first["port"] if first else None, "err": True}
+
+
+def _until(f, deadline, default=None):
+    """Результат f, но не позже deadline (time.monotonic; None — ждать сколько нужно). Не успел — default и отметка
+    LINGER: поток ещё работает, и выход процесса его ждать не должен. Ошибка внутри f — как раньше, наружу."""
+    global LINGER
+    if f is None:
+        return default
+    if deadline is None:
+        return f.result()
+    try:
+        return f.result(timeout=max(0.0, deadline - time.monotonic()))
+    except concurrent.futures.TimeoutError:
+        LINGER = True
+        return default
+
+
+def deep_diag(ch, via, agents, bases, deadline=None):
     """Канал не работает: посмотреть на его вход напрямую с rf1, с других российских точек, из-за рубежа и трассировкой.
     С каждой точки: проверка входа (порт, TLS, 64 КБ), серия из DEEP_SERIES соединений и сравнение имён TLS.
-    via — живой зарубежный канал ({"name", "port"}) либо None."""
+    via — живые зарубежные каналы: список {"name", "port"} (из abroad_vias; сверяем через первые ABROAD_VIAS),
+    один такой словарь (как раньше) либо None.
+    deadline — срок (time.monotonic): что не успело к нему, в разбор не входит — точка, не успевшая ответить, попадает
+    в d["late"], из-за рубежа и Globalping остаются None, сверки с нодой нет. Без срока — ждём всё, как раньше."""
     host, port = ch.get("entry"), int(ch.get("entry_port") or 443)
+    vias = via if isinstance(via, list) else ([via] if via else [])
+    tls_in = ch.get("security") in ("reality", "tls")
+    hello = ch.get("sni") if tls_in and ch.get("sni") and ch.get("sni") != host else None   # имя прикрытия Reality
     sni = ch.get("sni") or host
     own = str(host).endswith(tuple("." + b for b in bases)) and sni == host
     query = f"host={urllib.parse.quote(str(host))}&port={port}" + ("" if sni == host else f"&sni={urllib.parse.quote(sni)}")
     verify = CERT_CHECK and ch.get("security") == "tls"   # у Reality сертификат чужой по устройству — не сверяем
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(agents) + 6) as ex:
+    # внешний сервис — в своём потоке-демоне: стартует, как только порт не открылся (с rf1 или с двух точек), идёт
+    # параллельно с остальным, а выход процесса его не ждёт
+    f_ext, t_ext = None, None
+
+    def ext_start(addrs):
+        return daemon_call(ext_job, host, addrs, port), time.monotonic()
+    # со сроком пул не ждёт отставших при выходе из разбора (shutdown без ожидания), без срока — как раньше, ждёт всех
+    ex = concurrent.futures.ThreadPoolExecutor(max_workers=len(agents) + 6)
+    try:
         f_direct = ex.submit(direct_check, host, port, sni, verify)
         f_series = ex.submit(netprobe.series, host, port, DEEP_SERIES, point_mss(0))
         f_sni = ex.submit(netprobe.sni_compare, host, port, sni, tls_mss(0))
         f_agents = {a["name"]: (ex.submit(agent_bundle, a, i + 1, query, True) if verify
                                 else ex.submit(agent_bundle, a, i + 1, query)) for i, a in enumerate(agents)}
-        f_abroad = (ex.submit(nodewatch.socks_open, via["port"], host, port, 5, ch.get("security") in ("reality", "tls"))
-                    if via else None)
-        direct, series, names = f_direct.result(), {SELF: f_series.result()}, {SELF: f_sni.result()}
+        f_abroad = ex.submit(abroad_check, vias[:ABROAD_VIAS], host, port, tls_in, hello) if vias else None
+        # прямая проверка с rf1 сама ограничена ~17 с, без неё разбора нет — её ждём всегда
+        direct, series, names = f_direct.result(), {SELF: _until(f_series, deadline)}, {SELF: _until(f_sni, deadline)}
         if direct["tcp"] == "timeout" and (series[SELF] or {}).get("ok"):
             direct = direct_check(host, port, sni, verify)  # одиночная проверка попала на потерянное соединение
+        if ext_trouble(direct):
+            f_ext, t_ext = ext_start([direct.get("addr")])
         f_ref = ex.submit(netprobe.name_ref, sni) if direct["tcp"] in ("timeout", "refused") else None
         f_vpn = {a["name"]: ex.submit(agent_get, a, "/vpn?name=" + urllib.parse.quote(ch["name"]), 40)
                  for a in vpn_points(agents)}
-        probes, paths, refs = {}, {}, {}
+        probes, paths, refs, late = {}, {}, {}, []
         for name, f in f_agents.items():
-            probe, ser, cmp_, path, ref = f.result()
+            got = _until(f, deadline)
+            if got is None:
+                if own:
+                    late.append(name)   # точка не успела к сроку — это не «не ответила»
+                    probes[name], series[name], names[name] = None, None, None
+                continue
+            probe, ser, cmp_, path, ref = got
             if probe is None and not own:
                 continue  # адрес вне наших доменов этой точке не разрешён — она не «не ответила», её не спрашивали
             probes[name], series[name], names[name] = probe, ser, cmp_
@@ -762,23 +928,63 @@ def deep_diag(ch, via, agents, bases):
                 paths[name] = path
             if ref:
                 refs[name] = ref
-        if f_ref is not None and f_ref.result():
-            refs[SELF] = f_ref.result()
+        own_ref = _until(f_ref, deadline)
+        if own_ref:
+            refs[SELF] = own_ref
+        if f_ext is None and ext_wanted(direct, probes):
+            f_ext, t_ext = ext_start([direct.get("addr")] + [p.get("addr") for p in probes.values() if p])
         closed = direct["addr"] and direct["tcp"] != "open"
         f_trace = ex.submit(netprobe.tcp_trace, direct["addr"], port) if closed else None
         f_nb = ex.submit(netprobe.neighbours, direct["addr"]) if closed else None
         d = {"direct": direct, "agents": probes, "series": series, "sni": names,
-             "abroad": f_abroad.result() if f_abroad else None, "via": via["name"] if via else None,
-             "trace": f_trace.result() if f_trace else None, "external": external_scan({"host": host, "addr": direct["addr"]}),
-             "paths": paths, "refs": refs, "vpn": {n: f.result() for n, f in f_vpn.items()},
-             "neighbours": f_nb.result() if f_nb else None,
+             "abroad": None, "via": None, "abroad_tries": [], "abroad_sure": 0,
+             "trace": _until(f_trace, deadline), "external": None,
+             "paths": paths, "refs": refs, "vpn": {n: _until(f, deadline) for n, f in f_vpn.items()},
+             "neighbours": _until(f_nb, deadline),
              "registry": registry_hit(direct["addr"], read_json_file(LISTS_FILE)) if closed else None}
+        if late:
+            d["late"] = late
+        ab = _until(f_abroad, deadline)
+    finally:
+        ex.shutdown(wait=deadline is None, cancel_futures=deadline is not None)
+    if ab:
+        d.update(abroad=ab["ok"], via=ab["via"], abroad_tries=ab["tries"], abroad_sure=ab["sure"])
+        if ab.get("err"):
+            d["abroad_err"] = True
     # что из этих серий видела сама нода (её счётчики лежат рядом с маячком; забираем и через живой чужой канал)
     beacon = next((n.get("beacon") for n in read_etc("nodes.json", []) if n.get("host") == host), None)
     tls = {f"{n}|tls": t for n, t in ((n, tls_ser(c)) for n, c in names.items()) if t}
-    d["witness"] = witness_wait(witness_url(beacon), {**series, **tls}, via["port"] if via else None) if port == 443 else {}
-    add_hop_info(d, own=netprobe.own_addr(), origins=agent_origins(agents))   # чей последний узел трассировки
+    wit_args = (witness_url(beacon), {**series, **tls}, ab["port"] if ab else None)
+    if port != 443:
+        d["witness"] = {}
+    elif deadline is None:
+        d["witness"] = witness_wait(*wit_args)
+    else:   # счётчики ноды — в потоке-демоне и не дольше срока: забор файла через канал бывает долгим
+        d["witness"] = _until(daemon_call(witness_wait, *wit_args), deadline, {})
+    if deadline is None or time.monotonic() < deadline:
+        add_hop_info(d, own=netprobe.own_addr(), origins=agent_origins(agents))   # чей последний узел трассировки
+    if f_ext is not None:
+        end = t_ext + EXT_WAIT if deadline is None else min(t_ext + EXT_WAIT, deadline)
+        try:   # ждём не дольше срока от старта (сверка адреса по DoH и весь check Globalping) и не дольше срока разбора
+            d["external"] = f_ext.result(timeout=max(0.1, end - time.monotonic()))
+        except Exception:  # noqa: BLE001 — внешний сервис не должен сорвать разбор
+            d["external"] = None
     return d
+
+
+def daemon_call(fn, *args):
+    """fn(*args) в отдельном потоке-демоне -> Future. В отличие от ThreadPoolExecutor, выход процесса такой поток
+    не ждёт: задержавшийся внешний сервис не держит службу до TimeoutStartSec и не съедает её сообщение."""
+    fut = concurrent.futures.Future()
+
+    def run():
+        if fut.set_running_or_notify_cancel():
+            try:
+                fut.set_result(fn(*args))
+            except BaseException as e:  # noqa: BLE001 — отдаём ожидающему
+                fut.set_exception(e)
+    threading.Thread(target=run, daemon=True).start()
+    return fut
 
 
 def direct_check(host, port, sni, verify=False):
@@ -856,7 +1062,8 @@ def fetch_witness(url, socks_port=None, sha256=None):
 
 def witness_match(wit, ser, slack=20):
     """Что нода видела из серии ser (по метке и времени): {"seen" — сколько соединений дошло, "rep" — на скольких
-    нода повторяла ответ (её ответ не дошёл обратно), "rst_out", "rst_in"}; None — сверить нечем."""
+    нода повторяла ответ (её ответ не дошёл обратно), "rst_out", "rst_in", "mute" — сколько дошло, а нода не ответила
+    ничем}; None — сверить нечем. В старых сверках (loss.json) "mute" нет — читать через w.get("mute")."""
     if not wit or not ser or not ser.get("mss") or not ser.get("t1") or wit["ts"] < ser["t1"] + WITNESS_LAG:
         return None  # файл ноды записан раньше, чем нода досчитала эту серию
     if wit.get("since", 0) > ser["t0"]:
@@ -865,7 +1072,37 @@ def witness_match(wit, ser, slack=20):
     if len(rows) < (ser.get("ok") or 0):
         return None  # нода насчитала меньше соединений, чем прошло успешно, — её счётчики неполны, судить по ним нельзя
     return {"seen": len(rows), "rep": sum(1 for f in rows if f[3] >= 3),
-            "rst_out": sum(f[4] for f in rows), "rst_in": sum(f[5] for f in rows)}
+            "rst_out": sum(f[4] for f in rows), "rst_in": sum(f[5] for f in rows),
+            "mute": sum(1 for f in rows if f[3] == 0 and f[4] == 0)}
+
+
+def witness_refusal(ser, w):
+    """Отказывает ли этой серии сама нода, по её счётчикам: 'drop' — дошли все, нода не ответила ни на одно, и отказов
+    точке не приходило;
+    'reject' — дошли все, нода сама сбросила каждое; 'part' — часть прошла, остальные дошли, но нода на них
+    промолчала (лимит соединений или перегрузка); None — нет или судить не по чему."""
+    if not w or not ser or w.get("mute") is None or w["rep"] or w["seen"] < WIT_MIN:
+        return None
+    fail, refused = ser.get("fail") or 0, ser.get("refused") or 0
+    if not fail + refused or w["seen"] < ser["n"] - 1:
+        return None   # потерь нет, либо часть запросов не дошла — тогда теряется и по дороге
+    if not ser.get("ok"):
+        # нода молчала, а точке пришёл отказ — отказ прислал кто-то по дороге (свой REJECT нода видит как rst_out)
+        if w["mute"] == w["seen"] and not refused:
+            return "drop"
+        if refused and not fail and w["rst_out"] >= refused and w["mute"] == 0:
+            return "reject"
+        return None
+    if fail and not refused and w["mute"] >= fail:
+        return "part"
+    return None
+
+
+def node_refused(d, pts):
+    """{точка: 'drop' | 'reject'} — каким точкам из pts (с бедой на уровне TCP), по счётчикам ноды, отказывает сама нода."""
+    series, wit = d.get("series") or {}, d.get("witness") or {}
+    out = {p: witness_refusal(series.get(p), wit.get(p)) for p in pts}
+    return {p: k for p, k in out.items() if k in ("drop", "reject")}
 
 
 def witness_text(ser, w):
@@ -873,6 +1110,15 @@ def witness_text(ser, w):
     if not w or not ser or not (ser.get("fail") or ser.get("refused")):
         return None
     n, seen = ser["n"], w["seen"]
+    kind, k = witness_refusal(ser, w), min(seen, n)   # при двух разборах подряд нода может насчитать больше серии
+    if kind == "drop":
+        return (f"нода получила все {k}, но не ответила ни на одно — их отбрасывает сама нода "
+                "(файрвол, бан адреса или перегрузка)")
+    if kind == "reject":
+        return f"нода получила все {k} и сама сбросила каждое — отказ на самой ноде"
+    if kind == "part":
+        return (f"нода получила {k} из {n}, на {w['mute']} не ответила вовсе — часть запросов отбрасывает сама нода "
+                "(лимит соединений или перегрузка)")
     if ser.get("refused") and not w["rst_out"]:
         return (f"точка получила отказ в соединении ({ser['refused']} из {n}), а нода отказов не отправляла — "
                 "соединение сбросил кто-то по дороге")
@@ -887,7 +1133,7 @@ def witness_text(ser, w):
                 "теряются ответы ноды на обратном пути")
     if w["rst_out"]:
         return f"нода получила {seen} из {n} и сама сбросила {w['rst_out']} — отказ на самой ноде"
-    return f"нода получила {seen} из {n} и ответила — где теряется, по её счётчикам не видно"
+    return f"нода получила {k} из {n} — где теряется, по её счётчикам не видно"
 
 
 def witness_wait(url, series, socks_port=None):
@@ -912,7 +1158,7 @@ def loss_keep(r):
     """Из ответа серии — только то, что нужно хранить."""
     if not r or "n" not in r:
         return None
-    return {k: r.get(k) for k in ("n", "ok", "fail", "slow", "refused", "ms", "t0", "t1", "mss", "dns")}
+    return {k: r.get(k) for k in ("n", "ok", "fail", "slow", "refused", "ms", "t0", "t1", "mss", "dns", "addr")}
 
 
 def loss_run(nodes, agents, n=LOSS_N, socks_port=None, local=netprobe.series, remote=None, wait=WITNESS_LAG + 14):
@@ -960,17 +1206,40 @@ def loss_judge(r):
     return "ok" if r["fail"] == 0 and r["n"] >= 10 else None
 
 
+def loss_shut(r):
+    """Серия, в которой не открылось ни одно соединение из первых SERIES_GIVEUP: вход закрыт. Судим по полям
+    серии, а не по тому, когда бросает серию агент точки: у агента своя копия netprobe."""
+    return bool(r and r.get("n", 0) >= netprobe.SERIES_GIVEUP and not r.get("ok")
+                and (r.get("fail") or 0) + (r.get("refused") or 0) == r["n"])
+
+
+def pair_judge(pts, point):
+    """Серия точки к ноде одним словом с оглядкой на сервер сторожа: 'closed' — с точки не открылось ни одно
+    соединение, а с сервера сторожа открывается не меньше половины; не открывается и с него — нода недоступна
+    целиком, это видно по каналам, тут не судим (None). Иначе — как loss_judge."""
+    r = pts.get(point)
+    if point != SELF and loss_shut(r):
+        ref = pts.get(SELF)
+        return "closed" if ref and ref.get("n") and (ref.get("ok") or 0) * 2 >= ref["n"] else None
+    return loss_judge(r)
+
+
 def loss_pct(r):
     return round(100.0 * r["fail"] / r["n"]) if r and r.get("n") else 0
 
 
 def point_view(data, point):
     """Как точка проверила ноды в этом замере: 'blind' — ничего не проверила (не ответила, не нашла ни одного имени,
-    ни одного соединения), 'noisy' — потери к большинству нод сразу, 'ok' — иначе."""
+    ни одного соединения), 'shut' — к большинству нод не открывается ни одно соединение, а с сервера сторожа они
+    открываются, 'noisy' — потери или закрытый вход к большинству нод сразу, 'ok' — иначе."""
     rows = [pts.get(point) for pts in data["nodes"].values()]
     if not rows or all(not r or not r.get("n") or not (r.get("ok") or r.get("fail") or r.get("refused")) for r in rows):
         return "blind"
-    if sum(1 for r in rows if loss_judge(r) == "bad") >= max(3, (len(rows) + 1) // 2):
+    judged = [pair_judge(pts, point) for pts in data["nodes"].values()]
+    closed, bad, lim = judged.count("closed"), judged.count("bad"), max(3, (len(rows) + 1) // 2)
+    if closed >= lim:
+        return "shut"
+    if bad + closed >= lim:
         return "noisy"
     return "ok"
 
@@ -984,17 +1253,40 @@ def point_why(data, point):
     return "не открылось ни одного соединения"
 
 
+def shut_why(data, point, shut):
+    """Почему с точки не открываются ноды shut — по счётчикам нод на её сериях: бан на нодах или блокировка по дороге."""
+    rows = [data["nodes"][n].get(point) for n in shut]
+    wits = [r.get("wit") for r in rows if r and r.get("wit")]
+    if rows and all(witness_refusal(r, r.get("wit")) in ("drop", "reject") for r in rows):
+        return ("по счётчикам нод запросы точки доходят, и ноды сами их отклоняют — бан адреса точки на нодах "
+                "(антискан, файрвол), а не блокировка")
+    if rows and len(wits) == len(rows) and not any(w["seen"] for w in wits):
+        return ("по счётчикам нод запросы точки до них не доходят — похоже на блокировку наших адресов у провайдера "
+                "этой точки; у его абонентов эти ноды, скорее всего, тоже не открываются")
+    return ("блокировка наших адресов у провайдера этой точки либо бан её адреса на нодах — по счётчикам нод "
+            "не различить")
+
+
 def point_alert(kind, point, data, since, now):
     rows = [pts.get(point) for pts in data["nodes"].values()]
     if kind == "blind":
         return (f"📍 <b>Точка «{html.escape(point)}» ничего не проверила</b> — {LOSS_CONFIRM} замера подряд: "
                 f"{point_why(data, point)}.\nПока так, её данные в выводах не учитываются.")
+    judged = {n: pair_judge(pts, point) for n, pts in sorted(data["nodes"].items())}
+    shut = [n for n, k in judged.items() if k == "closed"]
     if kind == "noisy":
-        bad = sorted(n for n, pts in data["nodes"].items() if loss_judge(pts.get(point)) == "bad")
+        bad = [n for n, k in judged.items() if k == "bad"]
+        also = f", к {len(shut)} — не открывается ни одно ({', '.join(n.upper() for n in shut)})" if shut else ""
         return (f"📍 <b>У точки «{html.escape(point)}» проблемы с сетью</b>\nТеряются соединения к {len(bad)} нодам из "
-                f"{len(rows)} сразу ({', '.join(n.upper() for n in bad)}), {LOSS_CONFIRM} замера подряд; с других точек "
-                "к этим нодам потерь нет или почти нет.\n<b>Похоже на:</b> беду сети этой точки или её провайдера, а не "
-                "нод. По нодам отдельных сообщений не шлю, в разборе сбоя эту точку не учитываю.")
+                f"{len(rows)} сразу ({', '.join(n.upper() for n in bad)}){also}, {LOSS_CONFIRM} замера подряд; с других "
+                "точек к этим нодам потерь нет или почти нет.\n<b>Похоже на:</b> беду сети этой точки или её провайдера, "
+                "а не нод. По нодам отдельных сообщений не шлю, в разборе сбоя эту точку не учитываю.")
+    if kind == "shut":
+        # так выглядит и блокировка наших адресов у провайдера точки, и бан адреса точки на нодах — различают счётчики нод
+        return (f"📍 <b>С точки «{html.escape(point)}» не открываются {len(shut)} нод из {len(rows)}</b>\n"
+                f"{', '.join(n.upper() for n in shut)} — ни одного соединения, {LOSS_CONFIRM} замера подряд; с сервера "
+                f"сторожа эти ноды открываются.\n<b>Похоже на:</b> {shut_why(data, point, shut)}.\n"
+                "По нодам отдельных сообщений не шлю; в разборе сбоя данные точки учитываю.")
     return (f"✅ <b>Точка «{html.escape(point)}» снова в порядке</b>\nБыло с {hmsk(since)} до {hmsk(now)} МСК.")
 
 
@@ -1003,7 +1295,7 @@ def hmsk(ts):
 
 
 def points_step(st, data):
-    """Состояние точек по замеру: ok / blind / noisy, с подтверждением LOSS_CONFIRM замеров подряд.
+    """Состояние точек по замеру: ok / blind / shut / noisy, с подтверждением LOSS_CONFIRM замеров подряд.
     Возвращает (сообщения, точки, которые сейчас не учитываются)."""
     pt = st.setdefault("loss", {}).setdefault("pt", {})
     msgs = []
@@ -1025,22 +1317,32 @@ def points_step(st, data):
 
 
 def loss_step(st, data):
-    """Свежий замер -> сообщения: о точках (ослепла, проблемы с сетью, снова в порядке) и о потерях к нодам, которые
-    держатся LOSS_CONFIRM замеров подряд, и об их конце. Пары точки, которая сейчас не в порядке, не судятся."""
+    """Свежий замер -> сообщения: о точках (ослепла, не открывает ноды, проблемы с сетью, снова в порядке), о потерях
+    к нодам и о закрытом с точки входе ноды, которые держатся LOSS_CONFIRM замеров подряд, и об их конце. Пары точки,
+    которая сейчас не в порядке, не судятся."""
     loss = st.setdefault("loss", {})
     lvl = loss.setdefault("lvl", {})
     loss["ts"], loss["n"], loss["last"] = data["ts"], data["n"], data["nodes"]
     msgs, skip = points_step(st, data)
-    loss["skip"] = skip
-    began, ended = [], []
+    # в разборе сбоя не учитываем только точки со своей бедой сети (ослепла, потери ко всем). «Не открывает ноды»
+    # (shut) — улика: так выглядит и блокировка наших адресов у её провайдера; её пары лишь не судим поодиночке
+    pt = loss.get("pt") or {}
+    loss["skip"] = [p for p in skip if pt.get(p, {}).get("lvl") != "shut"]
+    began, ended, shut_began, shut_ended, absorbed = [], [], [], [], []
     for node, pts in sorted(data["nodes"].items()):
         for point, r in pts.items():
             cur = lvl.setdefault(f"{node}|{point}", {"lvl": "ok", "cand": "ok", "n": 0})
             if point in skip:
+                if cur["lvl"] in ("closed", "bad"):
+                    absorbed.append((node, point, cur["lvl"]))   # о паре уже сообщали — сказать, куда она делась
                 cur.update(lvl="ok", cand="ok", n=0)  # беда самой точки: о нодах с неё не судим
                 continue
-            obs = loss_judge(r)
+            obs = pair_judge(pts, point)
             if obs is None:
+                if cur["lvl"] == "closed" and point != SELF and loss_shut(r):
+                    # с сервера сторожа нода тоже не открывается — она недоступна целиком (это видно по каналам),
+                    # «закрыт с одной точки» больше не правда: пару сбрасываем молча
+                    cur.update(lvl="ok", cand="ok", n=0)
                 continue
             if obs == cur["lvl"]:
                 cur["cand"], cur["n"] = obs, 0
@@ -1048,12 +1350,35 @@ def loss_step(st, data):
             cur["n"] = cur["n"] + 1 if obs == cur["cand"] else 1
             cur["cand"] = obs
             if cur["n"] >= LOSS_CONFIRM:
+                was = cur["lvl"]
                 cur["lvl"], cur["n"] = obs, 0
-                (began if obs == "bad" else ended).append((node, point))
+                if obs == "bad":
+                    began.append((node, point))   # и из закрытого входа в потери — обычное сообщение о потерях
+                elif obs == "closed":
+                    shut_began.append((node, point))
+                else:
+                    (shut_ended if was == "closed" else ended).append((node, point))
     valid = {f"{node}|{point}" for node, pts in data["nodes"].items() for point in pts}
     for key in [k for k in lvl if k not in valid]:
         del lvl[key]
-    return msgs + ([loss_alert(began, data)] if began else []) + ([loss_end(ended, data)] if ended else [])
+    return (msgs + [absorbed_text(absorbed)] * bool(absorbed)
+            + ([loss_alert(began, data)] if began else []) + ([shut_alert(shut_began, data)] if shut_began else [])
+            + ([loss_end(ended, data)] if ended else [])
+            + ([loss_end(shut_ended, data, title="✅ <b>Вход ноды снова открыт</b>")] if shut_ended else []))
+
+
+def absorbed_text(items):
+    """Пары, о которых уже сообщали (закрытый вход, потери), а теперь у их точки общая беда: [(нода, точка, lvl)]."""
+    by = {}
+    for node, point, kind in items:
+        by.setdefault(point, {"closed": [], "bad": []})[kind].append(node.upper())
+    out = []
+    for point, k in by.items():
+        what = "; ".join(x for x in (("вход закрыт: " + ", ".join(k["closed"])) if k["closed"] else "",
+                                     ("потери: " + ", ".join(k["bad"])) if k["bad"] else "") if x)
+        out.append(f"ℹ️ <b>Точка «{html.escape(point)}»: ранее сообщал — {html.escape(what)}</b>\nТеперь это часть "
+                   "общей беды точки (сообщение о ней — выше или раньше); отдельно эти ноды больше не веду.")
+    return "\n\n".join(out)
 
 
 def loss_group(pairs):
@@ -1083,13 +1408,69 @@ def loss_alert(pairs, data):
         rest = [p for p in data.get("points", []) if p != point]
         out += ["", html.escape("С других точек к этим нодам: " + ("; ".join(elsewhere) if elsewhere else "потерь нет")
                                 + (f" ({', '.join(rest)})" if rest and not elsewhere else ""))]
-    out += ["", "<b>Что это значит:</b> у клиентов такого же провайдера часть подключений к этим нодам зависает "
-                "на старте. Сами ноды работают."]
+    rows = [data["nodes"][node][point] for node, point in pairs]
+    if rows and all(witness_refusal(r, r.get("wit")) == "part" for r in rows):
+        out += ["", "<b>Что это значит:</b> нода сама отбрасывает часть подключений с этого адреса — лимит соединений "
+                    "или перегрузка на ноде; клиентам мешает, когда их много за одним адресом."]
+    else:
+        out += ["", "<b>Что это значит:</b> у клиентов такого же провайдера часть подключений к этим нодам зависает "
+                    "на старте. Сами ноды работают."]
     return "\n".join(out)
 
 
-def loss_end(pairs, data):
-    out = ["✅ <b>Потери соединений прошли</b>", f"<i>{LOSS_CONFIRM} замера подряд без потерь</i>"]
+WIT_VAGUE = "где теряется, по её счётчикам не видно"   # общая фраза сверки, когда сказать по сути нечего
+
+
+def shut_alert(pairs, data):
+    """Сообщение о закрытом с точки входе ноды: с точки не открылось ни одно соединение, с сервера сторожа нода
+    открывается. По абзацу на ноду: что видела сама нода, другой ли адрес дало имя ноды у точки."""
+    by_point = loss_group(pairs)
+    out = ["🚪 <b>Вход ноды закрыт с " + ("одной точки" if len(by_point) == 1 else "точек") + "</b>",
+           f"<i>{LOSS_CONFIRM} замера подряд: с точки не открылось ни одно соединение</i>"]
+    for point, nodes in by_point.items():
+        out += ["", f"📍 Откуда: <b>{html.escape(point)}</b>"]
+        for node in nodes:
+            pts = data["nodes"][node]
+            r, ref = pts[point], pts.get(SELF) or {}
+            # число попыток — у каждой ноды своё: старый агент серию не бросает и делает все 30
+            out += ["", f"• <b>{html.escape(node.upper())}</b> — с точки 0 из {r.get('n')}, с сервера сторожа проходит "
+                        f"{ref.get('ok')} из {ref.get('n')}"]
+            note = witness_text(r, r.get("wit"))
+            if note and not note.endswith(WIT_VAGUE):   # при закрытом входе общая фраза только путает
+                out.append("   ↳ " + html.escape(note))
+            if r.get("addr") and ref.get("addr") and r["addr"] != ref["addr"]:
+                out.append("   ↳ имя ноды у точки дало другой адрес, чем у сервера сторожа")
+        for node in nodes:
+            pts = data["nodes"][node]
+            seen = []
+            for p in data.get("points", []):
+                v = pts.get(p)
+                if p in (point, SELF):
+                    continue
+                if not v or not v.get("n"):
+                    seen.append(f"{p} — нет данных")
+                elif loss_shut(v):
+                    seen.append(f"{p} — тоже закрыт")
+                elif loss_judge(v) == "bad":
+                    seen.append(f"{p} — не проходит {v['fail']} из {v['n']}")
+                else:
+                    seen.append(f"{p} — проходит")
+            if seen:
+                whom = "этой ноде" if len(nodes) == 1 else node.upper()
+                out += ["", html.escape(f"С других точек к {whom}: " + ", ".join(seen))]
+    rows = [data["nodes"][node][point] for node, point in pairs]
+    if all(witness_refusal(r, r.get("wit")) in ("drop", "reject") for r in rows):
+        out += ["", "<b>Что это значит:</b> нода сама не принимает подключения с адреса этой точки (файрвол или бан "
+                    "адреса); у остальных клиентов она работает."]
+    else:
+        out += ["", "<b>Что это значит:</b> клиенты такого же провайдера к " + ("этой ноде" if len(rows) == 1
+                    else "этим нодам") + " не подключаются, у остальных " + ("она работает." if len(rows) == 1
+                                                                          else "они работают.")]
+    return "\n".join(out)
+
+
+def loss_end(pairs, data, title="✅ <b>Потери соединений прошли</b>"):
+    out = [title, f"<i>{LOSS_CONFIRM} замера подряд без потерь</i>"]
     for point, nodes in loss_group(pairs).items():
         out += ["", f"📍 Откуда: <b>{html.escape(point)}</b>",
                 html.escape("• " + ", ".join(node.upper() for node in nodes)
@@ -1110,22 +1491,50 @@ def loss_bad(st, now):
     return out
 
 
+def loss_shut_now(st, now):
+    """Пары (нода, точка) с подтверждённым закрытым входом по свежему замеру; замер устарел — пусто."""
+    loss = st.get("loss") or {}
+    if not loss.get("ts") or now - loss["ts"] > LOSS_STALE:
+        return []
+    return [tuple(key.split("|", 1)) for key, v in sorted(loss.get("lvl", {}).items()) if v.get("lvl") == "closed"]
+
+
+def loss_log_pair(node, point, r):
+    if loss_shut(r):
+        return f"{node} — {point} закрыт {r.get('ok') or 0}/{r['n']}"
+    return f"{node} — {point} {r.get('fail') or 0}/{r['n']}" + (f", сброшено {r['refused']}" if r.get("refused") else "")
+
+
 def loss_log(data):
     """Замер одной строкой для журнала сторожа."""
-    bad = [f"{node} — {point} {r['fail']}/{r['n']}" for node, pts in sorted(data["nodes"].items())
-           for point, r in pts.items() if r and r.get("fail")]
+    bad = [loss_log_pair(node, point, r) for node, pts in sorted(data["nodes"].items())
+           for point, r in pts.items() if r and (r.get("fail") or r.get("refused"))]
     asked = sum(1 for pts in data["nodes"].values() for r in pts.values() if r)
     total = sum(len(pts) for pts in data["nodes"].values())
     return f"потери с точек: серий {asked} из {total}; не прошло: " + ("; ".join(bad) or "нигде")
 
 
-def deep_many(chans, via_for, agents, bases):
-    """Разбор нескольких каналов разом (не больше DEEP_MAX): {имя канала: результат deep_diag}."""
+def deep_many(chans, via_for, agents, bases, deadline=None):
+    """Разбор нескольких каналов разом (не больше DEEP_MAX): {имя канала: результат deep_diag}.
+    deadline — срок (time.monotonic): разбор каждого канала укладывается в него (см. deep_diag), канал, чей разбор
+    не кончился и через DEEP_TAIL после срока, в ответ не входит."""
     chans = chans[:DEEP_MAX]
     if not chans:
         return {}
-    with concurrent.futures.ThreadPoolExecutor(max_workers=len(chans)) as ex:
-        return dict(zip((c["name"] for c in chans), ex.map(lambda c: deep_diag(c, via_for(c), agents, bases), chans)))
+    if deadline is None:
+        with concurrent.futures.ThreadPoolExecutor(max_workers=len(chans)) as ex:
+            return dict(zip((c["name"] for c in chans), ex.map(lambda c: deep_diag(c, via_for(c), agents, bases), chans)))
+    # со сроком: каждый канал в своём потоке-демоне, отдаём то, что готово, — по каналу, а не всё или ничего
+    futs = {c["name"]: daemon_call(deep_diag, c, via_for(c), agents, bases, deadline) for c in chans}
+    out = {}
+    for name, f in futs.items():
+        try:
+            got = _until(f, deadline + DEEP_TAIL)
+        except Exception:  # noqa: BLE001 — сорвался разбор одного канала: остальные всё равно отдаём
+            continue
+        if got is not None:
+            out[name] = got
+    return out
 
 
 def series_part(ser):
@@ -1352,6 +1761,8 @@ def deep_lines(d, extra=None):
     series, names = d.get("series") or {}, d.get("sni") or {}
 
     def point(name, r):
+        if name in d.get("late", ()):
+            return "не успела ответить за срок разбора"
         return "; ".join(x for x in (point_text(r), series_part(series.get(name))) if x)
     lines = ["• с rf1 напрямую: " + point(SELF, d["direct"])]
     lines += [f"• {name}: {point(name, r)}" + (" (у точки сейчас своя беда с сетью — в выводе не учитываю)"
@@ -1364,8 +1775,9 @@ def deep_lines(d, extra=None):
     if cut:
         lines.append("• имена TLS на том же адресе (" + ", ".join(cut) + "): с настоящим именем ответа нет, "
                      "с другим именем и без имени сервер отвечает")
-    if d["abroad"] is not None:
-        lines.append(f"• из-за рубежа (через {d['via']}): " + ("отвечает" if d["abroad"] else "не отвечает"))
+    ab_line = abroad_line(d)
+    if ab_line:
+        lines.append(ab_line)
     t = d.get("trace")
     if t:
         if t["reached"]:
@@ -1375,11 +1787,33 @@ def deep_lines(d, extra=None):
         else:
             lines.append("• трассировка с rf1: не ответил ни один шаг")
     ext = d.get("external")
-    if ext:
+    if ext and ext.get("service") == "Globalping":
+        lines.append(f"• абоненты в РФ (Globalping): {ext.get('note') or 'нет данных'}")
+    elif ext:
         lines.append(f"• внешняя проверка ({ext.get('service', '?')}): {ext.get('note', 'нет данных')}")
     if DEEP_EXTRA_LIVE if extra is None else extra:
         lines += deep_extra(d)
     return lines
+
+
+def abroad_line(d):
+    """Строка «из-за рубежа» для разбора (None — не проверяли). Попытки — d["abroad_tries"] от abroad_check."""
+    ab, tries, via = d.get("abroad"), d.get("abroad_tries") or [], d.get("via")
+    if ab is True:
+        if len(tries) >= 2 and tries[0][1] is False:
+            first, last = tries[0][0], tries[-1][0]
+            if first == last:
+                return f"• из-за рубежа: через {first} со второй попытки отвечает"
+            return f"• из-за рубежа: через {first} не ответила, через {last} отвечает"
+        return f"• из-за рубежа (через {via}): отвечает"
+    if ab is False:
+        # что сверка шла через один канал, говорит вывод («вывод неуверенный») — здесь не повторяем
+        return f"• из-за рубежа (через {via}): не отвечает"
+    if d.get("abroad_err"):
+        return "• из-за рубежа: проверка сорвалась (ошибка в самой проверке)"
+    if tries:
+        return "• из-за рубежа: проверить не удалось — обходной канал сам не открыл контрольный адрес"
+    return None
 
 
 def deep_verdict(d, status):
@@ -1416,12 +1850,29 @@ def deep_verdict(d, status):
     if "ok" in kinds:
         bad = ", ".join(k for k, v in answered.items() if v != "ok")
         good = ", ".join(k for k, v in answered.items() if v == "ok")
+        bad_kinds = {v for v in answered.values() if v != "ok"}
+        # по счётчикам ноды: каким точкам с бедой на уровне TCP отказывает сама нода (tls и обрыв данных так не объяснить)
+        ref = node_refused(d, [k for k, v in answered.items() if v == "tcp"])
         if points["rf1"] != "ok" and all(v == "ok" for k, v in answered.items() if k != "rf1"):
+            if "rf1" in ref:
+                return ("не отвечает только с rf1, а по счётчикам ноды запросы rf1 доходят и она сама их отклоняет — "
+                        "нода закрылась от адреса сторожа (бан или антискан на ноде); у пользователей, скорее всего, "
+                        "всё в порядке — снять бан") + ext_tail(d, bad_kinds)
             return (f"не отвечает только с rf1, с остальных точек ({good}) нода работает — сбой на стороне rf1 или "
-                    "её провайдера; у пользователей, скорее всего, всё в порядке")
+                    "её провайдера; у пользователей, скорее всего, всё в порядке") + ext_tail(d, bad_kinds)
+        if ref and len(ref) == sum(1 for v in answered.values() if v != "ok"):
+            return (f"с части точек ({bad}) нода не отвечает, с других работает ({good}); по её счётчикам запросы "
+                    "доходят, но она сама их отклоняет — бан адресов точек на ноде, а не провайдеры") + ext_tail(d, bad_kinds)
         return (f"с части российских точек нода не отвечает ({bad}), с других работает ({good}) — блокировка "
-                "у отдельных провайдеров либо неустойчивая сеть") + tail
+                "у отдельных провайдеров либо неустойчивая сеть") + tail + (
+                    f"; {', '.join(ref)}: нода сама отклоняет их запросы (бан на ноде)" if ref else "") + ext_tail(d, bad_kinds)
     # ни с одной российской точки не работает
+    nv = node_refusal_verdict(d, answered, kinds)
+    if nv:
+        return nv
+    gv = ext_verdict(d, kinds, where)
+    if gv:
+        return gv
     if kinds == {"dns"}:
         return (f"имя ноды не находится в DNS {where}" + (", а из-за рубежа нода отвечает — блокировка или подмена "
                 "на уровне DNS" if abroad else " — проверьте запись домена у регистратора"))
@@ -1443,8 +1894,63 @@ def deep_verdict(d, status):
                    if d.get("trace") and not d["trace"]["reached"] and d["trace"]["last"] else "") + side
                 + block_detail(d))
     if abroad is False:
-        return "нода не отвечает ни из России, ни из-за рубежа — сбой самой ноды или её хостера, а не блокировка"
+        if d.get("abroad_sure", 2) >= 2:
+            return ("нода не отвечает ни из России, ни из-за рубежа — сбой самой ноды или её хостера, а не блокировка"
+                    + (f" (через {d['via']})" if d.get("via") else ""))
+        return (f"нода не отвечает ни из России, ни из-за рубежа (через {d.get('via')}, второго рабочего канала для "
+                "сверки нет) — похоже на сбой самой ноды или её хостера, но вывод неуверенный")
+    if d.get("abroad_err"):
+        return (f"нода не отвечает {where}; проверка из-за рубежа сорвалась — блокировка это или поломка, "
+                "не различить")
+    if d.get("abroad_tries"):
+        return (f"нода не отвечает {where}; из-за рубежа проверить не удалось — обходной канал сам не работал; "
+                "блокировка это или поломка, не различить")
     return f"нода не отвечает {where}; из-за рубежа проверить было не через что — блокировка это или поломка, не различить"
+
+
+def node_refusal_verdict(d, answered, kinds):
+    """Ни с одной российской точки порт не открывается, а по счётчикам ноды запросы доходят и она сама их отклоняет
+    (молчит или сбрасывает) — это не блокировка по дороге. Вывод только когда у всех точек беда с портом (tcp), каждая
+    сверенная точка отклонена и сверено не меньше двух точек (или все): одна rf1 с баном на ноде не должна заслонить
+    настоящую блокировку у остальных. Globalping остаётся в выводе: он говорит, задело ли пользователей; если у
+    абонентов тоже закрыто, а отклонена одна точка — называем только бан этой точки, причину беды абонентов нет.
+    None — не то."""
+    if not answered or not kinds <= {"tcp"}:
+        return None
+    ref = node_refused(d, list(answered))
+    wit = [p for p, w in (d.get("witness") or {}).items() if w and not p.endswith("|tls") and p in answered]
+    if not ref or any(p not in ref for p in wit) or not (len(ref) >= 2 or len(ref) == len(answered)):
+        return None
+    who = "с rf1" if list(ref) == [SELF] else "с точек " + ", ".join(ref)
+    how = "сама сбрасывает их" if all(k == "reject" for k in ref.values()) else "не отвечает на них"
+    rest = [p for p in answered if p not in ref]
+    rest_tail = f" (остальные — {', '.join(rest)} — сверить не удалось)" if rest else ""
+    s = ext_summary(d, fresh=True)
+    gpc = bool(s) and s["verdict"] in ("closed", "mixed")
+    abroad = d.get("abroad")
+    unsure = " (из-за рубежа сверено через один канал — вывод неуверенный)" if (
+        abroad is False and d.get("abroad_sure", 2) < 2) else ""
+    if gpc and abroad is not False and len(ref) < 2:
+        # отклонена одна точка (обычно rf1 — антискан на ноде): бан её адреса доказан, а причина беды абонентов — нет,
+        # это может быть и настоящая блокировка
+        return (f"по счётчикам ноды запросы {who} доходят, но она {how} — адрес проверки забанен на ноде"
+                + ext_tail(d) + "; почему не открывается у абонентов, по этим данным не сказать — блокировка или "
+                "файрвол ноды") + rest_tail
+    if gpc and abroad is not False:
+        return (f"по счётчикам ноды запросы {who} доходят, но она {how}; у абонентов домашних провайдеров тоже не "
+                "открывается — нода закрыта для России своим файрволом (геоблок, антискан), клиенты из РФ подключиться "
+                "не могут") + rest_tail
+    if abroad is True:
+        return (f"из-за рубежа нода отвечает, а {who} запросы доходят до ноды, и она {how} — это не блокировка: нода "
+                "закрылась от адресов проверки (бан, антискан, файрвол на ноде)") + ext_tail(d) + rest_tail
+    if abroad is False:
+        if all(k == "reject" for k in ref.values()):
+            return ("нода сама сбрасывает соединения на порт входа, из-за рубежа тоже не отвечает — Xray на ноде не "
+                    "слушает порт или его закрыл файрвол; это не блокировка") + unsure + rest_tail
+        return (f"запросы {who} доходят до ноды, но она не отвечает, из-за рубежа тоже — перегрузка или файрвол самой "
+                "ноды, а не блокировка") + unsure + rest_tail
+    return (f"запросы {who} доходят до ноды, но она {how} — отказывает сама нода (файрвол, бан, перегрузка), а не "
+            "блокировка") + ext_tail(d) + rest_tail
 
 
 def block_detail(d):
@@ -1472,22 +1978,158 @@ def deep_text(d, status, extra=()):
             + f"\n\n<b>Похоже на:</b> {html.escape(deep_verdict(d, status))}." + (f"\n{html.escape(note)}." if note else ""))
 
 
-# ---------- 4. внешний сервис: заглушка ----------
+# ---------- 4. внешний сервис: Globalping (домашние сети России) ----------
 
 def external_scan(target, cfg=None):
-    """ЗАГЛУШКА, выключена. Место под проверку ноды сторонним сервисом, у которого сканеры стоят в сетях настоящих
-    операторов (например, «динамическое сканирование» cheburcheck.ru) — этого взгляда сторожу не хватает: все его
-    точки в дата-центрах.
+    """Взгляд из домашних сетей России: открывается ли вход ноды у абонентов обычных провайдеров (МТС, Билайн,
+    Ростелеком, Дом.ру…) и из Европы — через Globalping (globalping.py). Все наши точки в дата-центрах, этого взгляда
+    сторожу не хватало. Зовётся из deep_diag (ext_job) только когда порт входа не открывается с rf1 или с двух точек,
+    и только с адресом, совпавшим с защищённым DNS.
 
-    Почему выключено: сервису и его добровольцам пришлось бы сообщить адрес и домен ноды. Включать — только по
-    решению владельца: external.json {"enabled": true, "service": "..."}; и до включения нужно дописать сам запрос
-    (порядок обращения к сервису не проверялся). Пока запроса нет, функция никуда не ходит ни при каких настройках.
-    Возвращает None (выключено) либо {"service", "note"} — строку для сообщения."""
+    Включается в external.json: {"enabled": true, "service": "globalping"}; необязательно "ru_probes" (точек в РФ,
+    по умолчанию 8) и "hour_budget" (проверок в час). Наружу уходят только адрес (IP) и порт входа — имя ноды никогда;
+    результаты Globalping открыты по номеру замера. Выключено или нет файла — None, наружу ничего. Другой сервис
+    в настройках — запроса к нему нет, тоже ничего не уходит (в сообщении так и сказано).
+    target — {"host", "addr", "port"}. Возвращает None либо {"service", "note", ...итог globalping.check}."""
     cfg = read_etc(EXTERNAL, {}) if cfg is None else cfg
-    if not cfg.get("enabled"):
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
         return None
-    return {"service": str(cfg.get("service") or "не указан"),
-            "note": "включена в настройках, но запрос к сервису не написан — ничего не отправлено"}
+    service = str(cfg.get("service") or "не указан")
+    if service.lower() != "globalping" or globalping is None:
+        return {"service": service, "note": "включена в настройках, но запрос к сервису не написан — ничего не отправлено"}
+    addr = (target or {}).get("addr")
+    if not addr or not globalping.public_ip(addr):
+        return None   # имени наружу не отдаём, а адреса нет — спрашивать не о чем
+    try:
+        n = max(1, min(int(cfg.get("ru_probes") or globalping.RU_PROBES), 20))
+        budget = int(cfg["hour_budget"]) if cfg.get("hour_budget") else None
+    except (TypeError, ValueError):
+        n, budget = globalping.RU_PROBES, None
+    res = globalping.check(addr, int((target or {}).get("port") or 443), n=n, budget=budget)
+    if res is None:
+        return None
+    return dict(res, service="Globalping", note=globalping.text(res))
+
+
+EXT_DOH_WAIT = 10        # секунд на сверку адреса по защищённому DNS перед Globalping
+EXT_WAIT = (globalping.WALL if globalping else 0) + EXT_DOH_WAIT + 2   # дольше от старта внешний сервис не ждём
+EXT_FRESH = 300          # итог Globalping старше (из памяти) в вывод не берём — только строкой «что увидели»
+
+
+def ext_trouble(r):
+    """Порт входа с этой точки не открывается (таймаут, отказ): повод спросить внешний сервис. Globalping проверяет
+    только рукопожатие TCP — при обрыве TLS, остановке данных или чужом сертификате он ответит «открывается», а адрес
+    уйдёт в открытый сервис зря. Не проверялось (none) — тоже не повод."""
+    return netprobe.probe_class(r) == "tcp"
+
+
+def ext_wanted(direct, probes):
+    """Спрашивать ли внешний сервис по итогам всех точек (когда с rf1 порт открыт или не проверялся): порт не
+    открылся хотя бы с двух точек или со всех ответивших. Одна точка при живом rf1 — скорее её собственная беда."""
+    pts = [direct] + [p for p in probes.values() if p]
+    bad = [p for p in pts if ext_trouble(p)]
+    seen = [p for p in pts if netprobe.probe_class(p) != "none"]
+    return bool(bad) and (len(bad) >= 2 or len(bad) == len(seen))
+
+
+def trusted_addr(host, addrs):
+    """Какой адрес можно отдать наружу -> (адрес, None) | (None, почему нет). Адрес с rf1 и с точек — из их обычного
+    DNS; при подмене это чужой адрес (заглушка, «яма»), и отдавать его в открытый сервис нельзя: сверяем с защищённым
+    DNS. Вход задан самим адресом — сверять нечего."""
+    addrs = [a for a in dict.fromkeys(addrs) if a]
+    if not addrs:
+        return None, None
+    try:
+        ipaddress.ip_address(str(host))
+        return (str(host) if str(host) in addrs else addrs[0]), None
+    except ValueError:
+        pass
+    truth = doh(str(host), first=True)
+    if not truth:
+        return None, "не спрашивал — защищённый DNS не ответил, а адресу из обычного DNS без сверки не верю"
+    good = [a for a in addrs if a in truth]
+    if not good:
+        return None, ("не спрашивал — адрес входа у наших точек не совпадает с защищённым DNS (похоже на подмену), "
+                      "чужой адрес наружу не отдаю")
+    return good[0], None
+
+
+def ext_job(host, addrs, port):
+    """В потоке внешнего сервиса: выбрать адрес, которому верим, и спросить. Выключено — ничего, даже DoH."""
+    cfg = read_etc(EXTERNAL, {})
+    if not isinstance(cfg, dict) or not cfg.get("enabled"):
+        return None
+    if str(cfg.get("service") or "").lower() != "globalping" or globalping is None:
+        return external_scan({"host": host, "addr": next((a for a in addrs if a), None), "port": port}, cfg)
+    addr, why = trusted_addr(host, addrs)
+    if not addr:
+        return {"service": "Globalping", "skipped": "dns", "note": why} if why else None
+    return external_scan({"host": host, "addr": addr, "port": port}, cfg)
+
+
+def ext_summary(d, fresh=False):
+    """Итог Globalping из разбора, если он есть и в нём есть ответы домашних точек; иначе None.
+    fresh — только для вывода: результат из памяти старше EXT_FRESH не годится (с тех пор нода могла упасть)."""
+    ext = d.get("external")
+    s = ext.get("summary") if isinstance(ext, dict) else None
+    if fresh and s and ext.get("cached") and (ext.get("age") or 0) > EXT_FRESH:
+        return None
+    return s if s and s.get("verdict") != "nodata" else None
+
+
+def ext_isps(s, state):
+    """Провайдеры: ok — у кого открылось хоть у одной точки; fail — у кого не открылось ни у одной (провайдер, где
+    есть и то и другое, в «закрытые» не пишем: это неустойчивая точка, а не блокировка)."""
+    return ", ".join(k for k, v in sorted((s.get("isps") or {}).items())
+                     if (v["ok"] if state == "ok" else v["fail"] and not v["ok"]))
+
+
+def ext_verdict(d, kinds, where):
+    """Вывод по Globalping, когда ни с одной нашей точки вход не открывается; None — данных нет или они не решают."""
+    s = ext_summary(d, fresh=True)
+    if not s or not kinds <= {"tcp"}:
+        return None   # Globalping проверяет только рукопожатие TCP: про TLS и обрыв данных он ничего не скажет
+    answered = s["ru_ok"] + s["ru_fail"]
+    gp = f"Globalping: открывается у {s['ru_ok']} из {answered}"
+    if s["verdict"] == "open":
+        return (f"с наших точек (все в дата-центрах) порт не отвечает {where}, а у абонентов домашних провайдеров "
+                f"открывается ({gp}: {ext_isps(s, 'ok')}) — закрыт путь из дата-центров и хостингов, у пользователей, "
+                "скорее всего, всё в порядке")
+    if s["verdict"] == "mixed":
+        return (f"порт не отвечает {where}; у абонентов домашних провайдеров — у части открывается "
+                f"({ext_isps(s, 'ok')}), у части нет ({ext_isps(s, 'fail')}) ({gp}) — блокировка у отдельных "
+                "провайдеров, а не по всей стране" + block_detail(d))
+    hop = (f" (с rf1 пакеты пропадают после шага {d['trace']['last'][0]})"
+           if d.get("trace") and not d["trace"]["reached"] and d["trace"]["last"] else "")
+    if s["verdict"] == "closed" and s["control"] == "down" and d.get("abroad") is True:
+        return (f"порт не отвечает {where} и у абонентов домашних провайдеров ({gp}: {ext_isps(s, 'fail')}); "
+                f"через наш зарубежный канал ({d.get('via') or '?'}) нода отвечает, а с точек Globalping в Европе — нет: "
+                "источники расходятся, похоже на блокировку из России, но вывод неуверенный" + hop + block_detail(d))
+    if s["verdict"] == "closed" and (s["control"] == "up" or d.get("abroad") is True):
+        src = ("из Европы (Globalping) открывается" if s["control"] == "up"
+               else f"из-за рубежа (через {d.get('via') or '?'}) отвечает")
+        return (f"блокировка адреса по всей России: порт не отвечает {where} и у абонентов домашних провайдеров "
+                f"({gp}: {ext_isps(s, 'fail')}), а {src}" + hop + block_detail(d))
+    if s["verdict"] == "closed" and s["control"] == "down" and d.get("abroad") is not True:
+        return ("нода не отвечает ни из России (наши точки и домашние провайдеры), ни из Европы (Globalping) — "
+                "сбой самой ноды или её хостера, а не блокировка")
+    return None
+
+
+def ext_tail(d, bad_kinds=("tcp",)):
+    """Хвост к выводу «у части точек не открывается»: что видят абоненты домашних провайдеров. bad_kinds — как не
+    открылось у наших точек: Globalping видит только порт, поэтому хвост — лишь когда у всех них беда с портом (tcp);
+    при обрыве TLS или данных его «открывается» вводило бы в заблуждение."""
+    s = ext_summary(d, fresh=True)
+    if not s or not set(bad_kinds) <= {"tcp"} or s["verdict"] not in ("open", "mixed", "closed"):
+        return ""
+    answered = s["ru_ok"] + s["ru_fail"]
+    if s["verdict"] == "open":
+        return f"; у абонентов домашних провайдеров открывается (Globalping: {s['ru_ok']} из {answered})"
+    if s["verdict"] == "mixed":
+        return (f"; у абонентов домашних провайдеров — у части открывается ({ext_isps(s, 'ok')}), у части нет "
+                f"({ext_isps(s, 'fail')})")
+    return f"; у абонентов домашних провайдеров не открывается (Globalping: 0 из {answered})"
 
 
 # ---------- проверка по запросу (probe.py --blocks) ----------
@@ -1508,8 +2150,11 @@ def full_check(chans, nodes, site_hosts, bases, state_chans, agents=None):
     tails = tuple("." + b for b in bases)
     names = list(site_hosts) + [n["host"] for n in nodes if str(n.get("host", "")).endswith(tails)]
 
+    cands = [{"name": clean(o["name"]), "port": o["port"], "entry": o.get("entry"), "key": o["name"]} for o in alive]
+    exits = {name: (s or {}).get("exit") for name, s in state_chans.items()}
+
     def via_for(c):
-        return next(({"name": clean(o["name"]), "port": o["port"]} for o in alive if o.get("entry") != c.get("entry")), None)
+        return abroad_vias(cands, c, exits)
 
     # списки качаются сами по себе; ноды — по три разом и раньше DNS, чтобы не завалить запросами точки проверки
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as side, concurrent.futures.ThreadPoolExecutor(max_workers=3) as ex:
@@ -1518,8 +2163,10 @@ def full_check(chans, nodes, site_hosts, bases, state_chans, agents=None):
         f_nodes = [(c["name"], ex.submit(deep_diag, c, via_for(c), agents, bases)) for c in chans]
         checked = {name: f.result() for name, f in f_nodes}
         dns = dns_check(names, via_port, agents)
+        ext_cfg = read_etc(EXTERNAL, {})
+        ext_on = isinstance(ext_cfg, dict) and bool(ext_cfg.get("enabled"))
         return {"lists": f_lists.result(), "dns": dns, "dns_names": len(names), "health": health, "nodes": checked,
-                "external": bool(read_etc(EXTERNAL, {}).get("enabled"))}
+                "external": (str(ext_cfg.get("service") or "не указан") if ext_on else False)}
 
 
 def node_line(name, d):
@@ -1532,6 +2179,13 @@ def node_line(name, d):
     answered = {p: k for p, k in kinds.items() if k != "none"}
     silent = [p for p, k in kinds.items() if k == "none"]
     abroad = {True: "из-за рубежа отвечает", False: "из-за рубежа НЕ отвечает", None: "из-за рубежа не проверялось"}[d["abroad"]]
+    if d["abroad"] is None and d.get("abroad_tries"):
+        abroad = "из-за рубежа проверить не удалось (обходной канал не работал)"
+    elif d["abroad"] is False and d.get("abroad_sure", 2) == 1:
+        abroad = "из-за рубежа НЕ отвечает (через один канал)"
+    s = ext_summary(d)
+    if s:
+        abroad += f"; абоненты в РФ (Globalping): открывается у {s['ru_ok']} из {s['ru_ok'] + s['ru_fail']}"
     where = "с rf1" if len(answered) == 1 else f"со всех {len(answered)} российских точек"
     if set(answered.values()) == {"ok"} and d["abroad"] is not False:
         note = f" (точка не ответила: {', '.join(silent)})" if silent else ""
@@ -1581,9 +2235,21 @@ def check_text(res, when):
     out += [html.escape(node_line(name, d)) for name, d in res["nodes"].items()]
     points = ["rf1 ✅"] + [f"{name} {'✅' if ok else '❌'}" for name, ok in res["health"].items()]
     out += ["", "<b>Точки проверки в РФ:</b> " + html.escape(" · ".join(points)),
-            "<b>Внешний сервис:</b> " + ("включён в настройках, но запрос к нему не написан — ничего не отправляется"
-                                         if res["external"] else "выключен")]
+            "<b>Внешний сервис:</b> " + html.escape(external_status(res))]
     return "\n".join(out)
+
+
+def external_status(res):
+    """Строка «Внешний сервис» проверки по запросу."""
+    ext = res.get("external")
+    if not ext:
+        return "выключен"
+    if not isinstance(ext, str) or ext.lower() != "globalping" or globalping is None:
+        return "включён в настройках, но запрос к нему не написан — ничего не отправляется"
+    asked = sum(1 for d in (res.get("nodes") or {}).values() if ext_summary(d))
+    return ("Globalping (абоненты домашних провайдеров в РФ) — спрашивается только о нодах, вход которых не "
+            "открывается с наших точек; уходят только адрес и порт" + (f"; спрошено о нодах: {asked}" if asked else
+                                                                     "; в этот раз не понадобился"))
 
 
 # ---------- строки отчёта ----------
@@ -1608,8 +2274,20 @@ def block_items(st, now):
             parts.append(f"в списках блокировок наших адресов нет (сверено адресов: {tg.get('ips', 0)}, имён: {tg.get('names', 0)})")
         if now - lists["ts"] > LISTS_STALE:
             parts.append(f"⚠️ списки не обновлялись {int((now - lists['ts']) // 3600)} ч")
-        elif failed:
-            parts.append(f"не скачалось списков: {len(failed)} из {len(lists['sources'])}")
+        else:
+            # сверка идёт, но какой-то список давно не скачивается: зеркала одного списка — одна группа
+            srcs, last, groups = lists.get("sources", {}), lists.get("last") or {}, {}
+            for k, name in LIST_NAMES.items():
+                groups.setdefault(name, []).append(k)
+            old = []
+            for name, keys in groups.items():
+                seen = [last[k] for k in keys if k in last]
+                if seen and not any(srcs.get(k, {}).get("ok") for k in keys) and now - max(seen) > LISTS_STALE:
+                    old.append(f"{name} — {int((now - max(seen)) // 3600)} ч")
+            if old:
+                parts.append("⚠️ давно не скачиваются: " + "; ".join(old))
+            if failed:
+                parts.append(f"не скачалось списков: {len(failed)} из {len(lists['sources'])}")
     parts += rucheck.items(st)
     dns = st.get("dns") or {}
     if dns.get("names"):
@@ -1620,24 +2298,33 @@ def block_items(st, now):
         down = [n for n, ok in van.items() if not ok]
         parts.append("⚠️ точка проверки не отвечает: " + ", ".join(down) if down
                      else f"точек проверки в РФ: {len(van) + 1}")
-    skip = (st.get("loss") or {}).get("skip") or []
+    pt = (st.get("loss") or {}).get("pt") or {}
+    # точки не в порядке — и те, что в разборе не учитываются (loss["skip"]), и «не открывает ноды»
+    skip = sorted(set((st.get("loss") or {}).get("skip") or []) | {p for p, v in pt.items() if v.get("lvl", "ok") != "ok"})
     if skip:
-        why = {"blind": "ничего не проверяет", "noisy": "проблемы с сетью"}
-        pt = (st.get("loss") or {}).get("pt") or {}
+        why = {"blind": "ничего не проверяет", "noisy": "проблемы с сетью", "shut": "не открывает наши ноды"}
         parts.append("⚠️ " + "; ".join(f"точка «{p}» — {why.get(pt.get(p, {}).get('lvl'), 'не в порядке')}" for p in skip))
     dbad = sorted(p for p, v in (st.get("dns_pt") or {}).items() if v.get("lvl") == "bad")
     if dbad:
         parts.append("⚠️ свой DNS не находит наших имён: " + ", ".join(dbad))
-    pl = profiles_line(st)
+    pl = profiles_line(st, now)
     if pl:
         parts.append(pl)
-    vl = vpn_line(st)
+    vl = vpn_line(st, now)
     if vl:
         parts.append(vl)
-    lossy_now = loss_bad(st, now)
+    # данные службы --side старше срока — не показываем как данные, говорим одной строкой
+    stale = [(h, word) for h, word in ((side_age(st.get("profiles"), PROFILE_STALE, now), "профиль"),
+                                       (side_age(st.get("vpn_pt"), VPN_STALE, now), "обход через VPN")) if h is not None]
+    if stale:
+        parts.append(f"⚠️ данные точек не обновлялись {max(h for h, _ in stale)} ч ("
+                     + ", ".join(w for _, w in stale) + ") — служба channel-watch-side")
+    lossy_now, shut_now = loss_bad(st, now), loss_shut_now(st, now)
+    if shut_now:
+        parts.append("⚠️ вход ноды закрыт: " + ", ".join(f"{node} — с точки {point}" for node, point in shut_now))
     if lossy_now:
         parts.append("⚠️ потери соединений: " + ", ".join(f"{node} — {point} {pct} %" for node, point, pct in lossy_now))
-    elif lossy_now is not None:
+    elif lossy_now is not None and not shut_now:
         parts.append("потерь соединений с точек нет")
     return parts
 
@@ -1713,13 +2400,15 @@ def geo_line(node, cur):
             + (", " + ", ".join(extra) if extra else "") + (" ⚠️" if odd else ""))
 
 
-def geo_week(st):
-    """Таблица гео для недельной сводки."""
+def geo_week(st, now=None):
+    """Таблица гео для недельной сводки. Гео старше GEO_STALE — с пометкой в заголовке."""
     geo = (st.get("geo") or {}).get("by") or {}
     if not geo:
         return []
-    return ["", "<b>Гео адресов нод</b> <i>(страна по базам, Cloudflare, YouTube; ⚠️ — расходится с флагом плитки)</i>"] \
-        + [geo_line(node, cur) for node, cur in sorted(geo.items())]
+    h = side_age(st.get("geo"), GEO_STALE, now)
+    old = f" — ⚠️ данные {h} ч назад" if h is not None else ""
+    return ["", "<b>Гео адресов нод</b> <i>(страна по базам, Cloudflare, YouTube; ⚠️ — расходится с флагом плитки)</i>"
+            + old] + [geo_line(node, cur) for node, cur in sorted(geo.items())]
 
 
 def week_lines(st):

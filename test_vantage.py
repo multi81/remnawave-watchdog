@@ -182,8 +182,8 @@ st, hd, body = raw_get(port, "/health", {"X-Token": "wrong"})
 check("B1 403 без JSON и без подписи Server", st == 403 and body == b"" and "Server" not in hd)
 st, hd, body = raw_get(port, "/health")
 h = json.loads(body)
-check("B2 /health: v 7, caps dns_udp0/verify/tls, tls выключен без сертификата, без Server",
-      st == 200 and h["v"] == 7 and {"dns_udp0", "verify", "tls"} <= set(h["caps"]) and h["tls"] is False
+check("B2 /health: v 8, caps dns_udp0/verify/tls, tls выключен без сертификата, без Server",
+      st == 200 and h["v"] == 8 and {"dns_udp0", "verify", "tls"} <= set(h["caps"]) and h["tls"] is False
       and "Server" not in hd)
 s = socket.create_connection(("127.0.0.1", port), timeout=5)
 s.sendall(b"BREW /x HTTP/1.0\r\n\r\n")
@@ -237,6 +237,26 @@ netprobe.direct_probe = dp_old
 st, _, _ = raw_get(port, "/probe?host=x.example.net&port=443&verify=1")
 check("D6 netprobe без verify — проверка без сверки, не ошибка", st == 200 and seen[-1] == "old")
 netprobe.resolve_system, netprobe.dns_udp, netprobe.direct_probe = real_rs, real_du, real_dp
+
+# /services: у «душат» агент отдаёт и kb (после скольких КБ встают данные), у остальных — нет
+import types  # noqa: E402
+real_rc = sys.modules.get("rucheck")
+sys.modules["rucheck"] = types.SimpleNamespace(
+    services_list=lambda: (["a.example", "b.example"], ["c.example"]),
+    check_all=lambda hosts: {"a.example": {"verdict": "THROTTLE", "kb": 18, "code": 200, "sys": [], "doh": []},
+                             "b.example": {"verdict": "OK", "kb": 7, "code": 200, "sys": [], "doh": []},
+                             "c.example": {"verdict": "TCP_TIMEOUT", "code": None, "sys": [], "doh": []}})
+try:
+    st, _, body = raw_get(port, "/services")
+finally:
+    if real_rc is None:
+        sys.modules.pop("rucheck", None)
+    else:
+        sys.modules["rucheck"] = real_rc
+sv = json.loads(body)["services"] if st == 200 else {}
+check("D7 /services: у THROTTLE kb передаётся, у прочих вердиктов — нет",
+      sv.get("a.example", {}).get("kb") == 18 and sv["a.example"]["verdict"] == "THROTTLE"
+      and "kb" not in sv.get("b.example", {"kb": 1}) and "kb" not in sv.get("c.example", {"kb": 1}))
 srv.shutdown()
 srv.server_close()
 

@@ -178,8 +178,9 @@ STILL = {"DOWN": "недоступен", "SLOW": "медленно", "FREEZE": "
 PERIOD = (("inc", 0), ("bad_sec", 0), ("checks", 0), ("fails", 0), ("spd_sum", 0.0), ("spd_n", 0),
           ("spd_min", 0.0), ("svc_n", 0))
 PERIOD_LISTS = ("lat", "conn")  # замеры задержки и времени соединения за период, мс — в отчёте их медианы
+# mass — с какого момента канал в общем сбое многих каналов сразу (0 — не в нём), см. main и mass_text
 DEFAULTS = (("status", "OK"), ("cand", "OK"), ("streak", 0), ("detail", ""), ("quality", "OK"),
-            ("quality_detail", ""), ("last_remind", 0), ("svc_ts", 0)) + PERIOD
+            ("quality_detail", ""), ("last_remind", 0), ("svc_ts", 0), ("mass", 0)) + PERIOD
 # сайт: n, fails, inc, bad_sec — статистика между отчётами; ts — когда проверяли в последний раз
 SITE_DEFAULTS = (("ok", True), ("n", 0), ("fails", 0), ("inc", 0), ("bad_sec", 0), ("status", "OK"), ("cand", "OK"),
                  ("streak", 0), ("code", "200"), ("last_remind", 0), ("ts", 0))
@@ -622,6 +623,203 @@ def domain_expiry(domain):
     return None
 
 
+HARD = ("DOWN", "FREEZE")  # данные не идут вовсе; при удушении эти два вида часто чередуются
+
+
+def same_trouble(status, cand, obs):
+    """Продолжает ли наблюдение obs серию кандидата cand. «Недоступен» и «душат» вперемешку — одна беда:
+    удушение то рвёт соединение, то пропускает 16–20 КБ, а тревога всё равно нужна. Остальные виды
+    склеивать нельзя: разовый сбой проверки плюс медленная закачка — ещё не повод для тревоги."""
+    if cand == obs:
+        return True
+    return status not in HARD and cand in HARD and obs in HARD
+
+
+BAD = HARD          # плохое состояние канала: не отвечает или душат — для общего сбоя многих каналов
+MASS_REPS = 2       # при общем сбое подробно разбираем столько каналов-представителей, а не каждый
+SERVICE_LIMIT = 170  # секунд живёт проход (TimeoutStartSec службы channel-watch в install.sh)
+SEND_RESERVE = 35    # секунд в конце прохода — на отправку в Telegram. Тревоги к ней уже в очереди и записаны
+#                      (state.json — до отправки): если отправку оборвут, они уйдут следующим проходом, а не пропадут
+DEEP_MIN = 20        # осталось на разбор меньше — не начинаем: успеет мало, а запросы к точкам и Globalping потратит
+DEEP_GRACE = 6       # сверх срока разбора ждём ещё столько: дописать узлы трассировки (blockwatch.DEEP_TAIL) и отдать
+
+
+def pick_reps(items, results, n=MASS_REPS):
+    """Представители общего сбоя для разбора: items — [(канал, состояние)], не больше n каналов.
+    Сначала каналы без expected_exit (у «Резерва» вход на самой rf1 — разбирать его с rf1 толку мало) и те, чей вход
+    не делят с живым каналом (results — итоги проверок прохода: такой вход точно открыт, сбой у канала нетипичный).
+    Входы у представителей разные; если есть и «недоступен», и «душат» — по одному на каждое состояние."""
+    live = {r[0].get("entry") for r in results if r[1]}
+    pool = [x for x in items if not x[0].get("expected_exit")] or list(items)
+    pool = sorted(pool, key=lambda x: x[0].get("entry") in live)  # sorted устойчив: порядок внутри сохраняется
+    out, entries = [], set()
+    kinds = {stt for _, stt in pool}
+    if len(kinds) > 1 and n >= 2:
+        for kind in ("DOWN", "FREEZE"):
+            ch = next((c for c, stt in pool if stt == kind), None)
+            if ch is not None:
+                out.append(ch)
+                entries.add(ch.get("entry"))
+    for ch, _ in pool:
+        if len(out) >= n:
+            break
+        if ch not in out and ch.get("entry") not in entries:
+            out.append(ch)
+            entries.add(ch.get("entry"))
+    return out[:n]
+
+
+MASS_FALLBACK = ("общая причина, а не поломка отдельных нод: сеть rf1 или массовая блокировка; с других точек "
+                 "проверить не успел — посмотрю при следующем напоминании")
+
+
+MASS_FALLBACK_RF1 = ("не работает ни один канал — первым делом похоже на сбой сети самой rf1 (или массовую "
+                     "блокировку); с других точек проверить не успел — посмотрю при следующем напоминании")
+RF1_BLIND = ("сбой сети самой rf1: не работает ни один канал, и с rf1 не достучаться ни до точек проверки, ни до "
+             "входов нод — это беда rf1, а не нод")
+
+
+def rf1_blind(d):
+    """По разбору: с rf1 вход не открылся, и ни одна спрошенная точка не ответила (не успевшие к сроку — не в счёт)."""
+    late = set(d.get("late") or ())
+    asked = {k: r for k, r in (d.get("agents") or {}).items() if k not in late}
+    return ((d.get("direct") or {}).get("tcp") != "open" and bool(asked)
+            and all(netprobe.probe_class(r) == "none" for r in asked.values()))
+
+
+def mass_verdict(deeps, reps, status_of, live=True):
+    """«Похоже на» для общего сбоя по разбору представителей. deeps — {имя: deep_diag}, reps — каналы-представители,
+    status_of(имя) — состояние канала, live — работает ли в этом проходе хоть один канал. Строка без разметки;
+    несколько разных выводов — строками «• A: …»."""
+    got = [(ch["name"], deeps[ch["name"]]) for ch in reps if deeps.get(ch["name"])]
+    if not got:
+        return MASS_FALLBACK if live else MASS_FALLBACK_RF1
+    if not live and all(rf1_blind(d) for _, d in got):
+        return RF1_BLIND   # иначе каждый представитель сказал бы «блокировка или поломка ноды, не различить»
+
+    def all_open(d):
+        points = {"rf1": netprobe.probe_class(d["direct"])}
+        points.update({k: netprobe.probe_class(r) for k, r in (d.get("agents") or {}).items()
+                       if k not in d.get("skip", ())})
+        answered = {k: v for k, v in points.items() if v != "none"}
+        if points["rf1"] != "ok" or any(v != "ok" for v in answered.values()):
+            return False
+        return not blockwatch.cert_verdict(answered, {"rf1": d["direct"], **(d.get("agents") or {})})
+    if all(status_of(name) == "DOWN" for name, _ in got) and all(all_open(d) for _, d in got):
+        return ("входы нод открываются со всех точек, включая rf1, а VPN не проходит сразу на многих каналах — общая "
+                "причина у сторожа или панели (служебный пользователь, новый конфиг от панели, клиент Xray на rf1), "
+                "а не блокировка адресов")
+    by = {}
+    for name, d in got:
+        by.setdefault(blockwatch.deep_verdict(d, status_of(name)), []).append(compact(name))
+    if len(by) == 1:
+        verdict, names = next(iter(by.items()))
+        return verdict + (f" (одинаково для {' и '.join(names)})" if len(names) > 1 else "")
+    return "\n".join(f"• {' и '.join(names)}: {verdict}" for verdict, names in by.items())
+
+
+def mass_text(kind, total, now, since, bad=(), earlier=(), more=(), more_since=None, back=(), still=(),
+              until=None, verdict=None, rep=None):
+    """Одно сообщение об общем сбое многих каналов. kind: new (начался), more (к нему добавился канал), remind (всё ещё
+    идёт), back (каналы вернулись). bad — [(имя, состояние)] всех неработающих каналов; earlier — имена из них, о
+    которых уже сообщали раньше; more — имена добавившихся (since у них — more_since); back — вернувшиеся, still — ещё
+    не работающие; until — когда вернулись; verdict — «похоже на» (mass_verdict); rep — (имя, строки deep_lines)
+    представителя. since — начало общего сбоя."""
+    def names(xs):
+        return html.escape(", ".join(compact(x) for x in xs))
+
+    def lines(skip=()):
+        down = [n for n, stt in bad if stt == "DOWN" and n not in skip]
+        frz = [n for n, stt in bad if stt == "FREEZE" and n not in skip]
+        out = ""
+        if down:
+            out += f"\n🔴 {'не отвечает' if len(down) == 1 else 'не отвечают'}: {names(down)}"
+        if frz:
+            out += f"\n🧊 душат (соединение есть, данные встают): {names(frz)}"
+        return out
+
+    def seems(head="<b>Похоже на:</b>"):
+        if not verdict:
+            return ""
+        v = html.escape(verdict)
+        return f"\n{head}" + (f"\n{v}" if v.startswith("•") else f" {v}.")
+    n = len(bad)
+    if kind == "new":
+        text = f"🔴 <b>Не работают сразу {plural(n, 'канал', 'канала', 'каналов')} из {total}</b>\nС {hm(since)} МСК."
+        text += lines(earlier)
+        if earlier:
+            text += f"\n<i>Ещё раньше {'перестал' if len(earlier) == 1 else 'перестали'} работать: {names(earlier)}.</i>"
+        if rep:
+            text += (f"\n\n<b>Откуда проверил</b> (вход канала {html.escape(compact(rep[0]))})\n"
+                     + html.escape("\n".join(rep[1])))
+        text += ("\n" + seems()) if verdict else ""
+        return text + ("\n<b>Для пользователей:</b> эти плитки не работают; балансиры AUTO и AUTO_LTE обходят "
+                       "недоступные ноды сами, пока есть живые.")
+    if kind == "more":
+        state = dict(bad)
+        frz = [x for x in more if state.get(x) == "FREEZE"]
+        if len(frz) == len(more):
+            head = "🧊 <b>Душат ещё и"
+        elif frz:
+            head = "🔴 <b>Не работают ещё и"   # одни не отвечают, других душат
+        else:
+            head = f"🔴 <b>{'Не отвечает' if len(more) == 1 else 'Не отвечают'} ещё и"
+        text = (f"{head}: {names(more)}</b> — с "
+                f"{hm(more_since or now)} МСК. Всего не работают {n} из {total}, общий сбой с {hm(since)}.")
+        return text + seems("Похоже на:")
+    if kind == "remind":
+        text = (f"⏳ <b>Сбой сразу у многих каналов продолжается: не работают {n} из {total}</b> — уже "
+                f"{dur(now - since)} (с {hm(since)} МСК).")
+        return text + lines() + seems("<b>Похоже на</b> (свежая проверка):")
+    until = until or now
+    span = f"Не работали с {hm(since)} до {hm(until)} МСК ({dur(until - since)})."
+    k, n_all = len(back), len(back) + len(still)
+    if not still:
+        if k == 1:
+            return f"✅ <b>Снова работает: {names(back)}</b> после общего сбоя.\n{span}"
+        if k == 2:
+            return f"✅ <b>Снова работают оба канала</b> после общего сбоя: {names(back)}.\n{span}"
+        return (f"✅ <b>Снова работают все {plural(k, 'канал', 'канала', 'каналов')}</b> после общего сбоя: "
+                f"{names(back)}.\n{span}")
+    head = f"Снова работает: {names(back)}" if k == 1 else f"Снова работают {k} из {n_all}"
+    return (f"✅ <b>{head}</b> после общего сбоя" + ("" if k == 1 else f": {names(back)}") + f".\n{span}\n"
+            f"Ещё не {'работает' if len(still) == 1 else 'работают'}: {names(still)}.")
+
+
+def deep_within(todo, via_for, agents, t_start):
+    """Разбор каналов todo (blockwatch.deep_many) в срок, который оставляет служба: SERVICE_LIMIT от старта прохода
+    t_start (monotonic) минус запас на отправку SEND_RESERVE. Срок уходит внутрь разбора: каждый канал отдаёт то, что
+    успел (без не успевших точек, без Globalping), а не всё или ничего. Осталось меньше DEEP_MIN — не начинаем.
+    Не успел или сорвался совсем — {}: сообщение уйдёт без разбора, а не потеряется вместе с проходом. Сколько заняли
+    проверки до разбора — в журнал: по нему видно, хватает ли срока."""
+    if not todo:
+        return {}
+    spent = time.monotonic() - t_start
+    left = SERVICE_LIMIT - SEND_RESERVE - spent
+    if left < DEEP_MIN:
+        log(f"проверки заняли {spent:.0f} с, на разбор осталось {max(0, left):.0f} с — не начинаю, сообщение без него")
+        return {}
+    log(f"проверки заняли {spent:.0f} с, на разбор — до {left:.0f} с")
+    t0 = time.monotonic()
+    try:
+        got = blockwatch.daemon_call(blockwatch.deep_many, todo, via_for, agents, DOMAINS,
+                                     t0 + left).result(timeout=left + DEEP_GRACE) or {}
+    except concurrent.futures.TimeoutError:
+        blockwatch.LINGER = True
+        log("разбор не успел за срок — сообщение без него")
+        return {}
+    except Exception as e:  # noqa: BLE001 — разбор не должен сорвать оповещение
+        log(f"разбор сорвался ({type(e).__name__}) — сообщение без него")
+        return {}
+    took = time.monotonic() - t0
+    lost = [short(c["name"]) for c in todo[:blockwatch.DEEP_MAX] if c["name"] not in got]
+    late = sorted({p for d in got.values() if d for p in d.get("late", ())})
+    log(f"разбор занял {took:.0f} с" + (f"; не успел совсем: {', '.join(lost)}" if lost else "")
+        + (f"; не успели точки: {', '.join(late)}" if late else "")
+        + ("; часть проверок не уложилась в срок" if blockwatch.LINGER else ""))
+    return got
+
+
 def classify(ch, deep_res):
     """deep_res — (сколько пришло, секунд, байт/с, адрес выхода) и, если скорость перепроверялась, пятым —
     результат закачки побольше (confirm_speed)."""
@@ -691,9 +889,9 @@ def others_line(ch, bad_now):
 
 
 def reason(d, bad_now, total):
-    if len(bad_now) >= max(3, (total + 1) // 2):
-        return ("не отвечает сразу несколько каналов — похоже на сбой сети в РФ или у самой rf1, "
-                "а не на поломку одной ноды")
+    if len(bad_now) >= crowd(total):
+        return ("не отвечает сразу несколько каналов — общая причина, а не поломка одной ноды: сеть rf1 или "
+                "массовая блокировка; проверить с других точек не удалось")
     if d["tcp"] == "open":
         if d["tls"] is False:
             return ("порт открыт, но TLS не отвечает — Xray на ноде завис, либо соединение рвут по пути "
@@ -745,8 +943,9 @@ def dur(seconds):
     return f"{d} д {h} ч"
 
 
-def alert_text(ch, s, was, was_since, diag, bad_now, total, deep=None):
-    """deep — разбор сбоя с нескольких точек (blockwatch.deep_diag); есть он — вывод берётся из него."""
+def alert_text(ch, s, was, was_since, diag, bad_now, total, deep=None, mixed=None):
+    """deep — разбор сбоя с нескольких точек (blockwatch.deep_diag); есть он — вывод берётся из него.
+    mixed — прошлый вид сбоя, если внутри серии «недоступен» и «душат» сменяли друг друга."""
     name, st, since = html.escape(short(ch["name"])), s["status"], hm(s["since"])
     if st == "OK":
         text = (f"✅ <b>Снова работает: {name}</b>\n{WAS[was]} {dur(s['since'] - was_since)} "
@@ -772,6 +971,8 @@ def alert_text(ch, s, was, was_since, diag, bad_now, total, deep=None):
     else:
         text = (f"🔀 <b>Не тот выход: {name}</b>\nС {since} МСК {html.escape(s['detail'])}. "
                 "Трафик выходит не через тот сервер, что задуман.")
+    if st in HARD and mixed in STILL:
+        text += f"\n<i>Проверки подряд: {STILL[mixed]}, потом {STILL[st]}.</i>"
     return text + (f"\n<i>До этого: {LABELS[was]}.</i>" if was != "OK" else "")
 
 
@@ -1027,7 +1228,8 @@ def init_state(st, now):
                  ("last_weekly", week_key(now)), ("nodes", {}), ("outside", {}), ("outside_ts", 0), ("disk_lvl", {}), ("speed_ts", 0),
                  ("lists", {}), ("dns", {}), ("dns_lvl", {}), ("dns_last", 0), ("dns_recheck", False), ("vantage", {}),
                  ("loss", {}), ("watch_slow", {"since": 0, "n": 0, "alerted": False}), ("dns_pt", {}),
-                 ("profiles", {}), ("geo", {}), ("vpn_pt", {}), ("vpn_alert", {})):
+                 ("profiles", {}), ("geo", {}), ("vpn_pt", {}), ("vpn_alert", {}),
+                 ("mass_hold", [])):  # тревоги общего сбоя, отложенные на один проход: {"name", "status", "was", "was_since"}
         st.setdefault(k, v)
     for s in st["channels"].values():
         init_channel(s, now)
@@ -1176,6 +1378,7 @@ def quality_alert(ch, kind, event, q, value, high, total, now, win=()):
 
 
 def main():
+    t_start = time.monotonic()  # от него считается срок разбора (SERVICE_LIMIT); time.time тесты подменяют
     cfg = json.load(open(os.path.join(ETC, "channels.json"), encoding="utf-8"))
     os.makedirs(os.path.dirname(STATE), exist_ok=True)
     now = time.time()
@@ -1294,6 +1497,13 @@ def main():
         for point, pr in sorted(sp.get("by", {}).items()):
             log("профиль " + blockwatch.profile_text(point, pr))
     sv = side.get("vpn") or {}
+    if not blockwatch.vpn_points(agents):
+        # VPN-точек больше нет — служба их не обходит, старый обход не показываем (иначе строка о старых данных
+        # висела бы вечно); свежий последний обход ещё доживает свой срок
+        if blockwatch.side_age(sv, blockwatch.VPN_STALE, now) is not None:
+            sv = {}
+        if blockwatch.side_age(st["vpn_pt"], blockwatch.VPN_STALE, now) is not None:
+            st["vpn_pt"] = {}
     if sv.get("ts", 0) > (st["vpn_pt"].get("ts") or 0):
         st["vpn_pt"] = sv
         alerts += blockwatch.vpn_step(st, sv.get("by", {}),
@@ -1462,6 +1672,7 @@ def main():
 
     q_events = []
     deferred = []  # сообщения о каналах дописываются после разбора сбоя: (место в alerts, вид, канал, параметры)
+    mixed = {}  # канал → прошлый вид сбоя внутри серии «недоступен»/«душат» — только для текста тревоги
     for ch, alive, code, lat, conn, deep_res, diag, svc, _ in results:
         s = st["channels"][ch["name"]]
         hr = s["hr"]
@@ -1500,11 +1711,19 @@ def main():
         if obs == s["status"]:
             s["cand"], s["streak"], s["detail"] = obs, 0, detail
         else:
-            if s["cand"] == obs:
-                s["streak"] += 1
+            prev = s["cand"]
+            if prev != s["status"] and same_trouble(s["status"], prev, obs):
+                s["cand"], s["streak"] = obs, s["streak"] + 1  # cand_since — с первого плохого наблюдения серии
+                if prev != obs:
+                    s["cand_mix"] = True
             else:
-                s["cand"], s["streak"], s["cand_since"] = obs, 1, now
-            if s["streak"] >= CONFIRM:
+                s["cand"], s["streak"], s["cand_since"], s["cand_mix"] = obs, 1, now, False
+            # серия вперемешку («недоступен», потом «душат») подтверждается на проверку позже: «душат» решает одна
+            # закачка, и разовый сбой проверки плюс одна вставшая закачка тревогой быть не должны
+            if s["streak"] >= CONFIRM + (1 if s.get("cand_mix") else 0):
+                if s.get("cand_mix"):
+                    mixed[ch["name"]] = next(k for k in HARD if k != obs)  # вид сбоя менялся внутри серии
+                s["cand_mix"] = False
                 was, was_since = s["status"], s["since"]
                 s["status"], s["since"], s["detail"], s["streak"] = obs, s["cand_since"], detail, 0
                 s["last_remind"] = now
@@ -1531,16 +1750,114 @@ def main():
                     elif quality_calm(s["q_" + kind], now):
                         q_events.append((ch, kind, "calm", value))
         note = "" if not alive or deep_res is not None else " (прошлый замер)"
+        if ch["name"] in mixed:
+            note += f" | серия {mixed[ch['name']]}→{obs}"
         log(f"{short(ch['name'])}: {'жив' if alive else 'НЕТ'} | вижу {obs} | состояние {s['status']} | {detail}{note}")
+    # общий сбой многих каналов сразу: одно сводное сообщение вместо тревоги на каждый канал.
+    # Сначала — тревоги, отложенные прошлым проходом (если состояние канала с тех пор не сменилось)
+    by_name = {c["name"]: c for c in chans}
+    diag_of = {r[0]["name"]: r[6] for r in results}
+    held = set()  # отложенные уже раз — второй раз не откладываем
+    for h in st["mass_hold"]:
+        ch = by_name.get(h.get("name")) if isinstance(h, dict) else None
+        if ch is None:
+            continue
+        if st["channels"][ch["name"]]["status"] != h.get("status"):
+            # состояние успело смениться — о новом скажет своя тревога этого прохода, отложенная уже не правда
+            log(f"{short(ch['name'])}: отложенная тревога ({h.get('status')}) снята — состояние уже "
+                f"{st['channels'][ch['name']]['status']}")
+            continue
+        s = st["channels"][ch["name"]]
+        if h.get("mixed"):
+            mixed[ch["name"]] = h["mixed"]   # строка «проверки подряд: …» не теряется из-за откладывания
+        alerts.append(None)
+        deferred.append((len(alerts) - 1, "alert", ch, (s, h.get("was", "OK"), h.get("was_since", s["since"]),
+                                                       diag_of.get(ch["name"]))))
+        held.add(ch["name"])
+    st["mass_hold"] = []
+    many = crowd(len(chans))
+
+    def chs():
+        return [(c, st["channels"][c["name"]]) for c in chans]
+
+    def counts():
+        """Все неработающие каналы и те из них, что в общем сбое (эпизод идёт, если таких хотя бы два)."""
+        return ([c for c, s in chs() if s["status"] in BAD], [c for c, s in chs() if s["status"] in BAD and s["mass"]])
+
+    def kind_of(d):
+        """Вид сообщения о канале для общего сбоя: bad (новая беда), shift (канал уже в общем сбое — например,
+        «недоступен» сменилось на «душат»), back (вернулся после общего сбоя), remind; None — не про общий сбой."""
+        _, what, ch, args = d
+        s = st["channels"][ch["name"]]
+        if what == "alert" and s["status"] in BAD:
+            return "shift" if s["mass"] else "bad"
+        if what == "alert" and s["status"] == "OK" and args[1] in BAD and s["mass"]:
+            return "back"
+        if what == "remind" and s["status"] in BAD:
+            return "remind"
+        return None
+    bad_all, ep = counts()
+    # ещё не подтверждённые: каналы, которые в этом проходе уже не работали, но состояние пока прежнее
+    pending = [c for c, s in chs() if s["cand"] in BAD and s["status"] not in BAD and s["streak"] >= 1]
+    back_wait = [c for c, s in chs() if s["mass"] and s["status"] in BAD and s["cand"] == "OK" and s["streak"] >= 1]
+    if not held:
+        # расхождение на проход: у одних каналов сбой подтвердился, у других — ещё нет. Сообщение — следующим
+        # проходом, одно на всех. Откладываем один раз и только на один проход
+        for kind, wait, enough in (("bad", pending, len(bad_all) + len(pending) >= many or len(ep) >= 2),
+                                   ("back", back_wait, True)):
+            items = [d for d in deferred if kind_of(d) == kind]
+            if not (items and wait and enough):
+                continue
+            for idx, _, ch, args in items:
+                st["mass_hold"].append({"name": ch["name"], "status": st["channels"][ch["name"]]["status"],
+                                        "was": args[1], "was_since": args[2]}
+                                       | ({"mixed": mixed[ch["name"]]} if ch["name"] in mixed else {}))
+                alerts[idx] = ""
+            deferred = [d for d in deferred if d not in items]
+            log(f"общий сбой: жду подтверждения ещё у {plural(len(wait), 'канала', 'каналов', 'каналов')} — сообщение "
+                f"следующим проходом ({', '.join(short(ch['name']) for _, _, ch, _ in items)})")
+        bad_all, ep = counts()
+    episode = len(ep) >= 2
+    m_new, m_more, m_remind, m_back, m_shift = [], [], [], [], []
+    for d in deferred:
+        kind, s = kind_of(d), st["channels"][d[2]["name"]]
+        if kind == "bad" and episode:
+            m_more.append(d)
+        elif kind == "bad" and len(bad_all) >= many:
+            m_new.append(d)
+        elif kind == "shift" and episode:
+            m_shift.append(d)
+        elif kind == "remind" and ((episode and s["mass"]) or (not episode and len(bad_all) >= many)):
+            m_remind.append(d)  # без эпизода — состояние от прежней версии сторожа: эпизод начнётся с напоминания
+        elif kind == "back":
+            m_back.append(d)
+    m_cover = []
+    if m_new:
+        # напоминание о канале, который лёг раньше, в том же проходе, где начался общий сбой, — лишнее: новое
+        # сообщение называет его в «Ещё раньше перестал работать», второе сводное рядом не нужно
+        names_bad = {c["name"] for c in bad_all}
+        m_cover = [d for d in m_remind if d[2]["name"] in names_bad]
+        m_remind = [d for d in m_remind if d not in m_cover]
+    grouped = m_new + m_cover + m_more + m_remind + m_back + m_shift
     # разбор сбоя: вход канала — напрямую с rf1, с других российских точек, из-за рубежа и трассировкой.
-    # Когда лежит сразу много каналов, дело не в одной ноде — тогда не разбираем.
-    many = len(bad_now) >= max(3, (len(chans) + 1) // 2)
-    todo = [ch for _, _, ch, _ in deferred if st["channels"][ch["name"]]["status"] in ("DOWN", "FREEZE")]
+    # При общем сбое разбираем только представителей (pick_reps), а не каждый канал
+    if m_new:
+        fresh = [d[2]["name"] for d in m_new]
+        pool = [by_name[n] for n in fresh] + [c for c in bad_all if c["name"] not in fresh]
+    else:
+        pool = (ep if episode else bad_all) if m_remind else []
+    reps = pick_reps([(c, st["channels"][c["name"]]["status"]) for c in pool], results) if pool else []
+    todo = reps + [ch for _, _, ch, _ in m_more] + [ch for d in deferred for ch in [d[2]] if d not in grouped
+                                                     and st["channels"][ch["name"]]["status"] in BAD]
+    todo = list({c["name"]: c for c in todo}.values())  # без повторов, порядок сохраняется; обрезка — в deep_many
 
     def via_for(ch):
-        return next(({"name": compact(r[0]["name"]), "port": r[0]["port"]} for r in results
-                     if r[1] and not r[0].get("expected_exit") and r[0].get("entry") != ch.get("entry")), None)
-    deeps = blockwatch.deep_many(todo, via_for, agents, DOMAINS) if todo and not many else {}
+        # из-за рубежа сверяем через два живых чужих канала с разными входами и выходами (см. blockwatch.abroad_vias)
+        cands = [{"name": compact(r[0]["name"]), "port": r[0]["port"], "entry": r[0].get("entry"), "key": r[0]["name"]}
+                 for r in results if r[1] and not r[0].get("expected_exit")]
+        exits = {c["name"]: st["channels"].get(c["name"], {}).get("exit") for c in chans}
+        return blockwatch.abroad_vias(cands, ch, exits)
+    deeps = deep_within(todo, via_for, agents, t_start)
     # «медленно», «снова работает» после «медленно» и «всё ещё медленно» сразу у многих каналов — одним сообщением
     groups = {"new": [], "back": [], "remind": []}
     for d in deferred:
@@ -1561,23 +1878,99 @@ def main():
                 alerts[idx] = ""
             deferred = [d for d in deferred if d not in items]
             log(f"одним сообщением ({kind}): " + ", ".join(short(ch["name"]) for _, _, ch, _ in items))
+    # устаревший профиль (служба --side давно не собирала) в разбор не идёт: «за фильтром» могло уже измениться
+    fresh_prof = blockwatch.side_age(st.get("profiles") or {}, blockwatch.PROFILE_STALE, now) is None
     filt = sorted(p for p, pr in ((st.get("profiles") or {}).get("by") or {}).items()
-                  if blockwatch.profile_verdict(pr) == "filtered")
+                  if blockwatch.profile_verdict(pr) == "filtered") if fresh_prof else []
     for d in deeps.values():
         d["skip"] = st["loss"].get("skip", [])  # точки с собственной бедой сети в выводе не учитываются
         d["filtered"] = filt
+    # общий сбой: первый в группе получает сводный текст, остальные — пустые
+    total = len(chans)
+
+    def status_of(name):
+        return st["channels"][name]["status"]
+
+    def pairs(cs):
+        return [(c["name"], status_of(c["name"])) for c in cs]
+
+    live = any(r[1] for r in results)   # хоть один канал в этом проходе работает (иначе первым делом — сеть rf1)
+
+    def put(kind, items, text):
+        nonlocal deferred
+        alerts[items[0][0]] = text
+        for idx, _, _, _ in items[1:]:
+            alerts[idx] = ""
+        deferred = [d for d in deferred if d not in items]
+        log(f"общий сбой ({kind}): " + ", ".join(short(ch["name"]) for _, _, ch, _ in items))
+    if reps and (m_new or m_remind):
+        log("общий сбой: представители — " + ", ".join(short(c["name"]) for c in reps)
+            + ("" if deeps else " (разбора нет)"))
+    if m_new:
+        fresh = [d[2]["name"] for d in m_new]
+        since = min(st["channels"][n]["since"] for n in fresh)
+        for c in bad_all:
+            st["channels"][c["name"]].update(mass=since, last_remind=now)
+        rep = next(((c["name"], blockwatch.deep_lines(deeps[c["name"]], extra=False)) for c in reps if deeps.get(c["name"])),
+                   None)
+        put("new", m_new + m_cover, mass_text("new", total, now, since, bad=pairs(bad_all),
+                                              earlier=[c["name"] for c in bad_all if c["name"] not in fresh],
+                                              verdict=mass_verdict(deeps, reps, status_of, live), rep=rep))
+    if m_more:
+        since = min((st["channels"][c["name"]]["mass"] for c in ep), default=now)
+        names = [d[2]["name"] for d in m_more]
+        for n in names:
+            st["channels"][n]["mass"] = since
+        own = next((blockwatch.deep_verdict(deeps[n], status_of(n)) for n in names if deeps.get(n)), None)
+        put("more", m_more, mass_text("more", total, now, since, bad=pairs(bad_all), more=names,
+                                      more_since=min(st["channels"][n]["since"] for n in names), verdict=own))
+    if m_remind:
+        crowd_ep = ep if episode else bad_all
+        if episode:
+            since = min(st["channels"][c["name"]]["mass"] for c in crowd_ep)
+        else:
+            since = min(st["channels"][c["name"]]["since"] for c in crowd_ep)
+        for c in crowd_ep:  # напоминания всех каналов сбоя — одно на всех и в одно время
+            st["channels"][c["name"]].update(mass=since, last_remind=now)
+        put("remind", m_remind, mass_text("remind", total, now, since, bad=pairs(crowd_ep),
+                                          verdict=mass_verdict(deeps, reps, status_of, live)))
+    if m_shift:
+        for idx, _, _, _ in m_shift:
+            alerts[idx] = ""
+        deferred = [d for d in deferred if d not in m_shift]
+        log("общий сбой: вид сбоя сменился, канал уже в общем сообщении — " + ", ".join(
+            f"{short(ch['name'])} ({status_of(ch['name'])})" for _, _, ch, _ in m_shift))
+    if m_back:
+        names = [d[2]["name"] for d in m_back]
+        # начало — по самому раннему: канал, легший до общего сбоя, не работал с собственного «с» (was_since), а не
+        # с начала общего сбоя (mass)
+        since = min(min(st["channels"][d[2]["name"]]["mass"], d[3][2] or now) for d in m_back)
+        until = max(st["channels"][n]["since"] for n in names)
+        still = [c["name"] for c in ep if c["name"] not in names]
+        put("back", m_back, mass_text("back", total, now, since, back=names, still=still, until=until))
     for idx, what, ch, args in deferred:
         deep_d = deeps.get(ch["name"])
         if what == "alert":
             s, was, was_since, diag = args
-            alerts[idx] = alert_text(ch, s, was, was_since, diag, bad_now, len(chans), deep_d)
+            alerts[idx] = alert_text(ch, s, was, was_since, diag, bad_now, len(chans), deep_d, mixed.get(ch["name"]))
         else:
             s, diag = args
             alerts[idx] = remind_text(ch, s, diag, bad_now, len(chans), now, deep_d)
-        if deep_d:
+    for name, deep_d in deeps.items():  # разбор каждого канала — в журнал, и в общем сбое тоже
+        if name in st["channels"] and deep_d:
             note = blockwatch.name_note(deep_d)
-            log(f"{short(ch['name'])}: разбор — " + "; ".join(x.lstrip("• ") for x in blockwatch.deep_lines(deep_d, extra=True))
-                + " => " + blockwatch.deep_verdict(deep_d, st["channels"][ch["name"]]["status"]) + (f" | {note}" if note else ""))
+            log(f"{short(name)}: разбор — " + "; ".join(x.lstrip("• ") for x in blockwatch.deep_lines(deep_d, extra=True))
+                + " => " + blockwatch.deep_verdict(deep_d, st["channels"][name]["status"]) + (f" | {note}" if note else ""))
+    # общий сбой: вернувшийся канал из него выходит (отложенные «снова работает» — после следующего прохода);
+    # осталось в нём меньше двух каналов — сбой уже не общий, дальше каждый канал живёт по одиночным правилам
+    keep = {h["name"] for h in st["mass_hold"] if h["status"] not in BAD}
+    for c, s in chs():
+        if s["status"] not in BAD and c["name"] not in keep:
+            s["mass"] = 0
+    left = [s for _, s in chs() if s["mass"]]
+    if len(left) < 2:
+        for s in left:
+            s["mass"] = 0
     for ch, kind, event, value in q_events:
         s = st["channels"][ch["name"]]
         q = s["q_" + kind]
@@ -1600,6 +1993,7 @@ def main():
     for i in range(0, len(alerts), 4):
         queue.append(alerts[i:i + 4])
     del queue[:-20]
+    save_state(st)  # тревоги уже в очереди: если проход убьют во время отправки, будет дубль, а не тишина
     while queue:
         item = queue[0]
         text = TG_HEAD + "\n\n".join(item) if isinstance(item, list) else str(item)
@@ -1734,6 +2128,16 @@ def week_changes(name, a, b):
     return f"{compact(name)} — " + ", ".join(out) if out else None
 
 
+def outside_report(st, now):
+    """Строка «Снаружи» для отчёта и недельной сводки. Снимок старше OUTSIDE_STALE — не данные: служба --side давно
+    не смотрела. outside_ts=0 — срок неизвестен, пометки нет."""
+    if st.get("outside"):
+        h = blockwatch.side_age({"ts": st.get("outside_ts")}, blockwatch.OUTSIDE_STALE, now)
+        if h is not None:
+            return f"<b>Снаружи:</b> ⚠️ данные не обновлялись {h} ч (служба channel-watch-side)"
+    return nodewatch.outside_line(st.get("outside") or {}, len(st.get("nodes") or {}))
+
+
 def week_span(now):
     """Семь полных суток по московскому времени до последней полуночи: (начало, конец). В понедельник это прошлая неделя."""
     shift = MSK.utcoffset(None).total_seconds()
@@ -1770,10 +2174,10 @@ def weekly_text(st, hist, now):
     iso = lambda ts: f"{dt.datetime.fromtimestamp(ts, MSK):%Y-%m-%d}"
     out += nodewatch.servers_block(st["nodes"], now)
     out += nodewatch.scan_block(st["nodes"], iso(start), iso(end))
-    seen = nodewatch.outside_line(st["outside"], len(st["nodes"]))
+    seen = outside_report(st, now)
     if seen:
         out += ["", seen]
-    out += blockwatch.geo_week(st)
+    out += blockwatch.geo_week(st, now)
     out += blockwatch.week_lines(st)
 
     # как менялись скорость и пинг: к прошлой неделе, а пока её нет — от первой половины этой недели ко второй
@@ -1859,7 +2263,7 @@ def report_text(st, now, sub=None, changes=()):
 
     # серверы: маячки, взгляд снаружи, DDoS и нагрузка
     servers = []
-    for line in (nodewatch.servers_line(st["nodes"], now), nodewatch.outside_line(st["outside"], len(st["nodes"]))):
+    for line in (nodewatch.servers_line(st["nodes"], now), outside_report(st, now)):
         if not line:
             continue
         if _is_issue(line):
@@ -2100,7 +2504,9 @@ if __name__ == "__main__":
         for node, pts in sorted(result["nodes"].items()):
             print(f"  {node}: " + "; ".join(
                 f"{point} — " + ("нет ответа" if not r else f"не прошло {r['fail']} из {r['n']}"
-                                 + (f" ({blockwatch.witness_text(r, r['wit'])})" if r.get("wit") and r["fail"] else ""))
+                                 + (f", сброшено {r['refused']}" if r.get("refused") else "")
+                                 + (f" ({blockwatch.witness_text(r, r['wit'])})"
+                                    if r.get("wit") and blockwatch.witness_text(r, r["wit"]) else ""))
                 for point, r in pts.items()))
     elif "--side" in sys.argv:
         # профиль точек (раз в 6 ч) и гео нод (раз в 12 ч) — долгие сборы вне основного прохода; таймер раз в час
@@ -2169,3 +2575,9 @@ if __name__ == "__main__":
     else:
         main()
         beat()
+        if blockwatch.LINGER:
+            # разбор обрезан по сроку, а его потоки ещё ждут ответов точек: состояние записано, тревоги отправлены —
+            # выходим, не дожидаясь их, иначе служба висела бы до TimeoutStartSec и её убил бы systemd
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(0)

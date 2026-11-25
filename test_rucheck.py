@@ -105,6 +105,10 @@ class Net:
         return self.tls
 
     def get(self, ip, host, timeout):
+        # http — один ответ или список: отдаются по очереди, последний повторяется
+        self.gets = getattr(self, "gets", 0) + 1
+        if isinstance(self.http, list):
+            return self.http[min(self.gets, len(self.http)) - 1]
         return self.http
 
 
@@ -187,4 +191,165 @@ check(any("не ответила" in p for p in rc.items(st3)) and any(p.startsw
 st4 = {}
 rc.step(st4, r1)
 check(any(p.startswith("с точки «Точка Б» закрыто 1 из 1") for p in rc.items(st4)), "R35 в отчёте — точка, с которой проверено")
+
+# --- «душат»: TLS прошёл, ответ встал или оборвался на первых КБ
+def P(http):
+    n = Net(http=http)
+    return rc.probe_service("svc.example", net=n), n
+
+
+H200 = b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n"
+cut18 = (200, H200 + b"x" * (18 * 1024 - len(H200)), "timeout")
+r, n = P(cut18)
+check(r["verdict"] == "THROTTLE" and r["kb"] == 18 and rc.blocked(r["verdict"]) and n.gets == 2,
+      "R36 200 без длины, обрыв на ~18 КБ дважды — THROTTLE, kb, это блокировка")
+r, n = P([cut18, (200, H200 + b"x" * 30000, "reset")])
+check(r["verdict"] == "OK" and n.gets == 2, "R37 на повторе встал уже после предела — не «душат»")
+r, n = P([cut18, (200, H200 + b"x" * 20000, "timeout")])
+check(r["verdict"] == "THROTTLE" and r["kb"] == 19, "R36 kb — больший из двух ответов, целые КБ")
+short_rst = (200, H200 + b"<html>short page</html>", "reset")
+r, n = P(short_rst)
+check(r["verdict"] == "OK" and n.gets == 1 and not rc._stalled(short_rst),
+      "R36a короткий ответ без длины и chunked, сразу за ним сброс (или EOF без close_notify) — ответ кончился, OK")
+r, n = P((200, b"HTTP/1.1 200 OK\r\nContent-Ty", "reset"))
+check(r["verdict"] == "THROTTLE", "R36b оборвался на заголовке дважды — THROTTLE")
+chu = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n4000\r\n" + b"q" * 9000
+r, n = P((200, chu, "reset"))
+check(r["verdict"] == "THROTTLE", "R36c chunked не дошёл до последнего куска, обрыв дважды — THROTTLE")
+full = (200, b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nhello", "ok")
+r, n = P([cut18, full])
+check(r["verdict"] == "OK" and n.gets == 2 and "kb" not in r, "R37 на повторе полный ответ — OK")
+r, n = P((None, b"", "timeout"))
+check(r["verdict"] == "DOWN" and not rc.blocked(r["verdict"]) and n.gets == 1,
+      "R38 запрос ушёл, в ответ ни байта — DOWN, не блокировка")
+st5 = {}
+rc.step(st5, {"ts": 1, "services": {"vk.com": dict(r, local=True)}, "mismatch": []})
+check(st5["rucheck"]["local_down"] == ["vk.com"], "R38 российский с таким исходом — в «не открылись»")
+r, n = P((301, b"HTTP/1.1 301 Moved\r\nLocation: /x\r\nContent-Length: 0\r\n\r\n", "timeout"))
+check(r["verdict"] == "OK" and n.gets == 1 and r["code"] == 301, "R39 301 с Content-Length: 0 и тишина после — OK, без повтора")
+cl = b"HTTP/1.1 200 OK\r\nContent-Length: 50000\r\n\r\n"
+r, n = P((200, cl + b"y" * (15 * 1024), "reset"))
+check(r["verdict"] == "THROTTLE" and r["kb"] == 15, "R40 Content-Length больше полученного, обрыв дважды — THROTTLE")
+ch = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n"
+r, n = P((200, ch, "reset"))
+check(r["verdict"] == "OK" and n.gets == 1, "R41 chunked с последним куском и обрыв — ответ кончился, OK")
+r, n = P((200, H200 + b"z" * (30 * 1024), "timeout"))
+check(r["verdict"] == "OK" and n.gets == 1, "R42 встал после 30 КБ — дальше предела, OK")
+stub = (200, H200 + "<p>Доступ к ресурсу ограничен</p>".encode(), "timeout")
+r, n = P(stub)
+check(r["verdict"] == "HTTP_STUB" and n.gets == 1, "R43 обрыв, но в ответе заглушка — HTTP_STUB без повтора")
+r, n = P([cut18, stub])
+check(r["verdict"] == "HTTP_STUB" and n.gets == 2, "R43 заглушка в повторе — HTTP_STUB")
+check(V(http=(200, H200 + b"x" * 100)) == "OK" and V(http=(None, b"")) == "OK",
+      "R44 старая подмена (код, данные) — как раньше")
+r, n = P((None, b"", "noconn"))
+check(r["verdict"] == "OK" and n.gets == 1, "R45 не подключились заново (рукопожатие только что прошло) — OK")
+eh = b"HTTP/1.1 103 Early Hints\r\nLink: </a.css>; rel=preload\r\n\r\n" + H200 + b"x" * 10000
+r, n = P((103, eh, "timeout"))
+check(r["verdict"] == "THROTTLE" and not rc._complete(b"HTTP/1.1 100 Continue\r\n\r\n")
+      and rc._head(eh)[0] == 200, "R46 103 Early Hints пропускается, судим по 200 без длины — THROTTLE")
+check(rc.verdict_ru("THROTTLE", 18) == "душат: данные встают после 18 КБ"
+      and rc.verdict_ru("THROTTLE") == rc.VERDICT_RU["THROTTLE"] and rc.verdict_ru("XYZ") == "XYZ",
+      "R46 вердикт по-русски с КБ и без")
+mm = rc.compare([dict(cfg, remarks="A")], {"web.wechat.com": {"verdict": "THROTTLE", "kb": 18},
+                                              "site.su": {"verdict": "TLS_BLOCK"}}, geo, resolve=lambda h: [])["mismatch"]
+check({"template": "A", "host": "web.wechat.com", "verdict": "THROTTLE", "kb": 18} in mm
+      and {"template": "A", "host": "site.su", "verdict": "TLS_BLOCK"} in mm, "R47 compare кладёт kb, только если оно есть")
+thr = [{"template": "A", "host": "web.wechat.com", "verdict": "THROTTLE", "kb": 18}]
+sv = {"web.wechat.com": {"verdict": "THROTTLE", "kb": 18}, "vk.com": {"verdict": "OK", "local": True}}
+st6 = {}
+b1 = rc.step(st6, {"ts": 1, "services": sv, "mismatch": thr})
+check(b1 == [] and st6["rucheck"]["pending"] == ["A|web.wechat.com"] and st6["rucheck"]["mismatch"] == []
+      and "web.wechat.com" in st6["rucheck"]["closed"], "R48 первый проход «душат» — без тревоги, ключ ждёт")
+b2 = rc.step(st6, {"ts": 2, "services": sv, "mismatch": thr})
+check(len(b2) == 1 and "душат" in b2[0] and "18 КБ" in b2[0] and st6["rucheck"]["pending"] == [],
+      "R48 второй проход подряд — одна тревога «душат», после скольких КБ")
+check(rc.step(st6, {"ts": 3, "services": sv, "mismatch": thr}) == [], "R48 третий проход с тем же — без повтора")
+b4 = rc.step(st6, {"ts": 4, "services": {}, "mismatch": []})
+check(len(b4) == 1 and "✅" in b4[0], "R48 расхождение ушло — сообщение о норме")
+thr_nokb = [dict(thr[0], kb=None)]
+st6b = {}
+rc.step(st6b, {"ts": 1, "services": sv, "mismatch": thr_nokb})
+b = rc.step(st6b, {"ts": 2, "services": sv, "mismatch": thr_nokb})
+check(len(b) == 1 and "на середине ответа" in b[0], "R48 без kb — «данные встают на середине ответа»")
+st7 = {}
+seq = [thr, [], thr, [], thr]
+got7 = [rc.step(st7, {"ts": i + 1, "services": {}, "mismatch": m}) for i, m in enumerate(seq)]
+check(all(g == [] for g in got7), "R49 «душат» появился и пропал — ни тревоги, ни «✅»; чередование тревоги не даёт")
+st8 = {"rucheck": {"ts": 1, "mismatch": [{"template": "A", "host": "web.wechat.com", "verdict": "TLS_BLOCK"}]}}
+check(rc.step(st8, {"ts": 2, "services": {}, "mismatch": thr}) == [] and st8["rucheck"]["mismatch"][0]["verdict"] == "THROTTLE",
+      "R49 был TLS_BLOCK, стал «душат» — новой тревоги нет")
+st9 = {"rucheck": {"ts": 1, "mismatch": [], "closed": [], "total": 1}}
+b9 = rc.step(st9, {"ts": 2, "services": {}, "mismatch": [{"template": "A", "host": "x.com", "verdict": "TLS_BLOCK"}]})
+check(len(b9) == 1 and "закрыт" in b9[0] and "рвут TLS" in b9[0], "R50 старое состояние без pending — TLS_BLOCK тревожит сразу")
+st10 = {}
+rc.step(st10, {"ts": 1, "services": {"web.wechat.com": {"verdict": "THROTTLE", "kb": 18}, "x.com": {"verdict": "OK"},
+                                    "vk.com": {"verdict": "THROTTLE", "local": True}}, "mismatch": []})
+p10 = rc.items(st10)
+check(any("закрыто 1 из 2 зарубежных" in p for p in p10)
+      and any(p == "из них душат (обрыв на середине ответа): web.wechat.com" for p in p10),
+      "R51 в отчёте «душат» — отдельной частью, российские туда не входят")
+
+
+# --- LiveNet.get на поддельном сокете
+class FakeSock:
+    def __init__(self, script):
+        self.script, self.closed, self.sent = list(script), False, b""
+
+    def settimeout(self, t):
+        self.t = t
+
+    def sendall(self, b):
+        self.sent += b
+
+    def recv(self, n):
+        x = self.script.pop(0) if self.script else b""
+        if isinstance(x, BaseException):
+            raise x
+        if callable(x):
+            return x()
+        return x
+
+    def close(self):
+        self.closed = True
+
+
+def live(script, timeout=6, fail=None):
+    ln = rc.LiveNet()
+    sock = FakeSock(script)
+
+    def tls(ip, host, t):
+        if fail:
+            raise fail
+        return sock
+    ln._tls = tls
+    return ln.get("192.0.2.1", "svc.example", timeout), sock
+
+
+g, s = live([H200, b"a" * 5000, rc.socket.timeout()])
+check(g[0] == 200 and g[1] == H200 + b"a" * 5000 and g[2] == "timeout" and s.closed, "R52 куски, потом тишина — байты целы, timeout")
+g, s = live([H200, b"a" * 5000, ConnectionResetError()])
+check(g[1].endswith(b"a" * 5000) and g[2] == "reset" and s.closed, "R52 куски, потом сброс — reset")
+g, s = live([rc.ssl.SSLError("bad record")])
+check(g == (None, b"", "reset") and s.closed, "R52 ошибка TLS при чтении — reset")
+g, s = live([H200, b"b" * 10])
+check(g[2] == "ok" and g[0] == 200 and s.closed, "R52 сервер закрыл соединение — ok")
+g, s = live([], fail=OSError("нет связи"))
+check(g == (None, b"", "noconn"), "R52 не подключились — noconn")
+import time as _t  # noqa: E402
+drip = [(lambda: (_t.sleep(0.05), b"c")[1])] * 1000
+t0 = _t.monotonic()
+g, s = live([H200] + drip, timeout=0.2)
+took = _t.monotonic() - t0
+check(g[2] == "timeout" and took < 0.6 + 0.3 and len(g[1]) > len(H200) and s.closed,
+      "R52 сервер шлёт по капле — общий предел 3×timeout, timeout (%.2f с)" % took)
+check(rc._complete(b"HTTP/1.1 204 No Content\r\n\r\n") and rc._complete(b"HTTP/1.1 304 Not Modified\r\nX: 1\r\n\r\n")
+      and not rc._complete(b"HTTP/1.1 200 OK\r\nContent-Length: 10\r\n\r\nabc") and not rc._complete(b"HTTP/1.1 200 OK\r\n"),
+      "R52 ответ кончился: 204/304, Content-Length; заголовок не целиком — нет")
+st9 = {}
+rc.step(st9, {"ts": 1, "services": {"web.wechat.com": {"verdict": "THROTTLE", "kb": 18}, "x.com": {"verdict": "THROTTLE"}},
+              "mismatch": [{"template": "A", "host": "web.wechat.com", "verdict": "THROTTLE", "kb": 18}]})
+line9 = next(p for p in rc.items(st9) if p.startswith("из них душат"))
+check("web.wechat.com (ждёт подтверждения)" in line9 and "x.com (ждёт" not in line9 and "x.com" in line9,
+      "R53 в отчёте «душат», ещё ждущее подтверждения, помечено")
 print("rucheck: тестов пройдено %d" % ok)

@@ -44,7 +44,7 @@ real_dns_check, real_deep_many, real_health = blockwatch.dns_check, blockwatch.d
 blockwatch.dns_check = lambda names, port, agents=(): {}
 real_dns_run, real_dns_own = probe.dns_check, probe.dns_check_own
 probe.dns_check = lambda names, port, agents=(): {}
-blockwatch.deep_many = lambda chans, via_for, agents, bases: {}
+blockwatch.deep_many = lambda chans, via_for, agents, bases, deadline=None: {}
 blockwatch.agents_health = lambda agents: {}
 # сводку за неделю в общих сценариях не шлём (проверяется отдельно, в разделе W)
 real_weekly, probe.weekly_text = probe.weekly_text, lambda st, hist, now: None
@@ -267,6 +267,103 @@ world["deep"].pop(21007)
 for _ in range(7):
     step()
 
+# DM. канал мечется между «недоступен» и «душат» — это одна беда, тревога нужна
+FREEZE_DEEP = (20_000, 20.0, 1000.0, "")
+SLOW512 = (300_000, 20.0, 15_000.0, "1.1.1.1")   # 512 КБ не докачались — «медленно» без перепроверки (C8)
+
+
+def back_ok(what):
+    """Вернуть Poland в норму: убрать поломки и прогнать проверки; канал в «душат» перепроверяется плановой закачкой."""
+    world["alive"].pop(21004, None)
+    world["deep"].pop(21004, None)
+    out = step(10)
+    for _ in range(3):
+        out += step()
+    check(state()["status"] == "OK", what)
+    return out
+
+
+sent.clear()
+inc0 = state()["inc"]
+world["alive"][21004] = False
+check(step() == [], "DM1 из нормы: один провал — тихо")
+t_first = clock["t"]
+world["alive"][21004] = True
+world["deep"][21004] = FREEZE_DEEP
+check(step() == [] and state()["status"] == "OK",
+      "DM1 «недоступен», потом одна вставшая закачка — смешанная серия ждёт ещё одной проверки, тихо")
+out = step()
+check(len(out) == 1 and "Душат: 🇵🇱 Poland" in out[0] and "Проверки подряд: недоступен, потом душат" in out[0],
+      "DM1 «недоступен», потом «душат» дважды — одна тревога «душат» с пояснением о серии")
+check(state()["status"] == "FREEZE" and state()["since"] == t_first and state()["inc"] == inc0 + 1,
+      "DM1 состояние FREEZE, начало — с первого плохого наблюдения, сбой учтён один раз")
+out = back_ok("DM2 после возврата канал снова в норме")
+check(any("Снова работает" in m and "Его душили" in m for m in out), "DM2 «снова работает» после «душат»")
+
+world["deep"][21004] = FREEZE_DEEP
+check(step(10) == [], "DM3 обратный порядок: «душат» один раз — тихо")
+world["alive"][21004] = False
+out = step()
+out += step()
+check(len(out) == 1 and "Недоступен: 🇵🇱 Poland" in out[0] and "Проверки подряд: душат, потом недоступен" in out[0],
+      "DM3 «душат», потом «недоступен» — тревога «недоступен» с пояснением о серии")
+back_ok("DM3 канал вернулся в норму")
+
+sent.clear()
+world["alive"][21004] = False
+out = step()
+world["alive"][21004] = True
+out += step()                      # закачка в норме — серия сброшена
+world["deep"][21004] = FREEZE_DEEP
+out += step(10)
+check(out == [], "DM4 «недоступен», норма, «душат» — норма посреди серии её сбрасывает, тихо")
+out = step()
+check(len(out) == 1 and "Душат: 🇵🇱 Poland" in out[0] and "Проверки подряд" not in out[0],
+      "DM4 ещё раз «душат» — обычная тревога без пояснения о серии")
+back_ok("DM4 канал вернулся в норму")
+
+sent.clear()
+world["alive"][21004] = False
+out = step()
+world["alive"][21004] = True
+world["deep"][21004] = SLOW512
+out += step()
+world["deep"].pop(21004)
+out += step() + step()
+check(out == [] and state()["status"] == "OK",
+      "DM5 разовый провал и одна медленная закачка — не тревога: такие виды в серию не склеиваются")
+
+sent.clear()
+world["deep"][21004] = SLOW512
+out = step(10) + step()
+check(len(out) == 1 and "Медленно: 🇵🇱 Poland" in out[0], "DM6 сначала «медленно»")
+world["deep"].pop(21004)
+world["alive"][21004] = False
+out = step()
+world["alive"][21004] = True
+world["deep"][21004] = FREEZE_DEEP
+out += step()
+out += step()
+check(len(out) == 1 and "Душат: 🇵🇱 Poland" in out[0] and "Проверки подряд: недоступен, потом душат" in out[0]
+      and "До этого: 🐢 медленно" in out[0], "DM6 из «медленно» — «душат» после смешанной серии, сказано, что было до этого")
+back_ok("DM6 канал вернулся в норму")
+
+sent.clear()
+st7 = load()
+st7["channels"][POLAND].update(status="OK", cand="DOWN", streak=1, cand_since=clock["t"])
+json.dump(st7, open(probe.STATE, "w", encoding="utf-8"))
+world["deep"][21004] = FREEZE_DEEP
+out = step() + step()
+check(len(out) == 1 and "Душат: 🇵🇱 Poland" in out[0], "DM7 состояние из прошлой версии (кандидат «недоступен») — тревога «душат»")
+back_ok("DM7 канал вернулся в норму")
+
+for args, want in ((("OK", "DOWN", "FREEZE"), True), (("OK", "FREEZE", "DOWN"), True), (("SLOW", "DOWN", "FREEZE"), True),
+                   (("OK", "DOWN", "SLOW"), False), (("OK", "FREEZE", "WRONG_EXIT"), False), (("OK", "DOWN", "OK"), False),
+                   (("DOWN", "FREEZE", "OK"), False), (("FREEZE", "FREEZE", "SLOW"), False), (("SLOW", "SLOW", "SLOW"), True)):
+    check(probe.same_trouble(*args) is want, f"DM8 same_trouble{args} — {want}")
+for _ in range(3):
+    step()
+
 # E. долгий сбой: напоминание раз в час, причина — «порт открыт, VPN не проходит»
 sent.clear()
 world["alive"][21004] = False
@@ -287,10 +384,14 @@ check("Каналы: работают 2 из 3" in text and _ln[_ci + 1].startsw
 world["alive"][21003] = False
 world["alive"][21007] = False
 out = step() + step()
-check(any("Недоступен: NL1" in m and "несколько каналов" in m for m in out), "F1 при массовом сбое причина — сеть")
+check(len(out) == 1 and "Не работают сразу 3 канала из 3" in out[0] and "Недоступен: NL1" not in out[0]
+      and "Ещё раньше перестал работать: 🇵🇱 Poland." in out[0] and probe.MASS_FALLBACK_RF1 in out[0],
+      "F1 при массовом сбое — одно сводное сообщение; разбора нет и не жив ни один канал — запасной вывод "
+      "первым называет сеть rf1")
 world["alive"] = {}
-for _ in range(3):
-    step()
+out = step() + step() + step()
+check(len(out) == 1 and "Снова работают все 3 канала" in out[0]
+      and all(state(c["name"])["mass"] == 0 for c in CHANS), "F2 все вернулись — одно сообщение, общий сбой закрыт")
 
 # H. Telegram недоступен в момент тревоги — оповещение уходит позже, не теряется
 sent.clear()
@@ -1386,7 +1487,7 @@ def fake_aget(a, path, timeout=20):
 
 
 blockwatch.agent_get = fake_aget
-nw.socks_open = lambda via, host, port, timeout=5, tls=False: asked["abroad"].append((via, host, port, tls)) or True
+nw.socks_open = lambda via, host, port, timeout=5, tls=False, sni=None: asked["abroad"].append((via, host, port, tls)) or True
 netprobe.tcp_trace = lambda addr, port=443, max_hops=16: asked["trace"].append((addr, port)) or {"reached": False, "hops": 9, "last": (7, "62.1.1.1")}
 got = real_deep_many(CHANS, lambda c: {"name": "NL1", "port": 21003} if c["port"] != 21003 else None,
                      [{"name": "Москва", "url": "u", "token": "t"}], probe.DOMAINS)
@@ -1451,7 +1552,7 @@ deep_calls2 = []
 D_BLOCK = dd(DEAD, two(DEAD), True, {"reached": False, "hops": 9, "last": (7, "62.1.1.1")})
 
 
-def fake_deep_many(chans, via_for, agents, bases):
+def fake_deep_many(chans, via_for, agents, bases, deadline=None):
     deep_calls2.append([(c["name"], via_for(c)) for c in chans])
     return {c["name"]: D_BLOCK for c in chans}
 
@@ -1459,13 +1560,16 @@ def fake_deep_many(chans, via_for, agents, bases):
 blockwatch.deep_many = fake_deep_many
 world["alive"][21004] = False
 step()
+st_x = load()
+st_x["channels"]["NL1"]["exit"] = "8.8.4.4"   # у NL1 свой выход (с тем же выходом посредник — возможно, та же нода)
+probe.save_state(st_x)
 out = step()
 check(len(out) == 1 and "Недоступен: 🇵🇱 Poland" in out[0] and "<b>Откуда проверил</b>" in out[0]
       and "• Москва: порт не отвечает" in out[0] and "• из-за рубежа (через NL1): отвечает" in out[0]
       and "• остальные каналы: работают" in out[0] and "блокировку адреса ноды из России" in out[0]
       and "Что проверил" not in out[0] and "Для пользователей" in out[0],
       "X34 канал лёг — в тревоге разбор с нескольких точек и вывод из него")
-check(deep_calls2 == [[(POLAND, {"name": "NL1", "port": 21003})]], "X35 из-за рубежа смотрим через живой чужой канал (не «Резерв»: у него выход в РФ)")
+check(deep_calls2 == [[(POLAND, [{"name": "NL1", "port": 21003}])]], "X35 из-за рубежа смотрим через живой чужой канал (не «Резерв»: у него выход в РФ)")
 got = []
 for _ in range(32):
     got += step()
@@ -1475,12 +1579,18 @@ world["alive"] = {21004: False, 21003: False, 21007: False}
 n_before = len(deep_calls2)
 step()
 out = step()
-check(len(deep_calls2) == n_before and any("Недоступен: NL1" in x and "Что проверил" in x and "Откуда проверил" not in x for x in out),
-      "X37 лежит сразу большинство каналов — дело не в одной ноде, подробный разбор не запускается")
+check(len(deep_calls2) == n_before + 1 and 1 <= len(deep_calls2[-1]) <= 2
+      and "Резерв" not in [n for n, _ in deep_calls2[-1]] and len(out) == 1
+      and "Не работают сразу 3 канала из 3" in out[0] and "Откуда проверил</b> (вход канала" in out[0]
+      and "блокировку адреса ноды из России" in out[0] and "Недоступен: NL1" not in out[0],
+      "X37 лежит сразу большинство каналов — одно сообщение, разбор только представителей (не «Резерв»)")
+world["alive"] = {}
+for _ in range(3):
+    step()
 fresh()
 world["deep"][21004] = (20000, 20.0, 1000.0, "1.1.1.1")
 D_CUT = dd(CUT, two(CUT), True)
-blockwatch.deep_many = lambda chans, via_for, agents, bases: {c["name"]: D_CUT for c in chans}
+blockwatch.deep_many = lambda chans, via_for, agents, bases, deadline=None: {c["name"]: D_CUT for c in chans}
 got = []
 for _ in range(12):
     got += step()
@@ -1488,7 +1598,7 @@ check(len(got) == 1 and "Душат: 🇵🇱 Poland" in got[0] and "<b>Отку
       and "душат всю подсеть хостера" in got[0] and "Так выглядит удушение DPI" not in got[0],
       "X38 канал душат — в тревоге тот же разбор: душат подсеть хостера или только VPN")
 world["deep"] = {}
-blockwatch.deep_many = lambda chans, via_for, agents, bases: {}
+blockwatch.deep_many = lambda chans, via_for, agents, bases, deadline=None: {}
 
 # точки проверки в отчёте
 fresh()
@@ -1551,8 +1661,8 @@ blockwatch.agents_health = lambda agents: {"Москва": True}
 res = blockwatch.full_check(CHANS, [{"name": "pl1", "host": "pl1.example.net"}], probe.SITE_HOSTS, probe.DOMAINS,
                             {POLAND: {"status": "DOWN"}, "NL1": {"status": "OK"}, "Резерв": {"status": "OK"}}, agents=[])
 check(set(res["nodes"]) == {POLAND, "NL1", "Резерв"} and res["dns_names"] == 5 and seen_fc["dns"][1] == 21003
-      and seen_fc["lists_port"] == 21003 and seen_fc["via"][POLAND] == {"name": "NL1", "port": 21003}
-      and seen_fc["via"]["NL1"] is None and res["health"] == {"Москва": True} and res["external"] is False,
+      and seen_fc["lists_port"] == 21003 and seen_fc["via"][POLAND] == [{"name": "NL1", "port": 21003}]
+      and seen_fc["via"]["NL1"] == [] and res["health"] == {"Москва": True} and res["external"] is False,
       "X47 проверка по запросу: защищённый DNS и «из-за рубежа» — через канал, который сейчас работает и не выходит в РФ")
 blockwatch.lists_run, blockwatch.dns_check, blockwatch.deep_diag, blockwatch.targets = real_parts
 blockwatch.dns_check = lambda names, port, agents=(): {}
@@ -1691,7 +1801,7 @@ flows = [[1001.0 + i * 0.2, 1203, 1, 1, 0, 0] for i in range(27)] + [[1007.0 + i
 wit = {"ts": 1030.0, "flows": flows + [[1002.0, 1205, 1, 1, 0, 0], [500.0, 1203, 1, 1, 0, 0]]}
 wm, wt = blockwatch.witness_match, blockwatch.witness_text
 m = wm(wit, ser(3))
-check(m == {"seen": 30, "rep": 3, "rst_out": 0, "rst_in": 0} and "ответ не дошёл обратно" in wt(ser(3), m)
+check(m == {"seen": 30, "rep": 3, "rst_out": 0, "rst_in": 0, "mute": 0} and "ответ не дошёл обратно" in wt(ser(3), m)
       and wm(dict(wit, ts=1005.0), ser(3)) is None and wm(None, ser(3)) is None and wm(wit, ser(3, mss=None)) is None,
       "ZL10 сверка с нодой: все запросы дошли, нода отвечала, ответы не вернулись — потери на обратном пути; чужие метки и старые записи не в счёт")
 m2 = wm({"ts": 1030.0, "flows": flows[:27]}, ser(3))
@@ -1727,7 +1837,7 @@ a3 = blockwatch.loss_step(st_l, data(300, ser(5)))
 L2 = a2[0].split("\n") if a2 else []
 check(a1 == [] and len(a2) == 1 and L2[0] == "📉 <b>Потери соединений до нод</b>" and "📍 Откуда: <b>Точка Б</b>" in L2
       and "• <b>DE7</b> — не проходит 4 из 30 (13 %)" in L2 and any(x.startswith("   ↳ нода получила все 30") for x in L2)
-      and "С других точек к этим нодам: потерь нет (rf1)" in L2 and "NL4" not in a2[0] and a3 == []
+      and "С других точек к этим нодам: потерь нет (rf1)" in L2 and "NL2" not in a2[0] and a3 == []
       and L2.count("") >= 4 and max(len(x) for x in L2) < 190,
       "ZL13 потери держатся два замера подряд — одно сообщение, читаемое: откуда, по ноде на абзац, что видела нода — отдельной строкой; дальше не повторяем")
 a4 = blockwatch.loss_step(st_l, data(400, ser(1)))
@@ -1783,7 +1893,7 @@ netprobe.direct_probe = lambda host, port=443, sni=None, **kw: dict(pt("timeout"
 netprobe.series = lambda host, port=443, n=20, mss=None, **kw: ser(n, n=n, ok=0, mss=mss, t0=clock["t"] - 30, t1=clock["t"] - 20)
 netprobe.sni_compare = lambda host, port=443, sni=None, mss=None: None
 netprobe.tcp_trace = lambda addr, port=443, max_hops=16: None
-nw.socks_open = lambda via, host, port, timeout=5, tls=False: True
+nw.socks_open = lambda via, host, port, timeout=5, tls=False, sni=None: True
 blockwatch.agent_get = lambda a, path, timeout=20: (pt("timeout") if path.startswith("/probe") else
                                                     ser(6, n=6, ok=0, mss=1203, t0=clock["t"] - 30, t1=clock["t"] - 20)
                                                     if path.startswith("/series") else None)
@@ -1792,7 +1902,7 @@ blockwatch.fetch_witness = lambda url, socks_port=None: wit_calls.append((url, s
     "ts": clock["t"], "flows": [[clock["t"] - 25, m_, 3, 5, 0, 0] for m_ in (1201, 1203) for _ in range(6)]}
 dw = blockwatch.deep_diag(CHANS[0], {"name": "NL1", "port": 21003}, [{"name": "Москва", "url": "u", "token": "t"}], probe.DOMAINS)
 check(wit_calls == [("https://pl1.example.net/fw-zz.json", 21003)] and set(dw["witness"]) == {"rf1", "Москва"}
-      and dw["witness"]["Москва"] == {"seen": 6, "rep": 6, "rst_out": 0, "rst_in": 0}
+      and dw["witness"]["Москва"] == {"seen": 6, "rep": 6, "rst_out": 0, "rst_in": 0, "mute": 0}
       and any("сверка с нодой (Москва): нода получила все 6 и отвечала, но ни один ответ не дошёл обратно" in x for x in blockwatch.deep_lines(dw))
       and "закрыт обратный путь, от ноды в Россию" in v(dw, "DOWN"),
       "ZL22 разбор: счётчики ноды — через чужой канал; запросы дошли, ответы нет — в выводе «закрыт обратный путь»")
@@ -1838,13 +1948,13 @@ fl.feed(f"{T + 20:.6f} IP 93.185.1.1.443 > 79.1.1.1.40002: Flags [S.], seq 9, ac
 late = fl.snapshot(T + 41)["flows"]
 old_gone = fl.snapshot(T + 41 + node_witness.KEEP)["flows"]
 check(len(late) == 4 and late[1] == [T + 0.2, 1213, 2, 3, 0, 0] and late[-1] == [T + 40, 1213, 1, 0, 0, 0] and old_gone == []
-      and wm({"ts": T + 30, "flows": rows}, ser(1, n=2, mss=1213, t0=T - 1, t1=T + 2)) == {"seen": 2, "rep": 1, "rst_out": 0, "rst_in": 1},
+      and wm({"ts": T + 30, "flows": rows}, ser(1, n=2, mss=1213, t0=T - 1, t1=T + 2)) == {"seen": 2, "rep": 1, "rst_out": 0, "rst_in": 1, "mute": 0},
       "ZL25 свидетель: тот же порт через полминуты — новое соединение; поздний пакет в старое не идёт; записи старше получаса уходят; сторож сверяет по метке")
 
 check(wm({"ts": 1030.0, "since": 1005.0, "flows": flows}, ser(3)) is None
       and wm({"ts": 1030.0, "since": 900.0, "flows": flows}, ser(3))["seen"] == 30
       and wm({"ts": 1030.0, "flows": flows[:20]}, ser(3)) is None and wm({"ts": 1030.0, "flows": []}, ser(4)) is None
-      and wm({"ts": 1030.0, "flows": []}, ser(6, n=6, ok=0)) == W0,
+      and wm({"ts": 1030.0, "flows": []}, ser(6, n=6, ok=0)) == dict(W0, mute=0),
       "ZL26 свидетель запущен позже серии или насчитал меньше, чем прошло успешно, — его счётчикам не верим; «не дошло ничего» — только когда и у точки не прошло ничего")
 
 fl2 = node_witness.Flows(local={"93.187.140.234"})
@@ -2259,7 +2369,7 @@ c58 = {"addr": "1", "real": "reset", "neutral": "answer", "none": "answer", "mss
 t58 = blockwatch.tls_ser(c58)
 check(t58 == {"mss": 1233, "t0": 1000.0, "t1": 1002.0, "n": 1, "ok": 1, "fail": 1}
       and blockwatch.witness_match({"ts": 1100, "flows": [[1001, 1233, 1, 1, 0, 0], [1001, 1203, 1, 1, 0, 0]]}, t58)
-      == {"seen": 1, "rep": 0, "rst_out": 0, "rst_in": 0}
+      == {"seen": 1, "rep": 0, "rst_out": 0, "rst_in": 0, "mute": 0}
       and blockwatch.tls_ser(dict(c58, real="answer")) is None and blockwatch.tls_ser(dict(c58, mss=None)) is None
       and blockwatch.tls_mss(0) == 1231 and blockwatch.tls_mss(1) == 1233,
       "ZL58 сброшенное приветствие TLS с меткой сверяется со свидетелем как серия из одного соединения")
@@ -2275,7 +2385,7 @@ netprobe.sni_compare = lambda host, port=443, sni=None, mss=None: {"addr": "9.9.
                                                                    "none": "answer", "mss": mss, "t0": t59 - 30, "t1": t59 - 20}
 netprobe.tcp_trace = lambda addr, port=443, max_hops=16: None
 netprobe.name_ref = lambda name, tries=2, ref=None: r_cut
-nw.socks_open = lambda via, host, port, timeout=5, tls=False: True
+nw.socks_open = lambda via, host, port, timeout=5, tls=False, sni=None: True
 blockwatch.agent_get = lambda a, path, timeout=20: (
     pt("timeout") if path.startswith("/probe") else ser(6, n=6, ok=0, mss=1203, t0=t59 - 30, t1=t59 - 20)
     if path.startswith("/series") else p_lost if path.startswith("/path") else r_cut if path.startswith("/sniref")

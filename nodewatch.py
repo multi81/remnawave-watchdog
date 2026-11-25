@@ -193,12 +193,16 @@ def node_flags(node, now):
 
 
 DNS_FALLBACK_WARN = 12       # уходов на запасной DNS за сутки — уже пометка (таймер возвращает раз в 10 минут)
-DNS_EXCEEDED_SHARE = 0.001   # доля запросов, не влезших в очередь Unbound
+# requestlist.exceeded у Unbound из Ubuntu — в основном не очередь: заплатка CVE-2024-33655 (discard-timeout 1900 мс) не отправляет
+# ответ, который искался дольше 1,9 с (клиент через 2 с спрашивает запасной). Обычно это ~2 % поисков мимо кэша — медленные
+# серверы имён в интернете; пометка — только когда таких заметно больше.
+DNS_SLOW_SHARE = 0.10        # доля поисков мимо кэша (queries − hits), на которые ответ не успел за 1,9 с
+DNS_SLOW_MIN_MISS = 2000     # меньше поисков мимо кэша (сразу после перезапуска) — доля врёт, молчим
 DNS_CACHE_FULL = 0.95        # кэш заполнен почти до предела
 
 
 def dns_flags(x):
-    """Свой резолвер (node_dns.sh): не работает, система на запасном, часто уходит на запасной, очередь или кэш полны."""
+    """Свой резолвер (node_dns.sh): не работает, система на запасном, часто уходит на запасной, медленные ответы, кэш полон."""
     if not isinstance(x, dict):
         return []   # резолвер не ставили или маячок старый
     if not x.get("active"):
@@ -224,9 +228,11 @@ def dns_flags(x):
                        f"nameserver {x['xray_resolv']}; обновить копию или перезапустить remnanode)")
     if (x.get("fallback_24h") or 0) >= DNS_FALLBACK_WARN:
         out.append(f"DNS уходил на запасной {x['fallback_24h']} раз за сутки")
-    q, e = x.get("queries") or 0, x.get("exceeded") or 0
-    if q >= 20000 and e >= 50 and e / q > DNS_EXCEEDED_SHARE:   # после перезапуска на малых числах доля врёт
-        out.append(f"очередь DNS переполняется ({e} из {q} запросов)")
+    q, h, e = x.get("queries") or 0, x.get("hits") or 0, x.get("exceeded") or 0
+    miss = q - h
+    if miss >= DNS_SLOW_MIN_MISS and e >= 50 and e / miss > DNS_SLOW_SHARE:
+        out.append(f"DNS отвечает медленно: {e} ответов искались дольше 1,9 с ({round(100 * e / miss)} % из {miss} "
+                   "поисков мимо кэша; клиенты в это время ждут 2 с и идут на запасной)")
     for key, name in (("rrset", "записей"), ("msg", "ответов")):
         cur, top = x.get(key + "_mb") or 0, x.get(key + "_max_mb") or 0
         if top and cur >= DNS_CACHE_FULL * top:
@@ -340,11 +346,12 @@ def socks_connect(socks_port, host, port, timeout):
     return netprobe.socks_connect(socks_port, host, port, timeout)
 
 
-def socks_open(socks_port, host, port, timeout=5, tls=False):
+def socks_open(socks_port, host, port, timeout=5, tls=False, sni=None):
     """Отвечает ли порт host:port постороннему. Идём через SOCKS-порт канала сторожа (выход — чужая нода).
     tls=True — про порт известно, что на нём TLS (вход VPN на нестандартном порту): здороваемся по TLS и там.
     Клиент Xray подтверждает соединение сразу, не дожидаясь цели, поэтому «открыт» — только если от цели пришли
-    данные: приветствие, ответ на запрос или ответ на приветствие TLS."""
+    данные: приветствие, ответ на запрос или ответ на приветствие TLS.
+    sni — имя для приветствия TLS (у Reality — имя сайта-прикрытия); без него — host."""
     try:
         s = socks_connect(socks_port, host, port, timeout)
         if s is None:
@@ -375,7 +382,7 @@ def socks_open(socks_port, host, port, timeout=5, tls=False):
         ctx.check_hostname = False
         ctx.verify_mode = ssl.CERT_NONE
         try:
-            with ctx.wrap_socket(s, server_hostname=host):
+            with ctx.wrap_socket(s, server_hostname=sni or host):
                 return True
         except ssl.SSLEOFError:
             return False               # закрыли, ничего не ответив

@@ -196,8 +196,9 @@ check("W2 старый маячок: поля per-query без mode не чит�
 P = dict(D, mode="per-query", current="127.0.0.1", resolved="1.1.1.1", nameservers=["127.0.0.1", "8.8.8.8"],
          resolv_foreign=False, resolv_card=None, unbound_ok=True)
 check("W3 per-query: частые уходы — как раньше", nw.dns_flags(dict(P, fallback_24h=30)) == ["DNS уходил на запасной 30 раз за сутки"])
-check("W4 per-query: очередь и кэш — как раньше", nw.dns_flags(dict(P, exceeded=2000, rrset_mb=63.5)) == [
-    "очередь DNS переполняется (2000 из 755000 запросов)", "кэш DNS записей заполнен (63.5 из 64 МБ)"])
+check("W4 per-query: медленные ответы и кэш — как раньше", nw.dns_flags(dict(P, exceeded=5000, rrset_mb=63.5)) == [
+    "DNS отвечает медленно: 5000 ответов искались дольше 1,9 с (18 % из 28000 поисков мимо кэша; клиенты в это время ждут 2 с "
+    "и идут на запасной)", "кэш DNS записей заполнен (63.5 из 64 МБ)"])
 node = {"data": {"ts": NOW, "disk_pct": 10, "mem_avail_mb": 900, "ufw": "active", "dns": P}, "ok_ts": NOW}
 check("W5 в отчёте о сервере — без ложной пометки", nw.node_flags(node, NOW) == [])
 

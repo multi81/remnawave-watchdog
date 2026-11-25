@@ -428,6 +428,7 @@ def set_mss_mark(value):
 
 MSS_MARK = load_mss_mark()  # метка серии: SYN с таким MSS узнаёт помощник на ноде (node_witness.py)
 SERIES_MAX = 40
+SERIES_GIVEUP = 6         # не прошло ни одно из стольких первых — серию бросаем
 SLOW_SYN = 0.9            # соединение дольше — прошло только со второй посылки SYN (первая через 1 с)
 NEUTRAL_SNI = "www.example.org"
 
@@ -444,7 +445,7 @@ def series(host, port=443, n=20, mss=None, timeout=2.5, gap=0.1):
         return res
     times = []
     for i in range(max(1, min(int(n), SERIES_MAX))):
-        if i >= 6 and res["ok"] == 0:
+        if i >= SERIES_GIVEUP and res["ok"] == 0:
             break  # не прошло ни одно из шести — сервер недоступен целиком, это уже не «частичные потери»
         s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         if res["mss"]:

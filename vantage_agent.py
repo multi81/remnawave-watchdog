@@ -56,9 +56,10 @@ def vpn_channels():
         except (OSError, ValueError, AttributeError):
             continue
     return None
-VERSION = 7         # 5 — VPN-точка: /vpn?name=<плитка> через свой клиент Xray (если в настройках "vpn": true)
+VERSION = 8         # 5 — VPN-точка: /vpn?name=<плитка> через свой клиент Xray (если в настройках "vpn": true)
                     # 6 — /services: проверка популярных сервисов отсюда (rucheck.py рядом)
                     # 7 — TLS на том же порту, /dns?udp=0, /probe?verify=1; чужие адреса отсекаются до разбора запроса
+                    # 8 — /services: вердикт THROTTLE и kb
 CAPS = ["dns_udp0", "verify", "tls"]  # что умеет (в /health): по этому списку сторож решает, о чём спрашивать
 # список по умолчанию, если в настройках нет profile: заблокированные сайты (приветствие TLS) и зарубежные хостинги
 DEFAULT_PROFILE = {"sites": [["blocked", "rutracker.org"], ["blocked", "www.instagram.com"], ["blocked", "www.facebook.com"],
@@ -300,7 +301,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     hosts = list(foreign) + list(local)
                 got = rucheck.check_all(hosts)
                 keep = ("verdict", "code", "sys", "doh")
-                return self.reply(200, {"services": {h: {k: v.get(k) for k in keep} for h, v in got.items()}})
+                out = {}
+                for h, v in got.items():
+                    out[h] = {k: v.get(k) for k in keep}
+                    if v.get("verdict") == "THROTTLE" and v.get("kb"):   # «душат»: после скольких КБ встают данные
+                        out[h]["kb"] = v["kb"]
+                return self.reply(200, {"services": out})
             finally:
                 srv.slots.release()
         if url.path == "/profile":

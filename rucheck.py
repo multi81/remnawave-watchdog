@@ -2,7 +2,8 @@
 
 1. Список сервисов проверяется прямо с сервера сторожа (из России, мимо VPN) по слоям: обычный DNS против защищённого,
    TCP 443, TLS с именем сайта, HTTP-запрос (451 и страницы-заглушки провайдеров). Вердикт: OK, DNS_BLOCK,
-   TCP_TIMEOUT, TCP_RESET, TLS_BLOCK, HTTP_STUB, DOWN (сервис недоступен вообще, не похоже на блокировку).
+   TCP_TIMEOUT, TCP_RESET, TLS_BLOCK, HTTP_STUB, THROTTLE (TLS прошёл, ответ встал или оборвался на первых КБ —
+   душат), DOWN (сервис недоступен вообще, не похоже на блокировку).
    Идея разбора по слоям — как у github.com/MayersScott/rkn-block-checker (MIT).
 2. Из настоящей подписки сторожа (XRAY_JSON) берутся правила каждой плитки; одинаковые правила — один шаблон. Для
    каждого сервиса считается, куда его отправит шаблон: напрямую, через VPN или в блок (domain/full/regexp/keyword,
@@ -37,9 +38,11 @@ SERVICES = (
 # (Госуслуги и др.) не пускает адреса хостингов, а у клиентов дома открывается
 LOCAL = ("www.gosuslugi.ru", "www.nalog.gov.ru", "www.sberbank.ru", "vk.com", "ya.ru", "www.mos.ru", "www.ozon.ru",
          "www.wildberries.ru", "max.ru", "rutube.ru")
-BLOCKED = ("DNS_BLOCK", "TCP_TIMEOUT", "TCP_RESET", "TLS_BLOCK", "HTTP_STUB")
+BLOCKED = ("DNS_BLOCK", "TCP_TIMEOUT", "TCP_RESET", "TLS_BLOCK", "HTTP_STUB", "THROTTLE")
 VERDICT_RU = {"DNS_BLOCK": "подмена DNS", "TCP_TIMEOUT": "порт молчит", "TCP_RESET": "сброс соединения",
-              "TLS_BLOCK": "рвут TLS по имени сайта", "HTTP_STUB": "страница-заглушка", "DOWN": "недоступен", "OK": "открыт"}
+              "TLS_BLOCK": "рвут TLS по имени сайта", "HTTP_STUB": "страница-заглушка",
+              "THROTTLE": "душат: данные встают на середине ответа", "DOWN": "недоступен", "OK": "открыт"}
+THROTTLE_MAX = 24 * 1024  # ТСПУ обрывает на 16–20 КБ сырых байтов вместе с сертификатами; после расшифровки приходит меньше
 STUB_MARKERS = ("eais.rkn.gov.ru", "warning.rt.ru", "blocklist.rkn.gov.ru", "доступ к ресурсу ограничен",
                 "доступ к запрашиваемому ресурсу ограничен", "ресурс заблокирован", "blocked by roskomnadzor")
 UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0 Safari/537.36"
@@ -47,6 +50,13 @@ UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like 
 
 def blocked(verdict):
     return verdict in BLOCKED
+
+
+def verdict_ru(v, kb=None):
+    """Вердикт по-русски; для THROTTLE с kb — после скольких КБ встают данные."""
+    if v == "THROTTLE" and kb:
+        return "душат: данные встают после %d КБ" % kb
+    return VERDICT_RU.get(v, v)
 
 
 # ---------- геобазы ----------
@@ -347,22 +357,110 @@ class LiveNet:
             return "reset"
 
     def get(self, ip, host, timeout):
+        """-> (код, данные, чем кончилось): "ok" — ответ кончился или набрали 64 КБ, "timeout" — встал,
+        "reset" — оборвался, "noconn" — не подключились заново (запрос не ушёл). Прочитанное не выбрасывается.
+        Весь ответ — не дольше 3×timeout: сервер, который шлёт по капле, поток не держит."""
         try:
             s = self._tls(ip, host, timeout)
-            s.settimeout(timeout)
-            s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
-                       % (host, UA)).encode())
-            data = b""
+        except OSError:
+            return (None, b"", "noconn")
+        data, end = b"", "ok"
+        try:
+            try:
+                s.settimeout(timeout)
+                s.sendall(("GET / HTTP/1.1\r\nHost: %s\r\nUser-Agent: %s\r\nAccept: text/html\r\nConnection: close\r\n\r\n"
+                           % (host, UA)).encode())
+            except OSError:
+                return (None, b"", "noconn")
+            deadline = time.monotonic() + 3 * timeout
             while len(data) < 65536:
-                chunk = s.recv(16384)
+                left = deadline - time.monotonic()
+                if left <= 0:
+                    end = "timeout"
+                    break
+                s.settimeout(max(0.1, min(timeout, left)))
+                try:
+                    chunk = s.recv(16384)
+                except socket.timeout:
+                    end = "timeout"
+                    break
+                except OSError:          # ssl.SSLError, ConnectionResetError и прочие обрывы
+                    end = "reset"
+                    break
                 if not chunk:
                     break
                 data += chunk
-            s.close()
-        except OSError:
-            return (None, b"")
-        m = re.match(rb"HTTP/\d\.\d (\d{3})", data)
-        return (int(m.group(1)) if m else None, data)
+        finally:
+            try:
+                s.close()
+            except OSError:
+                pass
+        h = _head(data)
+        if h:
+            return (h[0], data, end)
+        m = re.match(rb"HTTP/\d\.\d (\d{3})", data)     # заголовок пришёл не целиком
+        return (int(m.group(1)) if m else None, data, end)
+
+
+def _head(data):
+    """Конечный заголовок ответа (промежуточные 1xx пропускаются): (код, {имя: значение}, тело) или None."""
+    while True:
+        m = re.match(rb"HTTP/\d(?:\.\d)? (\d{3})[^\r\n]*\r\n", data)
+        end = data.find(b"\r\n\r\n")
+        if not m or end < 0:
+            return None
+        code = int(m.group(1))
+        head, body = data[m.end():end], data[end + 4:]
+        if 100 <= code < 200:
+            data = body
+            continue
+        hdrs = {}
+        for line in head.split(b"\r\n"):
+            k, sep, v = line.partition(b":")
+            if sep:
+                hdrs[k.strip().lower().decode("latin-1")] = v.strip().decode("latin-1")
+        return code, hdrs, body
+
+
+def _complete(data):
+    """Ответ правда кончился: код без тела, тело по Content-Length или последний кусок chunked."""
+    h = _head(data)
+    if not h:
+        return False
+    code, hdrs, body = h
+    if code in (204, 304):
+        return True
+    if "content-length" in hdrs:
+        try:
+            return len(body) >= int(hdrs["content-length"])
+        except ValueError:
+            return False
+    if "chunked" in hdrs.get("transfer-encoding", "").lower():
+        return body.endswith(b"0\r\n\r\n")
+    return False
+
+
+def _stalled(got):
+    """Ответ встал или оборвался на первых КБ, а не кончился сам. Обрыв (reset) считаем, только если видно, что ответ
+    недописан: заголовок пришёл не целиком, тело короче Content-Length или chunked не дошёл до конца. Без этих
+    заголовков тело кончается закрытием соединения — сервер, который сразу за ним шлёт сброс, ответ отдал целиком;
+    тогда «душат» — только если ответ встал (timeout)."""
+    code, data, end = got
+    if end not in ("timeout", "reset") or not 0 < len(data) < THROTTLE_MAX or _complete(data):
+        return False
+    if end == "timeout":
+        return True
+    h = _head(data)
+    if not h:
+        return True
+    hdrs = h[1]
+    return "content-length" in hdrs or "chunked" in hdrs.get("transfer-encoding", "").lower()
+
+
+def _stub(got):
+    """Код 451 или страница-заглушка провайдера."""
+    low = got[1][:65536].decode("utf-8", "replace").lower()
+    return got[0] == 451 or any(m in low for m in STUB_MARKERS)
 
 
 def _private(ip):
@@ -374,7 +472,7 @@ def _private(ip):
 
 
 def probe_service(host, net=None, timeout=6):
-    """Проверка с этого сервера по слоям: {"host", "verdict", "sys", "doh", "code"}."""
+    """Проверка с этого сервера по слоям: {"host", "verdict", "sys", "doh", "code"} и "kb" у THROTTLE."""
     net = net or LiveNet()
     sys_ips, doh_ips = net.resolve(host), net.doh(host)
     out = {"host": host, "sys": sys_ips, "doh": doh_ips, "code": None}
@@ -395,12 +493,27 @@ def probe_service(host, net=None, timeout=6):
         return dict(out, verdict="TCP_TIMEOUT" if tcp == "timeout" else "TCP_RESET")
     if net.handshake(ip, host, timeout) != "ok":
         return dict(out, verdict="TLS_BLOCK")
-    code, body = net.get(ip, host, timeout)
-    out["code"] = code
-    low = body[:65536].decode("utf-8", "replace").lower()
-    if code == 451 or any(m in low for m in STUB_MARKERS):
+    got = _got(net.get(ip, host, timeout))
+    out["code"] = got[0]
+    if _stub(got):
         return dict(out, verdict="HTTP_STUB")
-    return dict(out, verdict="OK")
+    if _stalled(got):
+        # один повтор: разовый сбой сети на первых КБ — ещё не «душат»
+        again = _got(net.get(ip, host, timeout))
+        out["code"] = again[0]
+        if _stub(again):
+            return dict(out, verdict="HTTP_STUB")
+        if _stalled(again):
+            return dict(out, verdict="THROTTLE", kb=max(len(got[1]), len(again[1])) // 1024)
+        got = again
+    if got[2] in ("timeout", "reset") and not got[1]:
+        return dict(out, verdict="DOWN")      # запрос ушёл, в ответ ни байта — сервис не отвечает, это не блокировка
+    return dict(out, verdict="OK")            # в том числе "noconn": рукопожатие только что прошло, сбой разовый
+
+
+def _got(r):
+    """Ответ get: старые подмены отдают (код, данные) — дописываем "ok"."""
+    return (r[0], r[1], "ok") if len(r) == 2 else tuple(r)
 
 
 # ---------- сверка ----------
@@ -424,7 +537,10 @@ def compare(tiles, verdicts, geo, resolve=None):
             continue
         for h, v in sorted(verdicts.items()):
             if routes[h] == "direct" and blocked(v.get("verdict")) and not v.get("local"):
-                mismatch.append({"template": name, "host": h, "verdict": v["verdict"]})
+                m = {"template": name, "host": h, "verdict": v["verdict"]}
+                if v.get("kb"):
+                    m["kb"] = v["kb"]
+                mismatch.append(m)
     return {"templates": templates, "mismatch": mismatch}
 
 
@@ -480,16 +596,33 @@ def _key(m):
 
 
 def step(st, data):
-    """Свежая сверка -> st["rucheck"]; тревоги о новых расхождениях и о тех, что ушли."""
-    prev = {_key(m): m for m in (st.get("rucheck") or {}).get("mismatch", [])}
-    cur = {_key(m): m for m in data.get("mismatch", [])}
+    """Свежая сверка -> st["rucheck"]; тревоги о новых расхождениях и о тех, что ушли.
+    Новое «душат» (THROTTLE) тревожит только со второго прохода подряд: до того ключ ждёт в pending."""
+    rc_prev = st.get("rucheck") or {}
+    prev = {_key(m): m for m in rc_prev.get("mismatch", [])}
+    pend_prev = set(rc_prev.get("pending") or [])
+    cur, pending = {}, set()
+    for m in data.get("mismatch", []):
+        k = _key(m)
+        if k not in prev and m.get("verdict") == "THROTTLE" and k not in pend_prev:
+            pending.add(k)           # первый раз — ждём подтверждения, в сохраняемые расхождения не кладём
+            continue
+        cur[k] = m
     alerts = []
     for k, m in cur.items():
-        if k not in prev:
+        if k in prev:
+            continue
+        if m["verdict"] == "THROTTLE":
+            alerts.append("🚧 <b>Шаблон «%s»: %s идёт напрямую, а из России его душат</b> (%s)\n"
+                          "У клиентов на этой плитке он не откроется или будет обрываться. "
+                          "Что сделать: в шаблоне отправить его через VPN."
+                          % (html.escape(m["template"]), html.escape(m["host"]),
+                             "данные встают после %d КБ" % m["kb"] if m.get("kb") else "данные встают на середине ответа"))
+        else:
             alerts.append("🚧 <b>Шаблон «%s»: %s идёт напрямую, а из России закрыт</b> (%s)\n"
                           "У клиентов на этой плитке он не откроется. Что сделать: в шаблоне отправить его через VPN."
                           % (html.escape(m["template"]), html.escape(m["host"]),
-                             VERDICT_RU.get(m["verdict"], m["verdict"])))
+                             verdict_ru(m["verdict"], m.get("kb"))))
     for k, m in prev.items():
         if k not in cur:
             alerts.append("✅ <b>Шаблон «%s»: %s больше не расходится с блокировками</b>"
@@ -499,6 +632,8 @@ def step(st, data):
                      "closed": sorted(h for h, v in sv.items() if blocked(v.get("verdict")) and not v.get("local")),
                      "total": sum(1 for v in sv.values() if not v.get("local")),
                      "local_down": sorted(h for h, v in sv.items() if v.get("local") and v.get("verdict") != "OK"),
+                     "pending": sorted(pending),
+                     "throttled": sorted(h for h, v in sv.items() if v.get("verdict") == "THROTTLE" and not v.get("local")),
                      "geo": data.get("geo", True), "source": data.get("source"), "missed": data.get("missed") or []}
     return alerts
 
@@ -511,6 +646,11 @@ def items(st):
     where = "с точки «%s»" % rc["source"] if rc.get("source") else "с сервера сторожа"
     parts = ["%s закрыто %d из %d зарубежных сервисов%s" % (
         where, len(rc.get("closed", [])), rc.get("total", 0), (": " + ", ".join(rc["closed"][:8])) if rc.get("closed") else "")]
+    if rc.get("throttled"):
+        # впервые увиденное «душат» у расхождения с шаблоном ждёт второго прохода — так и пишем
+        wait = {k.split("|", 1)[-1] for k in rc.get("pending") or []}
+        parts.append("из них душат (обрыв на середине ответа): " + ", ".join(
+            h + (" (ждёт подтверждения)" if h in wait else "") for h in rc["throttled"][:6]))
     if rc.get("missed") and not rc.get("source"):
         parts.append("⚠️ точка «%s» не ответила — сервисы проверены с сервера сторожа (дата-центр видит не все блокировки)"
                      % "», «".join(rc["missed"]))

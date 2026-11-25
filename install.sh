@@ -154,7 +154,8 @@ case "${ID:-}:${VERSION_ID:-}" in
   *) echo "внимание: рассчитано на Ubuntu 24.04 / 26.04, здесь ${PRETTY_NAME:-неизвестная система}" ;;
 esac
 # vantage_client.py — TLS к точкам проверки с закреплённым отпечатком (blockwatch.agent_get для точек с "sha256")
-for f in probe.py nodewatch.py blockwatch.py netprobe.py rucheck.py build_channels.py vantage_client.py; do
+# globalping.py — взгляд из домашних сетей России (blockwatch.external_scan; включается в external.json)
+for f in probe.py nodewatch.py blockwatch.py netprobe.py rucheck.py build_channels.py vantage_client.py globalping.py; do
   [ -s "$SRC/$f" ] || { echo "рядом со скриптом нет $f"; exit 1; }
 done
 missing=""
@@ -166,7 +167,7 @@ if [ -n "$missing" ]; then
 fi
 python3 -c 'import ast, sys; [ast.parse(open(f, encoding="utf-8").read(), f) for f in sys.argv[1:]]' \
   "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py" \
-  "$SRC/vantage_client.py"
+  "$SRC/vantage_client.py" "$SRC/globalping.py"
 
 # --- ссылка подписки служебного пользователя ---
 install -d -m 700 "$ETC"
@@ -208,6 +209,7 @@ install -d -m 755 /opt/channel-watch /var/lib/channel-watch
 probe_changed=0; cmp -s "$SRC/probe.py" /opt/channel-watch/probe.py || probe_changed=1
 install -m 755 "$SRC/probe.py" "$SRC/nodewatch.py" "$SRC/blockwatch.py" "$SRC/netprobe.py" "$SRC/rucheck.py" "$SRC/build_channels.py" /opt/channel-watch/
 install -m 644 "$SRC/vantage_client.py" /opt/channel-watch/
+install -m 644 "$SRC/globalping.py" /opt/channel-watch/   # Globalping: взгляд из домашних сетей РФ
 # байт-код заранее: в песочнице /opt только для чтения, без него каждый запуск компилировал бы заново
 python3 -m compileall -q /opt/channel-watch >/dev/null 2>&1 || true
 
@@ -334,7 +336,7 @@ Requires=channel-watch-xray.service
 Type=oneshot
 ExecStart=/usr/bin/python3 /opt/channel-watch/probe.py
 Nice=10
-TimeoutStartSec=110
+TimeoutStartSec=170
 UNIT
 py_sandbox "$hb_rw" >> /etc/systemd/system/channel-watch.service
 
