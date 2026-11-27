@@ -31,7 +31,9 @@ same path your clients do: through every entry (tile) of the subscription, to th
 
 ## ✨ Features
 
-### 📡 Channels — every 2 minutes
+<details>
+<summary><b>📡 Channels — every 2 minutes</b></summary>
+
 Fetches a service subscription from Remnawave, starts a local Xray client and checks **every tile**:
 
 | Check | What you see |
@@ -45,17 +47,27 @@ Fetches a service subscription from Remnawave, starts a local Xray client and ch
 
 If every channel is slow at once, the watchdog says so: the problem is its own server, not the nodes.
 
-- **A mass outage — one message.** If many channels go down or get throttled at once, the watchdog diagnoses 2
-  representative channels from 2–3 vantage points and sends a single summary: what is down, what is throttled, what it
-  looks like, then one shared reminder and one shared recovery notice. If no channel works and rf1 can reach neither the
-  vantage points nor the node entry addresses, it says exactly that: the problem is rf1's own network, not the nodes.
+<details>
+<summary><b>📣 A mass outage — one message.</b></summary>
+
+If many channels go down or get throttled at once, the watchdog diagnoses 2
+representative channels from 2–3 vantage points and sends a single summary: what is down, what is throttled, what it
+looks like, then one shared reminder and one shared recovery notice. If no channel works and rf1 can reach neither the
+vantage points nor the node entry addresses, it says exactly that: the problem is rf1's own network, not the nodes.
+
+</details>
+
 - **A flapping channel — no avalanche.** "Unreachable" and "throttled" alternating count as one problem. When ping or
   connect time keeps rising and falling back (a third change within an hour), you get one "flapping" message and then
   silence until "settled down".
 - A watchdog run is capped at 170 seconds (the service timeout): outage analysis doesn't start when time is short, and
   alerts are saved before sending, so an interrupted send goes out on the next run.
 
-### 🚧 Blocking
+</details>
+
+<details>
+<summary><b>🚧 Blocking</b></summary>
+
 - When a channel goes down, the watchdog works out the cause itself: ping, port, TLS, a cutoff at 16–20 KB, a view
   from other Russian vantage points and from abroad, traceroute.
 - **The node refusing vs. blocking on the way.** The witness counters on the node show whether the probe's SYN
@@ -64,11 +76,18 @@ If every channel is slow at once, the watchdog says so: the problem is its own s
 - **From abroad — through two different channels** with a control site (`www.gstatic.com`): "not responding" counts
   only if the control address opened through that same channel. The node itself gets no more than two requests, so as
   not to trigger its anti-scan protection.
-- **A view from Russian home networks (Globalping, optional).** Your own vantage points usually sit in data centers.
-  When a node entry won't open from rf1 or from a vantage point, the watchdog asks [Globalping](https://globalping.io)
-  whether the same address and port open over TCP for subscribers of ordinary ISPs (MTS, Beeline, Rostelecom,
-  Dom.ru…) and, for comparison, from two points in Europe. You can see whether it is closed across all of Russia, at some
-  ISPs, or only for data centers. More in [Configuration](#%EF%B8%8F-configuration).
+
+<details>
+<summary><b>🏠 A view from Russian home networks (Globalping, optional).</b></summary>
+
+Your own vantage points usually sit in data centers.
+When a node entry won't open from rf1 or from a vantage point, the watchdog asks [Globalping](https://globalping.io)
+whether the same address and port open over TCP for subscribers of ordinary ISPs (MTS, Beeline, Rostelecom,
+Dom.ru…) and, for comparison, from two points in Europe. You can see whether it is closed across all of Russia, at some
+ISPs, or only for data centers. More in [Configuration](#%EF%B8%8F-configuration).
+
+</details>
+
 - **An entry fully closed from one vantage point.** Background loss measurement: if not a single connection from a
   vantage point got through while the node opens from rf1, you get one fact-based message; a vantage point that has most
   nodes closed is a problem with the vantage point itself.
@@ -80,24 +99,38 @@ If every channel is slow at once, the watchdog says so: the problem is its own s
   only about other people's names.
 - Tracks the country and network of node addresses across five geo databases: it will notice if "Germany" suddenly
   became "USA".
-- **Checks the subscription template against blocking.** Every 6 hours it tests popular services directly from Russia
-  layer by layer (DNS, TCP, TLS, block page) and parses the rules of every subscription tile (domain/full/regexp,
-  geosite and geoip from the node's `geosite.dat`/`geoip.dat`, `domainStrategy`). If the template routes a service
-  directly but it is blocked from Russia, you get an alert: clients on that tile won't be able to open it. Tiles that
-  route everything directly ("for use abroad") are not checked; Russian services are only noted (some of them reject
-  hosting addresses). Services are best checked from a vantage point at an ordinary ISP (`"rucheck": true` in
-  `vantage.json`): a data center often doesn't cut what home connections get cut; if it doesn't respond, the check runs
-  from the watchdog itself with a note in the report. A vantage point running agent 8 also reports "throttled" (data
-  stalls mid-response, and after how many KB); a new "throttled" alerts from the second consecutive run. The idea of
-  layered checks comes from [rkn-block-checker](https://github.com/MayersScott/rkn-block-checker).
 
-### 🌐 Sites, subscription, certificates
+<details>
+<summary><b>🧭 Checks the subscription template against blocking.</b></summary>
+
+Every 6 hours it tests popular services directly from Russia
+layer by layer (DNS, TCP, TLS, block page) and parses the rules of every subscription tile (domain/full/regexp,
+geosite and geoip from the node's `geosite.dat`/`geoip.dat`, `domainStrategy`). If the template routes a service
+directly but it is blocked from Russia, you get an alert: clients on that tile won't be able to open it. Tiles that
+route everything directly ("for use abroad") are not checked; Russian services are only noted (some of them reject
+hosting addresses). Services are best checked from a vantage point at an ordinary ISP (`"rucheck": true` in
+`vantage.json`): a data center often doesn't cut what home connections get cut; if it doesn't respond, the check runs
+from the watchdog itself with a note in the report. A vantage point running agent 8 also reports "throttled" (data
+stalls mid-response, and after how many KB); a new "throttled" alerts from the second consecutive run. The idea of
+layered checks comes from [rkn-block-checker](https://github.com/MayersScott/rkn-block-checker).
+
+</details>
+
+</details>
+
+<details>
+<summary><b>🌐 Sites, subscription, certificates</b></summary>
+
 - Panel, user portal and your other sites — directly from Russia; the subscription page — by **actually downloading**
   the subscription.
 - Certificate and domain registration expiry: warns in advance and tells you when it has been renewed.
 - Subscription changes: which tiles appeared, disappeared or changed.
 
-### 💥 DDoS and load — every minute
+</details>
+
+<details>
+<summary><b>💥 DDoS and load — every minute</b></summary>
+
 - Each server runs a lightweight collector (5% CPU, 64 MB): traffic and packets on the external interface, SYN flood,
   queue overflows, CPU, memory, disk, swap, failed services.
 - **Thresholds adapt automatically** to each server's normal load (weekly p95).
@@ -112,7 +145,11 @@ If every channel is slow at once, the watchdog says so: the problem is its own s
   compose, or named in `critical_containers` / `permanent_containers`) are covered by alerts. Temporary ones (a one-off
   `docker run`) raise no alerts: when they exit or are removed, it is a line in the report.
 
-### 🛡 Flood shield — with buttons in Telegram
+</details>
+
+<details>
+<summary><b>🛡 Flood shield — with buttons in Telegram</b></summary>
+
 - Its own nftables table, which by default **only counts** who opens too many new connections.
 - On an attack or a suspicious address you get **one message** with the sources and buttons.
 - Knows your clients (from the Xray log) and marks them: hundreds of people can sit behind one mobile carrier address.
@@ -121,7 +158,11 @@ If every channel is slow at once, the watchdog says so: the problem is its own s
 - Gate: panel ports can be opened to your own addresses only.
 - Chat commands: `/shield` — what is blocked where, `/unblock` — lift everything.
 
-### 🔭 Scanners
+</details>
+
+<details>
+<summary><b>🔭 Scanners</b></summary>
+
 - A combined list of scanner networks is re-downloaded once a day and distributed to all servers. Sources:
   | List | Contents |
   |---|---|
@@ -137,15 +178,24 @@ If every channel is slow at once, the watchdog says so: the problem is its own s
 - By default hits are **only counted**; dropping is enabled by a separate command once you are sure none of your
   clients are on the list. Your own addresses and servers are always removed from the list.
 
-### 📊 Reports
+</details>
+
+<details>
+<summary><b>📊 Reports</b></summary>
+
 - A full report three times a day: channels, services, sites, certificates, domains, subscription, servers.
 - A weekly summary on Mondays: availability, outages, speed and ping per channel.
 - 🐕 **A watchdog for the watchdog** (`guard.py`) on another server: if the watchdog itself goes down or loses
   connectivity, you get a message too.
 
+</details>
+
 ## 🆕 What's new
 
-**27.11.2026 — device monitoring** (`devicewatch.py`, `panel_devices.sh`, tests — `test_devicewatch.py`). Monitoring
+<details>
+<summary><b>📱 27.11.2026 — device monitoring</b></summary>
+
+(`devicewatch.py`, `panel_devices.sh`, tests — `test_devicewatch.py`). Monitoring
 only, nothing is changed in the panel. Once an hour the watchdog reads the panel database through a separate
 `watch-devices` command (read-only, `watch_ro` role, its own key with `from=`, `command=`, `restrict`; any extra words in
 the command are refused) and once a day sends a summary: subscriptions with more devices than their HWID limit, and
@@ -154,17 +204,29 @@ the limit). New/changed items are marked, own subscriptions are skipped via `ski
 addresses never appear in messages. Settings — `/etc/channel-watch/devices.json` (`summary_hour`, `alert_new_over` — off
 by default).
 
-**25.11.2026 — more precise outage analysis and a view from home networks** (watchdog, vantage agent 8,
+</details>
+
+<details>
+<summary><b>🏠 25.11.2026 — more precise outage analysis and a view from home networks</b></summary>
+
+(watchdog, vantage agent 8,
 `globalping.py`; tests — `test_globalping.py`, `test_witness_refusal.py`, `test_abroad.py`, `test_mass_outage.py`,
 `test_loss_shut.py`, `test_lists_fresh.py`, `test_rucheck.py`)
-- 🏠 **Globalping — a view from Russian home networks**, optional (`globalping.py`, `/etc/channel-watch/external.json`,
-  sample — `examples/external.example.json`). Queried only when a node entry already fails to open from rf1 or from a
-  vantage point: a TCP handshake to the same address and port from 8 probes on ordinary ISP networks plus one each in
-  DE and NL. Only the entry's IP address and port leave your servers — never the node name, domains or users.
-  Globalping results are public to anyone with the measurement ID and are kept for up to six months: treat any address
-  you send as published. Gentle on the API: a per-address answer is cached for 20 minutes, the budget is 120 checks per
-  hour (free tier: 250), with an optional key `/etc/channel-watch/globalping.token` (600) — 300 (free tier: 500); a 429
-  response pauses until the limit resets. To disable — `"enabled": false` or delete the file: then nothing is sent out.
+
+<details>
+<summary><b>🏠 Globalping — a view from Russian home networks</b>, optional</summary>
+
+(`globalping.py`, `/etc/channel-watch/external.json`,
+sample — `examples/external.example.json`). Queried only when a node entry already fails to open from rf1 or from a
+vantage point: a TCP handshake to the same address and port from 8 probes on ordinary ISP networks plus one each in
+DE and NL. Only the entry's IP address and port leave your servers — never the node name, domains or users.
+Globalping results are public to anyone with the measurement ID and are kept for up to six months: treat any address
+you send as published. Gentle on the API: a per-address answer is cached for 20 minutes, the budget is 120 checks per
+hour (free tier: 250), with an optional key `/etc/channel-watch/globalping.token` (600) — 300 (free tier: 500); a 429
+response pauses until the limit resets. To disable — `"enabled": false` or delete the file: then nothing is sent out.
+
+</details>
+
 - 🚪 **A ban on the node vs. blocking on the way:** based on the witness counters, the analysis says "это не
   блокировка" ("this is not blocking") — the node received the SYN and stayed silent or reset the connection itself
   (banned the vantage point addresses, closed itself off from the watchdog's address); the loss message says "часть
@@ -188,20 +250,37 @@ by default).
 - Upgrade: watchdog — `bash install.sh --yes`; vantage points — `bash vantage_update.sh` (agent 8). Globalping is
   optional: `cp examples/external.example.json /etc/channel-watch/external.json`.
 
-**23.11.2026 — the node's own DNS: fallback on every query** (`node_dns.sh install --per-query`) — against
+</details>
+
+<details>
+<summary><b>🧭 23.11.2026 — the node's own DNS: fallback on every query</b></summary>
+
+(`node_dns.sh install --per-query`) — against
 systemd-resolved "sticking" to the fallback DNS while Unbound is healthy; the timer no longer restarts Unbound because of
 a single slow recursion (only if it failed to answer twice in a row or the service died), and rollback waits for a
 running check to finish.
 
-**23.11.2026 — security and reliability, part 4** (watchdog, beacon, witness, vantage point, shield; tests —
+</details>
+
+<details>
+<summary><b>🔐 23.11.2026 — security and reliability, part 4</b></summary>
+
+(watchdog, beacon, witness, vantage point, shield; tests —
 `test_socks_auth*.py`, `test_beacon_serve.py`, `test_witness_user.py`, `test_sandbox.py`, `test_shield_allow_sync.py`,
 `test_panel_ro.py`, `test_shield.py`)
-- 🔐 **Password on the local SOCKS ports** of the watchdog and the VPN vantage point: `build_channels.py --socks-auth`
-  creates `/etc/channel-watch/socks.auth` (600) once, with a random username and password — otherwise any process on
-  the server could reach the network through your nodes. The password never appears in arguments: curl gets it via
-  standard input (`-K -`), Xray from its own config. All modules support both modes, and `--socks-auth` first checks
-  that every module alongside it supports the password — so it switches on with no downtime. Without the file the ports
-  have no password, as before.
+
+<details>
+<summary><b>🔐 Password on the local SOCKS ports</b></summary>
+
+of the watchdog and the VPN vantage point: `build_channels.py --socks-auth`
+creates `/etc/channel-watch/socks.auth` (600) once, with a random username and password — otherwise any process on
+the server could reach the network through your nodes. The password never appears in arguments: curl gets it via
+standard input (`-K -`), Xray from its own config. All modules support both modes, and `--socks-auth` first checks
+that every module alongside it supports the password — so it switches on with no downtime. Without the file the ports
+have no password, as before.
+
+</details>
+
 - ✂️ **`dialerProxy` from the subscription is stripped at any depth** (including `sockopt` inside transport settings),
   not only at the top level: the watchdog's channel won't go through someone else's chain.
 - 🏷 **MSS marks are configurable:** `"mss_mark": [start, end]` in the watchdog's `/etc/channel-watch/site.json`, in the
@@ -209,11 +288,18 @@ running check to finish.
   accepts several ranges at once (`[[old], [new]]`). Without the setting — the previous range.
 - 🧭 **Fallback DNS — DoH by IP only** (`1.1.1.1`, `8.8.8.8`): if the system DNS fails to resolve a node entry name, the
   name no longer goes out over plain UDP to public resolvers.
-- 📡 **Beacon `--serve` — its own server `beacon_serve.py`:** HTTP and TLS on one port, a self-signed certificate; the
-  installer prints its fingerprint as a `BEACON-SHA256` line; put it as `"sha256"` for the node in `nodes.json` and the
-  watchdog switches to TLS and verifies the certificate. `--tls-only` closes HTTP. The watchdog also fetches the
-  witness's `flows.json` over TLS. Connections from unknown addresses are dropped before they take up resources, and
-  every connection has an overall deadline.
+
+<details>
+<summary><b>📡 Beacon <code>--serve</code> — its own server <code>beacon_serve.py</code>:</b></summary>
+
+HTTP and TLS on one port, a self-signed certificate; the
+installer prints its fingerprint as a `BEACON-SHA256` line; put it as `"sha256"` for the node in `nodes.json` and the
+watchdog switches to TLS and verifies the certificate. `--tls-only` closes HTTP. The watchdog also fetches the
+witness's `flows.json` over TLS. Connections from unknown addresses are dropped before they take up resources, and
+every connection has an overall deadline.
+
+</details>
+
 - 🛡 **Shield, allow-sync:** once a day the watchdog sends the shields its own addresses — your addresses
   (`owner.txt`), the `ddos.json` servers and its own external address; networks no wider than /24 and /64. The shield
   keeps them separately (`allow-sync.txt`), honors them everywhere allow applies, and lifts blocks from addresses that
@@ -228,7 +314,12 @@ running check to finish.
   `beacon_serve.py` alongside), the fingerprint goes into `nodes.json`, and once everything works — `--tls-only`;
   shields — the new `shield_ctl.py` (or re-run `server_install.sh`).
 
-**23.11.2026 — security and reliability, part 3: secrets, vantage point, witness, DDoS thresholds** (watchdog,
+</details>
+
+<details>
+<summary><b>🔑 23.11.2026 — security and reliability, part 3: secrets, vantage point, witness, DDoS thresholds</b></summary>
+
+(watchdog,
 vantage agent 7, installers; tests — `test_ddos_thresholds.py`, `test_netprobe_dns.py`, `test_vantage.py`,
 `test_witness.py`, `test_tls_dns_installers.py`, `test_probe.py`, `test_guard.py`)
 - 🔑 **Secrets don't show up in the process list:** curl gets the bot token and message text via standard input
@@ -236,27 +327,53 @@ vantage agent 7, installers; tests — `test_ddos_thresholds.py`, `test_netprobe
 - 📨 **Telegram doesn't lose a batch of alerts:** a long batch is sent one alert at a time right away; a batch Telegram
   rejected is resent one by one — only the bad one is lost (its beginning goes to the log); a rejected full report is
   not retried every 2 minutes.
-- 💓 **A short heartbeat:** `heartbeat.path` holds only the start time, the last report, the queue and whether there is
-  internet, with no list of nodes (the file sits in the site folder). The full heartbeat with nodes and sites is written
-  only if a path is set in `heartbeat-full.path`; the same path in both files means one full file, as before. Writes go
-  through a private temp file (`mkstemp`): a planted symlink can't redirect the write into someone else's file.
-- 🧭 **Your node names don't go out over plain DNS to public resolvers.** Your names are checked with the system DNS of
-  the watchdog server and vantage points against secure DoH; public DNS over UDP is asked only about neutral third-party
-  names — that is enough to see whether answers are spoofed on the way. The "Подмена DNS" ("DNS spoofing") alert fires
-  only on 2 independent mismatches; a single mismatch goes to the log.
+
+<details>
+<summary><b>💓 A short heartbeat:</b></summary>
+
+`heartbeat.path` holds only the start time, the last report, the queue and whether there is
+internet, with no list of nodes (the file sits in the site folder). The full heartbeat with nodes and sites is written
+only if a path is set in `heartbeat-full.path`; the same path in both files means one full file, as before. Writes go
+through a private temp file (`mkstemp`): a planted symlink can't redirect the write into someone else's file.
+
+</details>
+
+<details>
+<summary><b>🧭 Your node names don't go out over plain DNS to public resolvers.</b></summary>
+
+Your names are checked with the system DNS of
+the watchdog server and vantage points against secure DoH; public DNS over UDP is asked only about neutral third-party
+names — that is enough to see whether answers are spoofed on the way. The "Подмена DNS" ("DNS spoofing") alert fires
+only on 2 independent mismatches; a single mismatch goes to the log.
+
+</details>
+
 - 🔐 **The TLS probe verifies the certificate where the diagnosis needs it:** for channels with regular TLS (CDN), outage
   analysis tells "wrong certificate" apart from "no connectivity"; for Reality the certificate isn't verified. Reading
   the response (`pull`) is done in chunks, with a deadline on each chunk and a size limit.
-- 💥 **DDoS thresholds don't learn from attacks:** only clean samples go into the baseline (no attacks, their
-  confirmation or traffic skew); a threshold may grow by no more than ×1.5 per day and ×2 per week, capped by the link
-  speed (`link_mbps` in `ddos.json`). A symmetric flood (the node answers with the same volume) is caught without skew:
-  inbound excess over outbound, growth against the norm, ICMP, a saturated link.
-- 📍 **Vantage point (agent 7):** TLS on the same port with a pinned fingerprint (`"sha256"` in `vantage.json`, printed
-  by `vantage_install.sh --entry`); connections from unknown addresses are dropped before the request is read;
-  responses carry no server signature; strict name validation per DNS rules; the service runs as a temporary user
-  (DynamicUser), settings and key are readable only by root; `--public ADDRESS` for a vantage point behind NAT.
-  Reinstalling keeps the `allow` list (unless `--allow` is given) and removes the old ufw rule when the address or port
-  changes.
+
+<details>
+<summary><b>💥 DDoS thresholds don't learn from attacks:</b></summary>
+
+only clean samples go into the baseline (no attacks, their
+confirmation or traffic skew); a threshold may grow by no more than ×1.5 per day and ×2 per week, capped by the link
+speed (`link_mbps` in `ddos.json`). A symmetric flood (the node answers with the same volume) is caught without skew:
+inbound excess over outbound, growth against the norm, ICMP, a saturated link.
+
+</details>
+
+<details>
+<summary><b>📍 Vantage point (agent 7):</b></summary>
+
+TLS on the same port with a pinned fingerprint (`"sha256"` in `vantage.json`, printed
+by `vantage_install.sh --entry`); connections from unknown addresses are dropped before the request is read;
+responses carry no server signature; strict name validation per DNS rules; the service runs as a temporary user
+(DynamicUser), settings and key are readable only by root; `--public ADDRESS` for a vantage point behind NAT.
+Reinstalling keeps the `allow` list (unless `--allow` is given) and removes the old ufw rule when the address or port
+changes.
+
+</details>
+
 - 🐕 **Watchdog for the watchdog:** before reporting "сторож недоступен" ("watchdog unreachable"), guard checks a
   control host (`api.telegram.org:443`, key `GUARD_CONTROL`) — if guard itself has no network, there is no alert; a
   malformed heartbeat doesn't crash it.
@@ -274,12 +391,24 @@ vantage agent 7, installers; tests — `test_ddos_thresholds.py`, `test_netprobe
   (`--entry … | … --add-vantage`; the entry will now contain `"sha256"`) and, once everything works, `--tls-only`; on
   nodes — `beacon_install.sh` again with the same parameters, then `witness_install.sh`.
 
-**23.11.2026 — security and reliability, part 2: shield** (`shield-ctl` 1.4.0, `ddos-collect` 1.8.0, installers;
+</details>
+
+<details>
+<summary><b>🛡 23.11.2026 — security and reliability, part 2: shield</b></summary>
+
+(`shield-ctl` 1.4.0, `ddos-collect` 1.8.0, installers;
 tests — `test_shield.py`, `test_scanners.py`, `test_shield_warn.py`)
-- 🛡 **Dropping scanners is now safe.** The rule sits after conntrack: only new inbound connections from listed
-  addresses are cut (plus ct invalid packets — FIN/NULL/XMAS scans, unsolicited SYN-ACK), while replies to the server's
-  own outbound connections (Telegram, GitHub, sites for clients), your addresses and your clients are never cut. Note: in
-  "count" mode the hit counter now counts only new connections — the numbers are noticeably lower than before.
+
+<details>
+<summary><b>🛡 Dropping scanners is now safe.</b></summary>
+
+The rule sits after conntrack: only new inbound connections from listed
+addresses are cut (plus ct invalid packets — FIN/NULL/XMAS scans, unsolicited SYN-ACK), while replies to the server's
+own outbound connections (Telegram, GitHub, sites for clients), your addresses and your clients are never cut. Note: in
+"count" mode the hit counter now counts only new connections — the numbers are noticeably lower than before.
+
+</details>
+
 - 🔒 **Shield commands don't interfere with each other:** a lock is held for the duration of a command (previously a
   block pressed while a timed unblock was running could vanish from the state); the scanner list is read before taking
   the lock.
@@ -290,91 +419,168 @@ tests — `test_shield.py`, `test_scanners.py`, `test_shield_warn.py`)
   of a made-up time.
 - **Clients from the Xray log** — only lines where `accepted` directly follows the address (a rejection line with that
   word in the reason no longer makes the address a "client").
-- **Installers:** re-running `server_install.sh` applies the update (restarts only what changed, takes parameters from
-  the previous install); the shield service waits for the network and restarts on failure; the shield's own addresses
-  are the watchdog address, the server's addresses and `--allow`; `install.sh --uninstall` first switches the shields to
-  observe mode; `install_ddos.sh add` won't silently trust a changed server key (`--rekey`); the shield log is rotated.
+
+<details>
+<summary><b>🧰 Installers:</b></summary>
+
+re-running `server_install.sh` applies the update (restarts only what changed, takes parameters from
+the previous install); the shield service waits for the network and restarts on failure; the shield's own addresses
+are the watchdog address, the server's addresses and `--allow`; `install.sh --uninstall` first switches the shields to
+observe mode; `install_ddos.sh add` won't silently trust a changed server key (`--rekey`); the shield log is rotated.
+
+</details>
+
 - Upgrading running servers: new `shield_ctl.py` → `/usr/local/sbin/shield-ctl`, `systemctl restart
   storozh-shield` (mode, blocks, clients and scanner lists are preserved), or re-run `server_install.sh`.
 
-**23.11.2026 — security and reliability, part 1** (the "behavior" list, scanner lists, beacon, `node_dns.sh`,
-`node_tune.sh`; a test for every fix, `test_scan_behavior.py`, `test_beacon.py`)
-- 🔎 **The "behavior" list (`behavscan.py`) is now hard to poison:**
-  - an address is added only if within one day it knocked on at least 2 servers and the knocking recurred on another
-    day; the same knock isn't counted twice if a run happened before and after midnight;
-  - mobile addresses are never added, residential ones only with 10+ ports and knocks on 2+ servers;
-  - a "never add" list (`scanlists.NEVER_LIST`): Telegram, Cloudflare, GitHub, ip-api networks, public DNS — IPv4 and
-    IPv6; they are also stripped from third-party lists;
-  - matching against your clients didn't always work (the shield rejected requests with more than 60 addresses, and the
-    rejection was read as "no clients"): now it goes in chunks of 50, shields are polled in parallel, and if even one
-    doesn't answer, no new addresses are added this time;
-  - "ours" now also includes servers from nodes.json and vantage.json (names are resolved to addresses); IPv6 — by /64;
-  - beacon lines aren't taken on faith: ports, numbers, public addresses only; a faulty beacon doesn't crash the run.
-- 📋 **Third-party scanner lists (`scanlists.py`):** if a list grows more than 1.5× (by networks or addresses), the
-  previous copy is used and you get a message with the command to accept it (`scanlists.py --accept NAME`); an overall
-  size limit on the result (IPv4 and IPv6); IPv6 wider than /32 is rejected; merged ranges wider than /16 are split
-  rather than silently rejected by the shield; how many networks the shield didn't accept is shown in the message;
-  exclusions (`scanners-exclude.txt`) of any width. If the result wasn't distributed, you find out (previously — only
-  in the log).
-- 📡 **Beacon:** counts only SYN without ACK (previously SYN-ACK replies too), sees IPv6 (one line per /64, at most 100
-  lines), filters out private and reserved addresses; the ufw log is parsed in linear time and only kernel lines are
-  used; reports the number of MPTCP listeners, including in containers with their own network — the watchdog marks
-  what to restart; the file is written without following symlinks, the beacon service runs in a systemd sandbox.
-  Upgrade: run `beacon_install.sh` again with the same parameters (the file path doesn't change).
-- 🧭 **`node_dns.sh`:** auto-rollback and `status` work when run via `bash`; by default the fallback is the DNS the
-  server had before installation, and it is tested — if it doesn't answer, the ISP's DNS is not disabled; rollback
-  restores "as it was" (a pre-existing Unbound, autostart, default-route, mask); the timer checks live recursion (a
-  random name, 3 attempts), not an answer from cache. Reinstalling on a server with the previous version upgrades it
-  cleanly (if the probe fails, the server goes back to the ISP's DNS — that's expected).
-- ⚙️ **`node_tune.sh`:** MPTCP is disabled by the file `99-zz-no-mptcp.conf` (read after `99-sysctl.conf`); after
-  applying, MPTCP listeners are counted (sysctl 0 doesn't close already open ones) — the script names what to restart
-  and exits with code 3; the connection table only grows (no less than 100000 and no less than the kernel value); the
-  modprobe and journald files are backed up before being overwritten; a multiqueue (mq) qdisc gets fq children right
-  away; root check.
+</details>
 
-**22.11.2026 v.2**
-- 🧭 **The node's own DNS resolver — `node_dns.sh`.** Unbound on 127.0.0.1 only: the node resolves sites for client
-  traffic itself without handing these queries to the ISP's DNS or 1.1.1.1; caching (96% of answers from cache on a
-  production node), DNSSEC validation. systemd-resolved asks it first, with 1.1.1.1 as fallback; a timer every 10
-  minutes switches the system back from the fallback and logs every switch to `/var/log/storozh-unbound.log`. Client
-  phones don't see the resolver. If the hoster put its own DNS servers into the main `resolved.conf`, that list is
-  cleared so Unbound comes first.
-- 🚫 **ExpressHost (AS197574) by default blocks major Russian services from its servers** — Yandex, VK, Mail.ru, Ozon,
-  Gosuslugi, banks, and with them their DNS servers (a toggle in the hoster's panel: "Сеть → Доступ к RU-сервисам",
-  "Network → Access to RU services"). Other Russian sites open. What follows from this:
-  - your own resolver won't come up there — recursion can't reach Yandex's DNS, so `node_dns.sh install` checks
-    whether Unbound resolves ya.ru and rolls itself back on failure: such nodes keep the ISP's DNS;
-  - anything the subscription template sends through the VPN rather than directly won't reach these services via such
-    a node. Russian services in templates should go directly from the device (`geosite:category-ru`,
-    `*.ru`/`*.рф`/`*.su`, `geoip:ru`; in whitelist mode — at least the listed services themselves and VK networks for
-    MAX). The restriction itself is useful: Russian services don't see the node's address as a "user from Russia", so
-    we don't recommend lifting it.
+<details>
+<summary><b>🔎 23.11.2026 — security and reliability, part 1</b></summary>
+
+(the "behavior" list, scanner lists, beacon, `node_dns.sh`,
+`node_tune.sh`; a test for every fix, `test_scan_behavior.py`, `test_beacon.py`)
+
+<details>
+<summary><b>🔎 The "behavior" list (<code>behavscan.py</code>) is now hard to poison:</b></summary>
+
+- an address is added only if within one day it knocked on at least 2 servers and the knocking recurred on another
+  day; the same knock isn't counted twice if a run happened before and after midnight;
+- mobile addresses are never added, residential ones only with 10+ ports and knocks on 2+ servers;
+- a "never add" list (`scanlists.NEVER_LIST`): Telegram, Cloudflare, GitHub, ip-api networks, public DNS — IPv4 and
+  IPv6; they are also stripped from third-party lists;
+- matching against your clients didn't always work (the shield rejected requests with more than 60 addresses, and the
+  rejection was read as "no clients"): now it goes in chunks of 50, shields are polled in parallel, and if even one
+  doesn't answer, no new addresses are added this time;
+- "ours" now also includes servers from nodes.json and vantage.json (names are resolved to addresses); IPv6 — by /64;
+- beacon lines aren't taken on faith: ports, numbers, public addresses only; a faulty beacon doesn't crash the run.
+
+</details>
+
+<details>
+<summary><b>📋 Third-party scanner lists (<code>scanlists.py</code>):</b></summary>
+
+if a list grows more than 1.5× (by networks or addresses), the
+previous copy is used and you get a message with the command to accept it (`scanlists.py --accept NAME`); an overall
+size limit on the result (IPv4 and IPv6); IPv6 wider than /32 is rejected; merged ranges wider than /16 are split
+rather than silently rejected by the shield; how many networks the shield didn't accept is shown in the message;
+exclusions (`scanners-exclude.txt`) of any width. If the result wasn't distributed, you find out (previously — only
+in the log).
+
+</details>
+
+<details>
+<summary><b>📡 Beacon:</b></summary>
+
+counts only SYN without ACK (previously SYN-ACK replies too), sees IPv6 (one line per /64, at most 100
+lines), filters out private and reserved addresses; the ufw log is parsed in linear time and only kernel lines are
+used; reports the number of MPTCP listeners, including in containers with their own network — the watchdog marks
+what to restart; the file is written without following symlinks, the beacon service runs in a systemd sandbox.
+Upgrade: run `beacon_install.sh` again with the same parameters (the file path doesn't change).
+
+</details>
+
+<details>
+<summary><b>🧭 <code>node_dns.sh</code>:</b></summary>
+
+auto-rollback and `status` work when run via `bash`; by default the fallback is the DNS the
+server had before installation, and it is tested — if it doesn't answer, the ISP's DNS is not disabled; rollback
+restores "as it was" (a pre-existing Unbound, autostart, default-route, mask); the timer checks live recursion (a
+random name, 3 attempts), not an answer from cache. Reinstalling on a server with the previous version upgrades it
+cleanly (if the probe fails, the server goes back to the ISP's DNS — that's expected).
+
+</details>
+
+<details>
+<summary><b>⚙️ <code>node_tune.sh</code>:</b></summary>
+
+MPTCP is disabled by the file `99-zz-no-mptcp.conf` (read after `99-sysctl.conf`); after
+applying, MPTCP listeners are counted (sysctl 0 doesn't close already open ones) — the script names what to restart
+and exits with code 3; the connection table only grows (no less than 100000 and no less than the kernel value); the
+modprobe and journald files are backed up before being overwritten; a multiqueue (mq) qdisc gets fq children right
+away; root check.
+
+</details>
+
+</details>
+
+<details>
+<summary><b>🧭 22.11.2026 v.2 — the node's own DNS resolver, ExpressHost and Russian services</b></summary>
+
+<details>
+<summary><b>🧭 The node's own DNS resolver — <code>node_dns.sh</code>.</b></summary>
+
+Unbound on 127.0.0.1 only: the node resolves sites for client
+traffic itself without handing these queries to the ISP's DNS or 1.1.1.1; caching (96% of answers from cache on a
+production node), DNSSEC validation. systemd-resolved asks it first, with 1.1.1.1 as fallback; a timer every 10
+minutes switches the system back from the fallback and logs every switch to `/var/log/storozh-unbound.log`. Client
+phones don't see the resolver. If the hoster put its own DNS servers into the main `resolved.conf`, that list is
+cleared so Unbound comes first.
+
+</details>
+
+<details>
+<summary><b>🚫 ExpressHost (AS197574) by default blocks major Russian services from its servers</b></summary>
+
+— Yandex, VK, Mail.ru, Ozon,
+Gosuslugi, banks, and with them their DNS servers (a toggle in the hoster's panel: "Сеть → Доступ к RU-сервисам",
+"Network → Access to RU services"). Other Russian sites open. What follows from this:
+- your own resolver won't come up there — recursion can't reach Yandex's DNS, so `node_dns.sh install` checks
+  whether Unbound resolves ya.ru and rolls itself back on failure: such nodes keep the ISP's DNS;
+- anything the subscription template sends through the VPN rather than directly won't reach these services via such
+  a node. Russian services in templates should go directly from the device (`geosite:category-ru`,
+  `*.ru`/`*.рф`/`*.su`, `geoip:ru`; in whitelist mode — at least the listed services themselves and VK networks for
+  MAX). The restriction itself is useful: Russian services don't see the node's address as a "user from Russia", so
+  we don't recommend lifting it.
+
+</details>
+
 - 🩺 **The watchdog monitors the resolver.** The beacon reports whether Unbound is running, whether the system is using
   it, how many times a day it fell back, whether the queue overflows, whether the cache is full — a note in the
   "Серверы" ("Servers") line of the report.
 - 👥 Our own scanner list doesn't pick up client addresses: the collector asks every node's shield who connected to Xray.
 
-**22.11.2026**
-- 🔭 **Our own "behavior" scanner list.** Official lists know only well-known networks, but there are far more scanners
-  (on a test node, only a fifth of the addresses that knocked in a day were in the official lists). A client never
-  knocks on closed ports — a scanner does it constantly. Each node's beacon takes from the ufw log who sent SYN to
-  closed ports over the day; once a day `behavscan.py` on the watchdog gathers suspects from all nodes: knocking on a
-  closed 80/443/8443, 3+ different closed ports, or 2+ of your servers. Only hosting and data center addresses are taken
-  (ip-api.com, cached for 30 days) — residential and mobile networks, where a client might be, only with 10+ ports.
-  Your addresses and `scanners-exclude.txt` are never included, **nor are your clients**: the collector asks every
-  node's shield which addresses connected to Xray during the day, and such an address isn't taken for 30 days. An
-  address stays on the list for 30 days after its last knock. The list joins the shield's combined list as the line
-  "по поведению на наших серверах" ("by behavior on our servers") and, like the others, is **only counted** by default.
-  The more closed ports and nodes with a closed 443 (for example, a node behind a relay entry), the better the trap.
-- ⚙️ **Node tuning in the repository — `node_tune.sh`.** One script instead of the old ones: BBR + fq, buffers, queues,
-  keepalive, a 100000-entry connection table and its hash, SYN flood protection, **MPTCP disabled** (CVE-2026-98432:
-  remote root via an MPTCP listener, and programs built with Go 1.24+, including Xray, enable MPTCP on their own), fq
-  queueing persisting across reboots. `node_tune.sh --check` only shows the differences.
+</details>
+
+<details>
+<summary><b>🔭 22.11.2026 — our own "behavior" scanner list, node tuning</b></summary>
+
+<details>
+<summary><b>🔭 Our own "behavior" scanner list.</b></summary>
+
+Official lists know only well-known networks, but there are far more scanners
+(on a test node, only a fifth of the addresses that knocked in a day were in the official lists). A client never
+knocks on closed ports — a scanner does it constantly. Each node's beacon takes from the ufw log who sent SYN to
+closed ports over the day; once a day `behavscan.py` on the watchdog gathers suspects from all nodes: knocking on a
+closed 80/443/8443, 3+ different closed ports, or 2+ of your servers. Only hosting and data center addresses are taken
+(ip-api.com, cached for 30 days) — residential and mobile networks, where a client might be, only with 10+ ports.
+Your addresses and `scanners-exclude.txt` are never included, **nor are your clients**: the collector asks every
+node's shield which addresses connected to Xray during the day, and such an address isn't taken for 30 days. An
+address stays on the list for 30 days after its last knock. The list joins the shield's combined list as the line
+"по поведению на наших серверах" ("by behavior on our servers") and, like the others, is **only counted** by default.
+The more closed ports and nodes with a closed 443 (for example, a node behind a relay entry), the better the trap.
+
+</details>
+
+<details>
+<summary><b>⚙️ Node tuning in the repository — <code>node_tune.sh</code>.</b></summary>
+
+One script instead of the old ones: BBR + fq, buffers, queues,
+keepalive, a 100000-entry connection table and its hash, SYN flood protection, **MPTCP disabled** (CVE-2026-98432:
+remote root via an MPTCP listener, and programs built with Go 1.24+, including Xray, enable MPTCP on their own), fq
+queueing persisting across reboots. `node_tune.sh --check` only shows the differences.
+
+</details>
+
 - 🩺 **The watchdog checks that the profile hasn't been reset.** The beacon reports the network profile; if a node
   isn't on BBR, the qdisc isn't fq (cake is fine too), MPTCP is enabled or the connection table is too small — a note in
   the "Серверы" ("Servers") line of the report.
 
-**14.11.2026**
+</details>
+
+<details>
+<summary><b>🛡 14.11.2026 — clearer shield messages, buttons that don't get through</b></summary>
+
 - 🛡 **Clearer shield messages.** A line "🖥 Сервер: name · address · note" ("Server"), "🎯 Куда бьют" ("Targets",
   ports), and under each source address — its network (AS), country and city, tags "мобильная сеть" ("mobile
   network"), "хостинг" ("hosting"), "прокси или VPN" ("proxy or VPN") (free: ip-api.com, fallback — ipinfo.io; cached
@@ -383,7 +589,11 @@ tests — `test_shield.py`, `test_scanners.py`, `test_shield_warn.py`)
   the watchdog with the same token): after 10 minutes you get a message with a hint, and another one once everything is
   back to normal.
 
-**13.11.2026**
+</details>
+
+<details>
+<summary><b>💾 13.11.2026 — backups, clients on the scanner list, template check</b></summary>
+
 - 💾 **Backup monitoring.** The collector (version 1.7.0) reads backup logs listed in `/etc/ddos-collect/backups.json`;
   the watchdog alerts if there has been no successful copy for longer than `backup_max_hours` or the last attempt
   failed; the report shows the latest copy and its size. No new keys or access to the backup storage are needed.
@@ -391,11 +601,18 @@ tests — `test_shield.py`, `test_scanners.py`, `test_shield_warn.py`)
   Telegram ID, subscription (active until…), last node and date, devices, traffic, app. The data comes from the panel via
   a read-only script (`panel_user_info.sh`) using a key that can do nothing but run it; no more than 20 clients at a
   time.
-- 🧭 **Checking the subscription template against blocking** (`rucheck.py`). Every 6 hours popular services are tested
-  from Russia layer by layer (DNS, TCP, TLS, block page), and the rules of every subscription tile are evaluated the way
-  Xray does it (domain/full/regexp, geosite/geoip, `domainStrategy`). If the template routes a service directly but it
-  is blocked from Russia, you get an alert. Identical rules count as one template; "everything direct" tiles aren't
-  checked.
+
+<details>
+<summary><b>🧭 Checking the subscription template against blocking</b></summary>
+
+(`rucheck.py`). Every 6 hours popular services are tested
+from Russia layer by layer (DNS, TCP, TLS, block page), and the rules of every subscription tile are evaluated the way
+Xray does it (domain/full/regexp, geosite/geoip, `domainStrategy`). If the template routes a service directly but it
+is blocked from Russia, you get an alert. Identical rules count as one template; "everything direct" tiles aren't
+checked.
+
+</details>
+
 - 📍 Services for the template check are tested by **a vantage point at an ordinary ISP** (`"rucheck": true` in
   `vantage.json`): a data center often doesn't cut what home connections get cut. If the vantage point doesn't respond,
   the watchdog checks itself and a note appears in the report. The vantage agent is updated to version 6 (`/services`
@@ -409,13 +626,19 @@ tests — `test_shield.py`, `test_scanners.py`, `test_shield_warn.py`)
   address (10.x, 100.64.x), it shows whose network that is: the external hop before it or the vantage point's own
   network.
 
-**05.11.2026**
+</details>
+
+<details>
+<summary><b>🐳 05.11.2026 — temporary containers, fourth scanner list</b></summary>
+
 - 🐳 Containers: temporary ones (a one-off `docker run`) are counted separately from permanent services. Permanent ones
   (with a restart policy, from docker compose) are covered by alerts; temporary ones raise no alerts, just a line in the
   report. Settings — `permanent_containers` and `ignore_containers` in `ddos.json`; the alert includes a hint on how to
   add a container to the exclusions.
 - 🔭 A fourth scanner list: [C24Be/AS_Network_List](https://github.com/C24Be/AS_Network_List) — Russian government
   agency networks (IPv4 and IPv6), updated daily like the others.
+
+</details>
 
 **02.11.2026** — first public release.
 
@@ -554,6 +777,9 @@ The shield will treat as its own: the watchdog's address, `--allow`, the server'
 interface (or on `--iface`) and its external address. Public addresses on other interfaces (tunnels, bridges) are only
 printed by the installer: if they are yours, add them to `--allow`.
 
+<details>
+<summary><b>⚙️ Node network profile — optional</b></summary>
+
 Node network profile (BBR, fq, connection table, MPTCP off) — optional, in the same session:
 
 ```bash
@@ -567,6 +793,11 @@ new sockets. The script names what to restart (`docker restart NAME`, `systemctl
 Containers with their own network (not host) need more than a restart: add `sysctls: [net.mptcp.enabled=0]` in compose
 and run `docker compose up -d`. Restarting remnanode drops client sessions — do it at a quiet time, then run
 `sudo bash node_tune.sh --check`.
+
+</details>
+
+<details>
+<summary><b>🧭 The node's own DNS resolver — optional</b></summary>
 
 The node's own DNS resolver (Unbound) — optional:
 
@@ -583,6 +814,8 @@ nothing to get stuck on, and DNS never drops out even for a moment. Docker gives
 /etc/resolv.conf > $(docker inspect -f '{{.ResolvConfPath}}' remnanode)`. To leave this mode — `install --regular`, to
 remove everything — `rollback`.
 
+</details>
+
 ### Step 5. Connect the server to the watchdog
 
 Back on the watchdog — the server's name, address and SSH port:
@@ -596,7 +829,10 @@ fingerprint. Reinstalled the server? Compare the fingerprint with the hoster's c
 
 ### Optional
 
-**A vantage point in another Russian network** — a second view of the nodes when a channel is down, and service checks
+<details>
+<summary><b>📍 A vantage point in another Russian network</b></summary>
+
+A second view of the nodes when a channel is down, and service checks
 for the template check. Best is a machine at an ordinary ISP (home, office): a data center often doesn't cut what your
 clients get cut. On the vantage machine (with `vantage_agent.py`, `netprobe.py`, `rucheck.py` alongside;
 `АДРЕС_СТОРОЖА` is the watchdog's address, `ваш-домен.ru` your domain):
@@ -620,7 +856,12 @@ vantage point can be turned off: `bash vantage_install.sh --tls-only`. A vantage
 forward the agent port on the router and specify the external address — `--public ADDRESS` (both at install time and
 with `--entry`). To update only the agent files without touching the unit and settings: `bash vantage_update.sh`.
 
-**Beacons on nodes** — disk, memory, versions in the weekly summary. On the node (with `node_beacon.py` alongside):
+</details>
+
+<details>
+<summary><b>📡 Beacons on nodes</b></summary>
+
+Disk, memory, versions in the weekly summary. On the node (with `node_beacon.py` alongside):
 `bash beacon_install.sh --site-dir SITE_DIR` (a node with a cover website) or
 `bash beacon_install.sh --serve PORT --allow WATCHDOG_ADDRESS` (no website; `beacon_serve.py` must be alongside too).
 With `--serve` the port is opened in ufw only to the watchdog's address; if ufw is disabled, no rule is added — the
@@ -630,12 +871,22 @@ the node in `/etc/channel-watch/nodes.json` (`"sha256": "…"`), and the watchdo
 file only over TLS with verification. Once that works, close HTTP: run `beacon_install.sh` again with the same
 parameters plus `--tls-only`.
 
-**Witness on the node** — counts only the marked probe connections of the watchdog and its vantage points and writes a
+</details>
+
+<details>
+<summary><b>👁 Witness on the node</b></summary>
+
+Counts only the marked probe connections of the watchdog and its vantage points and writes a
 small file without addresses next to the beacon; opens no ports. On a node with a beacon (with `node_witness.py`
 alongside): `bash witness_install.sh`. tcpdump parses packets as a separate user, and the service runs in a systemd
 sandbox.
 
-**Which clients ended up on the scanner list** — Telegram username and name, subscription, node, devices and app instead
+</details>
+
+<details>
+<summary><b>👤 Which clients ended up on the scanner list</b></summary>
+
+Telegram username and name, subscription, node, devices and app instead
 of a bare number from the Xray log. The watchdog needs read-only access to the panel, and only to this data
 (`АДРЕС_СТОРОЖА` — watchdog address, `АДРЕС_ПАНЕЛИ` — panel server address):
 
@@ -655,7 +906,12 @@ Without these files everything works as before: the report shows the name from t
 have the script read the database not as `postgres` but through a dedicated read-only role, apply `panel_ro_role.sql`
 on the panel server (instructions at the top of the file); `watch-user-info` will switch to it on its own.
 
-**Watchdog for the watchdog** — on any other server (with `guard.py` alongside): `bash guard_install.sh`. It notifies
+</details>
+
+<details>
+<summary><b>🐕 Watchdog for the watchdog</b></summary>
+
+On any other server (with `guard.py` alongside): `bash guard_install.sh`. It notifies
 you if the watchdog itself goes down or disappears. It reads the watchdog's heartbeat: write the file path inside the
 site folder to `/etc/channel-watch/heartbeat.path` (use a random name, e.g. `hb-$(openssl rand -hex 12).json`) and run
 `bash install.sh --yes` again — the service sandbox needs to know this folder. The heartbeat contains only the start
@@ -664,6 +920,8 @@ full heartbeat (plus the state of every node and site) — only if a second watc
 `/etc/channel-watch/heartbeat-full.path`, also with a random name. If the heartbeat can't be read, guard first checks a
 control host (`api.telegram.org:443`, or your own — `GUARD_CONTROL=host:port`): if that is unreachable too, it is
 guard's own network failing and there is no alert.
+
+</details>
 
 ### Upgrading
 
@@ -701,7 +959,7 @@ in their current mode).
 ## ⚙️ Configuration
 
 <details>
-<summary><b>Configuration files</b></summary>
+<summary><b>🗂 Configuration files</b></summary>
 
 | File | Contents |
 |---|---|
@@ -725,7 +983,7 @@ in their current mode).
 </details>
 
 <details>
-<summary><b>Thresholds</b></summary>
+<summary><b>🎚 Thresholds</b></summary>
 
 The values in the code are a reasonable starting point, not the truth. Watch for a week in observe mode (`/shield` in
 the chat, reports), then tune to your setup: attack thresholds — in `ddos.json` → `thresholds`, the shield — in
@@ -734,7 +992,7 @@ the chat, reports), then tune to your setup: attack thresholds — in `ddos.json
 </details>
 
 <details>
-<summary><b>Manual commands</b></summary>
+<summary><b>⌨️ Manual commands</b></summary>
 
 ```bash
 python3 /opt/channel-watch/probe.py --show          # report now (without sending)
@@ -762,13 +1020,20 @@ python3 /opt/channel-watch/scanlists.py --dry       # download and validate scan
   point's) channel ports accept only the username and password from `socks.auth` (600): another process on the server
   can't reach the network through your nodes. The modules pass the password to curl via standard input, not as
   arguments.
-- **systemd sandbox.** The watchdog's Xray runs as a temporary unprivileged user (DynamicUser), and systemd hands it the
-  config. The watchdog's Python services write only to their own directories, `/var/log` and the heartbeat directory;
-  `/home` and `/root` are read-only. To be honest: they still run as root — they read `sub.url` and `guard.env` (600
-  root), talk to docker and trace TCP SYN (`traceroute -T`). On an already running watchdog the same is applied without
-  reinstalling by `sandbox_dropins.sh`. The vantage agent runs as a temporary user, and its settings and TLS key are
-  readable only by root; the witness on a node keeps only the privileges to capture packets and write to the site
-  folder, and tcpdump parses packets as a separate user.
+
+<details>
+<summary><b>🧱 systemd sandbox.</b></summary>
+
+The watchdog's Xray runs as a temporary unprivileged user (DynamicUser), and systemd hands it the
+config. The watchdog's Python services write only to their own directories, `/var/log` and the heartbeat directory;
+`/home` and `/root` are read-only. To be honest: they still run as root — they read `sub.url` and `guard.env` (600
+root), talk to docker and trace TCP SYN (`traceroute -T`). On an already running watchdog the same is applied without
+reinstalling by `sandbox_dropins.sh`. The vantage agent runs as a temporary user, and its settings and TLS key are
+readable only by root; the witness on a node keeps only the privileges to capture packets and write to the site
+folder, and tcpdump parses packets as a separate user.
+
+</details>
+
 - **The vantage point and the beacon don't talk too much.** Connections from unknown addresses are dropped before the
   request is read; responses carry no server signature; names only on your domains and per DNS rules; the watchdog talks
   to the vantage point and to the `--serve` beacon over TLS with a pinned fingerprint (`"sha256"`), and HTTP can be
@@ -778,17 +1043,23 @@ python3 /opt/channel-watch/scanlists.py --dry       # download and validate scan
   information from the panel database with a read-only role (`panel_ro_role.sql`).
 - **A heartbeat without the node list.** The file for guard sits in the site folder and is therefore short; the full
   one goes only to a separate path.
-- **Doesn't hoard addresses.** The collector keeps only counters; "suspicious" entries live for 5 minutes, your clients'
-  addresses for a day and only on the server itself. The "behavior" list on the watchdog
-  (`/var/lib/channel-watch/behavior.json`) stores addresses that knocked on closed ports (per day and server, with
-  ip-api details) for up to 30 days after the last knock. An address the shields identified as a client is deleted
-  immediately — only sha256(salt + address) with a date remains, for up to 30 days; the salt is stored separately
-  (`behavscan.salt`, mode 600) and rotated every 30 days. To be honest: anyone who reads both files can recover such
-  IPv4 addresses by brute force; and a client the shields didn't recognize this time (connected more than a day ago) is
-  stored the same as any other knocking address.
 
 <details>
-<summary><b>Where the watchdog connects</b></summary>
+<summary><b>🗃 Doesn't hoard addresses.</b></summary>
+
+The collector keeps only counters; "suspicious" entries live for 5 minutes, your clients'
+addresses for a day and only on the server itself. The "behavior" list on the watchdog
+(`/var/lib/channel-watch/behavior.json`) stores addresses that knocked on closed ports (per day and server, with
+ip-api details) for up to 30 days after the last knock. An address the shields identified as a client is deleted
+immediately — only sha256(salt + address) with a date remains, for up to 30 days; the salt is stored separately
+(`behavscan.salt`, mode 600) and rotated every 30 days. To be honest: anyone who reads both files can recover such
+IPv4 addresses by brute force; and a client the shields didn't recognize this time (connected more than a day ago) is
+stored the same as any other knocking address.
+
+</details>
+
+<details>
+<summary><b>📤 Where the watchdog connects</b></summary>
 
 Only outward, and only where a check needs it: `api.telegram.org` (messages); `ip-api.com`, `ipinfo.io` (source address
 details in shield messages); through the channels — `gstatic.com`, `speed.cloudflare.com`, `api.ipify.org`, Telegram,
