@@ -145,6 +145,15 @@ If every channel is slow at once, the watchdog says so: the problem is its own s
 
 ## 🆕 What's new
 
+**27.11.2026 — device monitoring** (`devicewatch.py`, `panel_devices.sh`, tests — `test_devicewatch.py`). Monitoring
+only, nothing is changed in the panel. Once an hour the watchdog reads the panel database through a separate
+`watch-devices` command (read-only, `watch_ro` role, its own key with `from=`, `command=`, `restrict`; any extra words in
+the command are refused) and once a day sends a summary: subscriptions with more devices than their HWID limit, and
+limited subscriptions fetched by an app that does not send HWID (the panel serves them the subscription without applying
+the limit). New/changed items are marked, own subscriptions are skipped via `skip_users` / `skip_prefixes`, client
+addresses never appear in messages. Settings — `/etc/channel-watch/devices.json` (`summary_hour`, `alert_new_over` — off
+by default).
+
 **25.11.2026 — more precise outage analysis and a view from home networks** (watchdog, vantage agent 8,
 `globalping.py`; tests — `test_globalping.py`, `test_witness_refusal.py`, `test_abroad.py`, `test_mass_outage.py`,
 `test_loss_shut.py`, `test_lists_fresh.py`, `test_rucheck.py`)

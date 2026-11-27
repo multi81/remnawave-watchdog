@@ -34,7 +34,7 @@ DROP = src_of("sandbox_dropins.sh")
 
 PY_UNITS = ["channel-watch.service", "channel-watch-build.service", "channel-watch-speed.service",
             "channel-watch-lists.service", "channel-watch-loss.service", "channel-watch-side.service"]
-DDOS_UNITS = ["channel-watch-ddos.service", "channel-watch-scanlists.service", "channel-watch-behavscan.service"]
+DDOS_UNITS = ["channel-watch-ddos.service", "channel-watch-scanlists.service", "channel-watch-behavscan.service", "channel-watch-devices.service"]
 XRAY = "channel-watch-xray.service"
 SHIELD = "channel-watch-shieldbot.service"
 LONG = [XRAY, SHIELD]

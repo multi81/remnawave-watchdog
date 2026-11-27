@@ -35,7 +35,7 @@ XRAY=channel-watch-xray.service
 LONG_PY="channel-watch-shieldbot.service"
 ONESHOT="channel-watch-build.service channel-watch.service channel-watch-speed.service channel-watch-lists.service
 channel-watch-loss.service channel-watch-side.service channel-watch-ddos.service channel-watch-scanlists.service
-channel-watch-behavscan.service"
+channel-watch-behavscan.service channel-watch-devices.service"
 HB_UNIT=channel-watch.service     # пульс пишет только главная проверка (как в install.sh)
 
 mode=apply test=1 skip=""
